@@ -254,7 +254,7 @@ function archiveDetails(translate, archive) {
           class="flex items-center link-primary text-sm cursor-pointer outline-none"
         >
           <svg
-            class="fill-current w-4 h-4 mr-1"
+            class="fill-current w-3 h-3 mr-1"
             xmlns="http://www.w3.org/2000/svg"
             viewBox="0 0 20 20"
           >
@@ -281,11 +281,11 @@ module.exports = function(state, emit, archive) {
     state.capabilities.share || platform() === 'android'
       ? html`
           <button
-            class="link-primary self-end flex items-start"
+            class="link-primary self-end flex items-center"
             onclick=${share}
             title="Share link"
           >
-            <svg class="h-4 w-4 mr-2">
+            <svg class="h-3 w-3 mr-2">
               <use xlink:href="${assets.get('share-24.svg')}#icon" />
             </svg>
             Share link
@@ -297,7 +297,7 @@ module.exports = function(state, emit, archive) {
             onclick=${copy}
             title="${state.translate('copyLinkButton')}"
           >
-            <svg class="h-4 w-4 mr-2">
+            <svg class="h-3 w-3 mr-2">
               <use xlink:href="${assets.get('copy-16.svg')}#icon" />
             </svg>
             ${state.translate('copyLinkButton')}
@@ -312,7 +312,7 @@ module.exports = function(state, emit, archive) {
             title="${state.translate('downloadButtonLabel')}"
             tabindex="0"
           >
-            <svg class="h-4 w-3 mr-2">
+            <svg class="h-3 w-3 mr-2">
               <use xlink:href="${assets.get('dl.svg')}#icon" />
             </svg>
             ${state.translate('downloadButtonLabel')}
@@ -324,7 +324,7 @@ module.exports = function(state, emit, archive) {
   return html`
     <send-archive
       id="archive-${archive.id}"
-      class="flex flex-col items-start rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90 dark:border-default dark:border-grey-70"
+      class="flex flex-col items-center rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90 dark:border-default dark:border-grey-70"
     >
       ${archiveInfo(
         archive,
@@ -343,8 +343,8 @@ module.exports = function(state, emit, archive) {
         ${expiryInfo(state.translate, archive)}
       </div>
       ${archiveDetails(state.translate, archive)}
-      <hr class="w-full border-t my-4 dark:border-grey-70" />
-      <div class="flex justify-between w-full">
+      <hr class="w-full border-t my-4 border-grey-40 dark:border-grey-70" />
+      <div class="flex justify-between w-full text-sm">
         ${dl} ${copyOrShare}
       </div>
     </send-archive>
@@ -416,16 +416,18 @@ module.exports.wip = function(state, emit) {
           for="file-upload"
           class="flex flex-row items-center justify-between w-full p-2"
         >
-          <label
-            for="file-upload"
-            class="flex items-center cursor-pointer"
-            title="${state.translate('addFilesButton')}"
-          >
-            <svg class="w-4 h-4 mr-2 link-primary">
-              <use xlink:href="${assets.get('addfiles.svg')}#plus" />
-            </svg>
-            ${state.translate('addFilesButton')}
-          </label>
+          <div class="flex items-center">
+            <label
+              for="file-upload"
+              class="text-sm flex items-center cursor-pointer mr-4"
+              title="${state.translate('addFilesButton')}"
+            >
+              <svg class="w-3 h-3 mr-2 link-primary">
+                <use xlink:href="${assets.get('addfiles.svg')}#plus" />
+              </svg>
+              ${state.translate('addFilesButton')}
+            </label>
+          </div>
           <div class="font-normal text-sm text-grey-70 dark:text-grey-40">
             ${state.translate('totalSize', {
               size: bytes(state.archive.size)
@@ -481,7 +483,7 @@ module.exports.wip = function(state, emit) {
     return html`
       <input
         type="image"
-        class="self-center text-white ml-4 h-4 hover:opacity-75 focus:outline"
+        class="self-center text-white ml-4 h-3 hover:opacity-75 focus:outline"
         alt="${desc}"
         title="${desc}"
         src="${assets.get('close-16.svg')}"
@@ -502,7 +504,7 @@ module.exports.uploading = function(state, emit) {
   return html`
     <send-upload-area
       id="${archive.id}"
-      class="flex flex-col items-start rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90"
+      class="flex flex-col items-center rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90"
     >
       ${archiveInfo(archive)}
       <div class="text-xs opacity-75 w-full mt-2 mb-2">
@@ -590,16 +592,18 @@ module.exports.empty = function(state, emit) {
         onchange="${add}"
         onclick="${e => e.stopPropagation()}"
       />
-      <label
-        for="file-upload"
-        role="button"
-        class="btn rounded-lg flex items-center mt-4"
-        title="${state.translate('addFilesButton', {
-          size: bytes(state.user.maxSize)
-        })}"
-      >
-        ${state.translate('addFilesButton')}
-      </label>
+      <div class="flex flex-col items-center mt-4">
+        <label
+          for="file-upload"
+          role="button"
+          class="btn rounded-lg flex items-center"
+          title="${state.translate('addFilesButton', {
+            size: bytes(state.user.maxSize)
+          })}"
+        >
+          ${state.translate('addFilesButton')}
+        </label>
+      </div>
       ${upsell} ${uploadNotice}
     </send-upload-area>
   `;
@@ -674,7 +678,7 @@ module.exports.preview = function(state, emit) {
           <div
             class="mt-2 text-sm text-green-60 dark:text-green-40 flex items-center"
           >
-            <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
+            <svg class="w-3 h-3 mr-2" fill="currentColor" viewBox="0 0 20 20">
               <path
                 fill-rule="evenodd"
                 d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z"
@@ -688,7 +692,7 @@ module.exports.preview = function(state, emit) {
           <div
             class="mt-2 text-sm text-orange-60 dark:text-orange-40 flex items-center"
           >
-            <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
+            <svg class="w-3 h-3 mr-2" fill="currentColor" viewBox="0 0 20 20">
               <path
                 fill-rule="evenodd"
                 d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zM8 9V5.5a2 2 0 114 0V9H8z"

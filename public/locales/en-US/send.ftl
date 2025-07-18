@@ -114,10 +114,10 @@ expiresDaysHoursMinutes = { $days }d { $hours }h { $minutes }m
 addFilesButton = Select files to upload
 uploadButton = Upload
 # the first part of the string 'Drag and drop files or click to send up to 1GB'
-dragAndDropFiles = Drag and drop files
+dragAndDropFiles = Drag files or folders here
 # the second part of the string 'Drag and drop files or click to send up to 1GB'
 # $size is the size of the file, displayed using the fileSize message as format (e.g. "2.5MB")
-orClickWithSize = or click to send up to { $size }
+orClickWithSize = Send up to { $size }
 addPassword = Protect with password
 passwordNotAvailable = Password protection is not available for unencrypted files.
 encryptFiles = Encrypt files
