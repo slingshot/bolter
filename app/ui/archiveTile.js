@@ -29,13 +29,14 @@ function password(state) {
   const MAX_LENGTH = 4096;
 
   if (!state.archive.encrypted) {
-    return html`
-      <div class="mt-4 mb-2 px-1 pb-2">
-        <div class="text-sm text-grey-70 dark:text-grey-40">
-          ${state.translate('passwordNotAvailable')}
-        </div>
-      </div>
-    `;
+    return '';
+    // return html`
+    //   <div class="mt-4 mb-2 px-1 pb-2">
+    //     <div class="text-sm text-grey-70 dark:text-grey-40">
+    //       ${state.translate('passwordNotAvailable')}
+    //     </div>
+    //   </div>
+    // `;
   }
 
   return html`
@@ -185,9 +186,7 @@ function encryption(state, emit) {
       </div>
       ${showWarning
         ? html`
-            <div
-              class="text-xs text-red-60 dark:text-red-40 mt-1 mb-2 p-2 bg-red-10 dark:bg-red-90 rounded"
-            >
+            <div class="text-xs mt-1 mb-2 py-2 rounded leading-loose">
               ⚠️ ${state.translate('encryptionLargeFileWarning')}
             </div>
           `
