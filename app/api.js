@@ -151,14 +151,30 @@ export async function metadata(id, keychain) {
     let processedMeta;
     if (meta.files && meta.files.length > 0) {
       // New format: metadata contains files array directly
-      const firstFile = meta.files[0];
-      processedMeta = {
-        name: firstFile.name,
-        size: firstFile.size,
-        type: firstFile.type,
-        iv: meta.iv,
-        manifest: meta
-      };
+      if (meta.files.length > 1) {
+        // Multiple files - use zip metadata
+        const totalSize = meta.files.reduce(
+          (total, file) => total + file.size,
+          0
+        );
+        processedMeta = {
+          name: 'Send-Archive.zip',
+          size: totalSize,
+          type: 'send-archive',
+          iv: meta.iv,
+          manifest: meta
+        };
+      } else {
+        // Single file
+        const firstFile = meta.files[0];
+        processedMeta = {
+          name: firstFile.name,
+          size: firstFile.size,
+          type: firstFile.type,
+          iv: meta.iv,
+          manifest: meta
+        };
+      }
     } else {
       // Old format: metadata contains individual file info
       processedMeta = {
