@@ -12,7 +12,7 @@ module.exports = function() {
       >
         <img src="${assets.get('master-logo.svg')}" class="h-16 mt-1 mb-4" />
         <section class="flex flex-col flex-shrink-0 self-center">
-          <h1 class="text-3xl font-semibold text-center">
+          <h1 class="text-3xl font-medium text-center">
             ${state.translate('accountBenefitTitle')}
           </h1>
           <ul

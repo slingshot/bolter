@@ -48,7 +48,7 @@ body {
   @apply cursor-pointer;
   @apply py-4;
   @apply px-6;
-  @apply font-semibold;
+  @apply font-medium;
 }
 
 .btn:hover {

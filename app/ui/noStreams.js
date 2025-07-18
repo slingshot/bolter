@@ -8,7 +8,7 @@ module.exports = function(state, emit) {
     <div
       class="flex flex-col w-full max-w-md h-full mx-auto items-center justify-center"
     >
-      <h1 class="mb-4 text-3xl font-semibold">${state.translate(
+      <h1 class="mb-4 text-3xl font-medium">${state.translate(
         'downloadTitle'
       )}</h1>
       <p
@@ -56,7 +56,7 @@ module.exports = function(state, emit) {
             title="${state.translate('copyLinkButton')}"
             type="submit" />
             <p
-          class="text-grey-80 leading-normal dark:text-grey-40 font-semibold text-center md:my-8 md:text-left"
+          class="text-grey-80 leading-normal dark:text-grey-40 font-medium text-center md:my-8 md:text-left"
         >
           ${state.translate('downloadConfirmDescription')}
         </p>

@@ -56,7 +56,7 @@ module.exports = function intro(state) {
     >
       ${notice}
       <div class="mt-12 flex flex-col h-full">
-        <h1 class="text-3xl font-semibold md:pb-2">
+        <h1 class="text-3xl font-medium md:pb-2">
           ${state.translate('introTitle')}
         </h1>
         <p class="max-w-sm leading-loose mt-6 md:mt-2 md:pr-14">

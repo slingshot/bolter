@@ -508,7 +508,7 @@ module.exports.empty = function(state, emit) {
       <svg class="w-10 h-10">
         <use xlink:href="/${assets.get('addfiles.svg')}#plus" />
       </svg>
-      <div class="pt-6 pb-2 text-center text-lg font-semibold">
+      <div class="pt-6 pb-2 text-center text-lg font-medium">
         ${state.translate('dragAndDropFiles')}
       </div>
       <div class="pb-6 text-center text-base">

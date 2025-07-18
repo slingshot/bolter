@@ -22,7 +22,7 @@ function downloading(state, emit) {
     <div
       class="flex flex-col w-full h-full items-center md:justify-center md:-mt-8"
     >
-      <h1 class="text-3xl font-semibold mb-4">
+      <h1 class="text-3xl font-medium mb-4">
         ${state.translate('downloadingTitle')}
       </h1>
       ${archiveTile.downloading(state, emit)}
@@ -38,7 +38,7 @@ function preview(state, emit) {
     <div
       class="flex flex-col w-full max-w-md h-full mx-auto items-center justify-center"
     >
-      <h1 class="text-3xl font-semibold mb-4">
+      <h1 class="text-3xl font-medium mb-4">
         ${state.translate('downloadTitle')}
       </h1>
       <p
