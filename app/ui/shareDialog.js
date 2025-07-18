@@ -47,7 +47,7 @@ module.exports = function(name, url, encrypted = true) {
       try {
         await navigator.share({
           title: state.translate('-send-brand'),
-          text: state.translate('shareMessage', { name }),
+          // text: state.translate('shareMessage', { name }),
           url
         });
       } catch (e) {
