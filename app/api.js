@@ -143,7 +143,7 @@ export async function metadata(id, keychain) {
     } else {
       // For unencrypted files, metadata is base64 encoded JSON
       console.log('Raw metadata before decode:', JSON.stringify(data.metadata));
-      meta = JSON.parse(atob(data.metadata));
+      meta = JSON.parse(decodeURIComponent(escape(atob(data.metadata))));
       console.log('Parsed metadata:', JSON.stringify(meta, null, 2));
     }
 
@@ -274,7 +274,7 @@ async function upload(
   try {
     const metadataHeader = isEncrypted
       ? arrayToB64(new Uint8Array(metadata))
-      : btoa(metadata);
+      : btoa(unescape(encodeURIComponent(metadata)));
     const fileMeta = {
       fileMetadata: metadataHeader,
       authorization: `send-v1 ${verifierB64}`,
