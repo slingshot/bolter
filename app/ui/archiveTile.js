@@ -29,7 +29,7 @@ function password(state) {
   const MAX_LENGTH = 4096;
 
   return html`
-    <div class="mb-2 px-1">
+    <div class="mt-4 mb-2 px-1">
       <input
         id="autocomplete-decoy"
         class="hidden"
@@ -338,7 +338,7 @@ module.exports.wip = function(state, emit) {
         'bg-white px-2 my-2 shadow-light rounded-default dark:bg-grey-90 dark:border-default dark:border-grey-80'
       )}
       <div
-        class="flex-shrink-0 flex-grow flex items-end p-4 bg-grey-10 rounded-b mb-1 font-medium dark:bg-grey-90"
+        class="flex-shrink-0 flex-grow flex items-end py-4 bg-grey-10 rounded-b mb-1 font-medium dark:bg-grey-90"
       >
         <input
           id="file-upload"
@@ -358,7 +358,7 @@ module.exports.wip = function(state, emit) {
             class="flex items-center cursor-pointer"
             title="${state.translate('addFilesButton')}"
           >
-            <svg class="w-6 h-6 mr-2 link-primary">
+            <svg class="w-4 h-4 mr-2 link-primary">
               <use xlink:href="${assets.get('addfiles.svg')}#plus" />
             </svg>
             ${state.translate('addFilesButton')}

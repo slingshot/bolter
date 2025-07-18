@@ -18,13 +18,6 @@ html {
   );
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-primary: #333;
-    --color-primary-accent: #333;
-  }
-}
-
 a {
   color: inherit;
   text-decoration: none;
@@ -417,3 +410,16 @@ select {
 }
 
 /* end signin button color experiment */
+
+/* slingshot */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-primary: #f9f9fa;
+    --color-primary-accent: #f9f9fa;
+  }
+
+  .btn {
+    background-color: #f9f9fa;
+    color: #000;
+  }
+}

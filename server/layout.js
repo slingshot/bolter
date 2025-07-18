@@ -49,12 +49,6 @@ module.exports = function(state, body = '') {
             --color-primary: ${state.ui.colors.primary};
             --color-primary-accent: ${state.ui.colors.accent};
           }
-          @media (prefers-color-scheme: dark) {
-            :root {
-              --color-primary: #fff;
-              --color-primary-accent: #eee;
-            }
-          }
         </style>
         <link
           rel="stylesheet"
