@@ -81,6 +81,11 @@ class DB {
     const result = await this.redis.hgetallAsync(id);
     return result && new Metadata(result);
   }
+
+  async getSignedUrl(id, expiresIn = 3600) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.getSignedUrl(filePath, expiresIn);
+  }
 }
 
 module.exports = new DB(config);

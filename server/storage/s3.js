@@ -9,6 +9,7 @@ class S3Storage {
       cfg['endpoint'] = config.s3_endpoint;
     }
     cfg['s3ForcePathStyle'] = config.s3_use_path_style_endpoint;
+    cfg['signatureVersion'] = 'v4';
     AWS.config.update(cfg);
     this.s3 = new AWS.S3();
   }
@@ -42,6 +43,14 @@ class S3Storage {
 
   ping() {
     return this.s3.headBucket({ Bucket: this.bucket }).promise();
+  }
+
+  getSignedUrl(id, expiresIn = 3600) {
+    return this.s3.getSignedUrl('getObject', {
+      Bucket: this.bucket,
+      Key: id,
+      Expires: expiresIn
+    });
   }
 }
 

@@ -369,27 +369,83 @@ async function downloadS(id, keychain, signal) {
     headers.Authorization = auth;
   }
 
-  const response = await fetch(getApiUrl(`/api/download/${id}`), {
+  // First try to get a pre-signed URL
+  const urlResponse = await fetch(getApiUrl(`/api/download/url/${id}`), {
     signal: signal,
     method: 'GET',
     headers: headers
   });
 
-  const authHeader = response.headers.get('WWW-Authenticate');
+  const authHeader = urlResponse.headers.get('WWW-Authenticate');
   if (authHeader && keychain) {
     keychain.nonce = parseNonce(authHeader);
   }
 
-  if (response.status !== 200) {
-    throw new Error(response.status);
+  if (urlResponse.status !== 200) {
+    throw new Error(urlResponse.status);
   }
 
-  return response.body;
+  const urlData = await urlResponse.json();
+
+  if (urlData.useSignedUrl) {
+    // Use pre-signed URL for direct download
+    const response = await fetch(urlData.url, {
+      signal: signal,
+      method: 'GET'
+    });
+
+    if (response.status !== 200) {
+      throw new Error(response.status);
+    }
+
+    // Store download info for completion callback
+    const body = response.body;
+    body.downloadInfo = {
+      id: id,
+      keychain: keychain,
+      dl: urlData.dl,
+      dlimit: urlData.dlimit
+    };
+
+    return body;
+  } else {
+    // Fall back to streaming through server
+    const response = await fetch(getApiUrl(`/api/download/${id}`), {
+      signal: signal,
+      method: 'GET',
+      headers: headers
+    });
+
+    if (response.status !== 200) {
+      throw new Error(response.status);
+    }
+
+    return response.body;
+  }
 }
 
 async function tryDownloadStream(id, keychain, signal, tries = 2) {
   try {
     const result = await downloadS(id, keychain, signal);
+
+    // If we used a pre-signed URL, we need to report completion
+    if (result.downloadInfo) {
+      const { downloadInfo } = result;
+      try {
+        let auth = null;
+        if (downloadInfo.keychain) {
+          auth = await downloadInfo.keychain.authHeader();
+        }
+
+        await fetch(getApiUrl(`/api/download/complete/${downloadInfo.id}`), {
+          method: 'POST',
+          headers: auth ? { Authorization: auth } : {}
+        });
+      } catch (e) {
+        console.warn('Failed to report download completion:', e);
+      }
+    }
+
     return result;
   } catch (e) {
     if (e.message === '401' && --tries > 0) {
@@ -421,6 +477,63 @@ async function download(id, keychain, onprogress, canceller) {
     auth = await keychain.authHeader();
   }
 
+  // First try to get a pre-signed URL
+  try {
+    const urlResponse = await fetch(getApiUrl(`/api/download/url/${id}`), {
+      method: 'GET',
+      headers: auth ? { Authorization: auth } : {}
+    });
+
+    if (urlResponse.ok) {
+      const urlData = await urlResponse.json();
+
+      if (urlData.useSignedUrl) {
+        // Use pre-signed URL for direct download
+        return new Promise(function(resolve, reject) {
+          const xhr = new XMLHttpRequest();
+          canceller.oncancel = function() {
+            xhr.abort();
+          };
+
+          xhr.addEventListener('loadend', async function() {
+            canceller.oncancel = function() {};
+            if (xhr.status !== 200) {
+              return reject(new Error(xhr.status));
+            }
+
+            const blob = new Blob([xhr.response]);
+
+            // Call completion endpoint
+            try {
+              await fetch(getApiUrl(`/api/download/complete/${id}`), {
+                method: 'POST',
+                headers: auth ? { Authorization: auth } : {}
+              });
+            } catch (e) {
+              console.warn('Failed to report download completion:', e);
+            }
+
+            resolve(blob);
+          });
+
+          xhr.addEventListener('progress', function(event) {
+            if (event.target.status === 200) {
+              onprogress(event.loaded);
+            }
+          });
+
+          xhr.open('get', urlData.url);
+          xhr.responseType = 'blob';
+          xhr.send();
+          onprogress(0);
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to get pre-signed URL, falling back to streaming:', e);
+  }
+
+  // Fall back to streaming through server
   const xhr = new XMLHttpRequest();
   canceller.oncancel = function() {
     xhr.abort();

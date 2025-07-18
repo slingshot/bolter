@@ -45,6 +45,12 @@ class FSStorage {
   ping() {
     return Promise.resolve();
   }
+
+  getSignedUrl(_id) {
+    // For filesystem storage, we can't generate pre-signed URLs
+    // Return null to indicate streaming should be used instead
+    return null;
+  }
 }
 
 module.exports = FSStorage;

@@ -37,6 +37,14 @@ class GCSStorage {
   ping() {
     return this.bucket.exists();
   }
+
+  async getSignedUrl(id, expiresIn = 3600) {
+    const [url] = await this.bucket.file(id).getSignedUrl({
+      action: 'read',
+      expires: Date.now() + expiresIn * 1000
+    });
+    return url;
+  }
 }
 
 module.exports = GCSStorage;

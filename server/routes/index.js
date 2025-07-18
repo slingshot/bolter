@@ -41,7 +41,10 @@ module.exports = function(app) {
             const r = baseUrl.replace(/^http(s?):\/\//, 'ws$1://');
             console.log([baseUrl, r]);
             return r;
-          }
+          },
+          // Allow connections to S3/R2 endpoints for direct downloads
+          config.s3_endpoint || 'https://*.amazonaws.com',
+          'https://*.r2.cloudflarestorage.com'
         ],
         imgSrc: ["'self'", 'data:'],
         scriptSrc: [
@@ -114,6 +117,16 @@ module.exports = function(app) {
     `/api/metadata/:id${ID_REGEX}`,
     auth.conditionalHmac,
     require('./metadata')
+  );
+  app.get(
+    `/api/download/url/:id${ID_REGEX}`,
+    auth.conditionalHmac,
+    require('./downloadUrl')
+  );
+  app.post(
+    `/api/download/complete/:id${ID_REGEX}`,
+    auth.conditionalHmac,
+    require('./downloadComplete')
   );
   app.get('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.get);
   app.post('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.post);
