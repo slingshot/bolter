@@ -160,8 +160,8 @@ export default function(state, emitter) {
         });
       }
       state.modal = state.capabilities.share
-        ? shareDialog(ownedFile.name, ownedFile.url)
-        : copyDialog(ownedFile.name, ownedFile.url);
+        ? shareDialog(ownedFile.name, ownedFile.url, ownedFile.encrypted)
+        : copyDialog(ownedFile.name, ownedFile.url, ownedFile.encrypted);
     } catch (err) {
       if (err.message === '0') {
         //cancelled. do nothing

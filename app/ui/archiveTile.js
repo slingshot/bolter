@@ -709,7 +709,7 @@ module.exports.preview = function(state, emit) {
       ${encryptionStatus}
       <button
         id="download-btn"
-        class="btn rounded-lg mt-4 w-full flex-shrink-0 focus:outline"
+        class="btn rounded-lg mt-8 w-full flex-shrink-0 focus:outline"
         title="${state.translate('downloadButtonLabel')}"
         onclick=${download}
       >

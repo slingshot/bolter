@@ -2,14 +2,17 @@ const html = require('choo/html');
 const { copyToClipboard } = require('../utils');
 const qr = require('./qr');
 
-module.exports = function(name, url) {
+module.exports = function(name, url, encrypted = true) {
   const dialog = function(state, emit, close) {
+    const messageKey = encrypted
+      ? 'notifyUploadEncryptDone'
+      : 'notifyUploadDone';
     return html`
       <send-copy-dialog
         class="flex flex-col items-center text-center p-4 max-w-sm m-auto"
       >
         <h1 class="text-3xl font-medium my-4">
-          ${state.translate('notifyUploadEncryptDone')}
+          ${state.translate(messageKey)}
         </h1>
         <p
           class="font-normal leading-normal text-grey-80 word-break-all dark:text-grey-40"
