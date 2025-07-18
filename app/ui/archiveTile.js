@@ -159,6 +159,12 @@ function password(state) {
 }
 
 function encryption(state, emit) {
+  // Check if any files are larger than 2GB
+  const hasLargeFiles = state.archive.files.some(
+    file => file.size > 2 * 1024 * 1024 * 1024
+  );
+  const showWarning = state.archive.encrypted && hasLargeFiles;
+
   return html`
     <div class="mt-4 mb-2 px-1">
       <div class="flex items-center mb-2">
@@ -177,6 +183,15 @@ function encryption(state, emit) {
       <div class="text-xs text-grey-70 dark:text-grey-40 mt-1 mb-2">
         ${state.translate('encryptionHelp')}
       </div>
+      ${showWarning
+        ? html`
+            <div
+              class="text-xs text-red-60 dark:text-red-40 mt-1 mb-2 p-2 bg-red-10 dark:bg-red-90 rounded"
+            >
+              ⚠️ ${state.translate('encryptionLargeFileWarning')}
+            </div>
+          `
+        : ''}
     </div>
   `;
 

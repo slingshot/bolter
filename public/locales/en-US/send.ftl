@@ -123,6 +123,7 @@ encryptFiles = Encrypt files
 encryptionHelp = Check to enable encryption for enhanced security
 encryptionEnabled = This file is encrypted
 encryptionDisabled = This file is not encrypted
+encryptionLargeFileWarning = Warning: Encrypted uploads for files larger than 2GB may fail due to memory constraints. Consider uploading without encryption for large files.
 emailPlaceholder = Enter your email
 # $size is the size of the file, displayed using the fileSize message as format (e.g. "2.5MB")
 signInSizeBump = Sign in to send up to { $size }

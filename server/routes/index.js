@@ -99,14 +99,22 @@ module.exports = function(app) {
   app.get('/app.webmanifest', language, require('./webmanifest'));
   app.get(`/download/:id${ID_REGEX}`, language, pages.download);
   app.get('/unsupported/:reason', language, pages.unsupported);
-  app.get(`/api/download/:id${ID_REGEX}`, auth.hmac, require('./download'));
+  app.get(
+    `/api/download/:id${ID_REGEX}`,
+    auth.conditionalHmac,
+    require('./download')
+  );
   app.get(
     `/api/download/blob/:id${ID_REGEX}`,
-    auth.hmac,
+    auth.conditionalHmac,
     require('./download')
   );
   app.get(`/api/exists/:id${ID_REGEX}`, require('./exists'));
-  app.get(`/api/metadata/:id${ID_REGEX}`, auth.hmac, require('./metadata'));
+  app.get(
+    `/api/metadata/:id${ID_REGEX}`,
+    auth.conditionalHmac,
+    require('./metadata')
+  );
   app.get('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.get);
   app.post('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.post);
   app.post('/api/upload', auth.fxa, require('./upload'));

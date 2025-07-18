@@ -5,6 +5,52 @@ const config = require('../config');
 const fxa = require('../fxa');
 
 module.exports = {
+  conditionalHmac: async function(req, res, next) {
+    const id = req.params.id;
+
+    // First, try to get metadata to check if file is encrypted
+    try {
+      const meta = await storage.metadata(id);
+      if (!meta) {
+        return res.sendStatus(404);
+      }
+
+      // If file is unencrypted, skip authentication
+      if (meta.encrypted === 'false') {
+        req.authorized = true;
+        req.meta = meta;
+        return next();
+      }
+
+      // For encrypted files, require authentication
+      const authHeader = req.header('Authorization');
+      if (!authHeader) {
+        res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
+        return res.sendStatus(401);
+      }
+
+      const auth = authHeader.split(' ')[1];
+      const hmac = crypto.createHmac(
+        'sha256',
+        Buffer.from(meta.auth, 'base64')
+      );
+      hmac.update(Buffer.from(meta.nonce, 'base64'));
+      const verifyHash = hmac.digest();
+      if (crypto.timingSafeEqual(verifyHash, Buffer.from(auth, 'base64'))) {
+        req.nonce = crypto.randomBytes(16).toString('base64');
+        storage.setField(id, 'nonce', req.nonce);
+        res.set('WWW-Authenticate', `send-v1 ${req.nonce}`);
+        req.authorized = true;
+        req.meta = meta;
+        next();
+      } else {
+        res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
+        res.sendStatus(401);
+      }
+    } catch (e) {
+      res.sendStatus(404);
+    }
+  },
   hmac: async function(req, res, next) {
     const id = req.params.id;
     const authHeader = req.header('Authorization');
