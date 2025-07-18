@@ -528,13 +528,6 @@ async function uploadDirectToS3(
       ? arrayToB64(new Uint8Array(metadata))
       : metadata; // For unencrypted, metadata is already a base64 string
 
-    console.log('DEBUG: uploadDirectToS3 - metadata before complete:', {
-      metadataType: typeof metadata,
-      metadataStringType: typeof metadataString,
-      metadataString: metadataString,
-      isEncrypted: isEncrypted
-    });
-
     const completeResponse = await fetch(getApiUrl('/api/upload/complete'), {
       method: 'POST',
       headers: {

@@ -4,13 +4,8 @@ const mozlog = require('../log');
 const log = mozlog('send.uploadComplete');
 
 module.exports = async function(req, res) {
-  console.log('DEBUG: uploadComplete endpoint called');
   try {
     const { id, metadata, parts } = req.body;
-    console.log(
-      'DEBUG: uploadComplete request body:',
-      JSON.stringify(req.body, null, 2)
-    );
 
     if (!id) {
       return res.status(400).json({ error: 'Missing file ID' });
