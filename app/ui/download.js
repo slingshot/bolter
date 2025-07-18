@@ -34,7 +34,11 @@ function downloading(state, emit) {
 }
 
 function preview(state, emit) {
-  if (!state.capabilities.streamDownload && state.fileInfo.size > BIG_SIZE) {
+  if (
+    !state.capabilities.streamDownload &&
+    state.fileInfo.size > BIG_SIZE &&
+    state.fileInfo.encrypted
+  ) {
     return noStreams(state, emit);
   }
   return html`
