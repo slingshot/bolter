@@ -30,8 +30,8 @@ function password(state) {
 
   if (!state.archive.encrypted) {
     return html`
-      <div class="mt-4 mb-2 px-1">
-        <div class="text-sm text-grey-70">
+      <div class="mt-4 mb-2 px-1 pb-2">
+        <div class="text-sm text-grey-70 dark:text-grey-40">
           ${state.translate('passwordNotAvailable')}
         </div>
       </div>
@@ -46,15 +46,16 @@ function password(state) {
         type="password"
         value="lol"
       />
-      <div class="checkbox inline-block mr-3">
+      <div class="flex items-center mb-2">
         <input
           id="add-password"
           type="checkbox"
+          class="mr-2"
           ${state.archive.password ? 'checked' : ''}
           autocomplete="off"
           onchange="${togglePasswordInput}"
         />
-        <label for="add-password">
+        <label for="add-password" class="text-sm">
           ${state.translate('addPassword')}
         </label>
       </div>
@@ -91,7 +92,7 @@ function password(state) {
       <label
         id="password-msg"
         for="password-input"
-        class="block text-xs text-grey-70"
+        class="block text-xs text-grey-70 dark:text-grey-40"
       ></label>
     </div>
   `;
@@ -157,22 +158,23 @@ function password(state) {
   }
 }
 
-function encryption(state) {
+function encryption(state, emit) {
   return html`
     <div class="mt-4 mb-2 px-1">
-      <div class="checkbox inline-block mr-3">
+      <div class="flex items-center mb-2">
         <input
           id="encrypt-files"
           type="checkbox"
+          class="mr-2"
           ${state.archive.encrypted ? 'checked' : ''}
           autocomplete="off"
           onchange="${toggleEncryption}"
         />
-        <label for="encrypt-files">
+        <label for="encrypt-files" class="text-sm">
           ${state.translate('encryptFiles')}
         </label>
       </div>
-      <div class="text-xs text-grey-70 mt-1">
+      <div class="text-xs text-grey-70 dark:text-grey-40 mt-1 mb-2">
         ${state.translate('encryptionHelp')}
       </div>
     </div>
@@ -182,6 +184,11 @@ function encryption(state) {
     event.stopPropagation();
     const checked = event.target.checked;
     state.archive.encrypted = checked;
+    // Clear password when encryption is disabled
+    if (!checked) {
+      state.archive.password = null;
+    }
+    emit('render');
   }
 }
 
@@ -412,8 +419,8 @@ module.exports.wip = function(state, emit) {
           </div>
         </div>
       </div>
-      ${expiryOptions(state, emit)} ${password(state, emit)}
-      ${encryption(state, emit)}
+      ${expiryOptions(state, emit)} ${encryption(state, emit)}
+      ${password(state, emit)}
       <button
         id="upload-btn"
         class="btn rounded-lg flex-shrink-0 focus:outline"

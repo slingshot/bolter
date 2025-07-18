@@ -118,7 +118,7 @@ dragAndDropFiles = Drag and drop files
 # $size is the size of the file, displayed using the fileSize message as format (e.g. "2.5MB")
 orClickWithSize = or click to send up to { $size }
 addPassword = Protect with password
-passwordNotAvailable = Password protection is not available for unencrypted files
+passwordNotAvailable = Password protection is not available for unencrypted files.
 encryptFiles = Encrypt files
 encryptionHelp = Check to enable encryption for enhanced security
 encryptionEnabled = This file is encrypted
