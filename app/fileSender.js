@@ -18,7 +18,11 @@ export default class FileSender extends Nanobus {
 
   get progressIndefinite() {
     return (
-      ['fileSizeProgress', 'notifyUploadEncryptDone'].indexOf(this.msg) === -1
+      [
+        'fileSizeProgress',
+        'notifyUploadEncryptDone',
+        'notifyUploadDone'
+      ].indexOf(this.msg) === -1
     );
   }
 
@@ -88,7 +92,9 @@ export default class FileSender extends Nanobus {
     this.emit('progress'); // HACK to kick MS Edge
     try {
       const result = await this.uploadRequest.result;
-      this.msg = 'notifyUploadEncryptDone';
+      this.msg = archive.encrypted
+        ? 'notifyUploadEncryptDone'
+        : 'notifyUploadDone';
       this.uploadRequest = null;
       this.progress = [1, 1];
       const secretKey = archive.encrypted

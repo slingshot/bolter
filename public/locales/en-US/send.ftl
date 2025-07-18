@@ -55,6 +55,7 @@ introTitle = Share files privately
 introDescription = { -send-brand } lets you share files securely with links that automatically expire. Your files are end-to-end encrypted, so only you and the people you share with can access them—not us, not AI companies, not anyone else.
 sendYourFilesLink = Try { -send-short-brand }
 notifyUploadEncryptDone = Your file is encrypted and ready to send
+notifyUploadDone = Your file is ready to send
 # downloadCount is from the downloadCount string and timespan is a timespanMinutes string. ex. 'Expires after 2 downloads or 25 minutes'
 archiveExpiryInfo = Expires after { $downloadCount } or { $timespan }
 timespanMinutes = { $num ->
