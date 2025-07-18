@@ -135,6 +135,11 @@ details[open] > summary > svg {
   transform: rotate(90deg);
 }
 
+footer {
+  animation: fade-in 0.3s ease-out 0.7s forwards;
+  opacity: 0;
+}
+
 footer li a:hover {
   text-decoration: underline;
 }
@@ -196,6 +201,23 @@ footer li a:hover {
 
 .main > section {
   @apply bg-white;
+
+  animation: fade-in-up 0.6s ease-out forwards;
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+@keyframes fade-in-up {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  to {
+    opacity: 1;
+  }
 }
 
 #password-msg::after {
