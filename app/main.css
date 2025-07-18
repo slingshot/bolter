@@ -28,10 +28,14 @@ a:focus {
 }
 
 body {
-  background-image: url('../assets/bg.svg');
-  background-position: center;
-  background-repeat: no-repeat;
-  background-size: cover;
+  /* background-image: url('../assets/bg.svg'); */
+
+  /* background-position: center; */
+
+  /* background-repeat: no-repeat; */
+
+  /* background-size: cover; */
+
   overflow-x: hidden;
 }
 
