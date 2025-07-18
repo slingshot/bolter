@@ -81,8 +81,8 @@ module.exports = function(state, body = '') {
         <script defer src="${assets.get('app.js')}"></script>
         <script
           defer
-          data-domain="fair.fm"
-          src="https://pl.slingshot.fm/js/script.js"
+          data-domain="send.fm"
+          src="https://pl.slingshot.fm/js/script.tagged-events.js"
         ></script>
       </head>
       <noscript>

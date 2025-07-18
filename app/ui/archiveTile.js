@@ -437,7 +437,7 @@ module.exports.wip = function(state, emit) {
       ${password(state, emit)}
       <button
         id="upload-btn"
-        class="btn rounded-lg flex-shrink-0 focus:outline"
+        class="btn rounded-lg flex-shrink-0 focus:outline plausible-event-name=Upload"
         title="${state.translate('uploadButton')}"
         onclick="${upload}"
       >
