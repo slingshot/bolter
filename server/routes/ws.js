@@ -29,6 +29,7 @@ module.exports = function(ws, req) {
       const dlimit = fileInfo.dlimit || config.default_downloads;
       const metadata = fileInfo.fileMetadata;
       const auth = fileInfo.authorization;
+      const encrypted = fileInfo.encrypted !== false;
       const user = await fxa.verify(fileInfo.bearer);
       const maxFileSize = config.max_file_size;
       const maxExpireSeconds = config.max_expire_seconds;
@@ -44,7 +45,7 @@ module.exports = function(ws, req) {
       }
       if (
         !metadata ||
-        !auth ||
+        (!auth && encrypted) ||
         timeLimit <= 0 ||
         timeLimit > maxExpireSeconds ||
         dlimit > maxDownloads
@@ -58,11 +59,13 @@ module.exports = function(ws, req) {
       }
 
       const meta = {
-        owner,
-        metadata,
-        dlimit,
-        auth: auth.split(' ')[1],
-        nonce: crypto.randomBytes(16).toString('base64')
+        owner: owner,
+        metadata: metadata,
+        dlimit: String(dlimit),
+        auth: encrypted && auth ? auth.split(' ')[1] : 'unencrypted',
+        nonce: encrypted ? crypto.randomBytes(16).toString('base64') : '',
+        encrypted: String(encrypted),
+        dl: '0'
       };
 
       const url = `${config.deriveBaseUrl(req)}/download/${newId}/`;

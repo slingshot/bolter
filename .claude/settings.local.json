@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm start)",
+      "Bash(npx eslint:*)"
+    ],
+    "deny": []
+  }
+}

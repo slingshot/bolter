@@ -8,8 +8,10 @@ import Zip from './zip';
 export default class FileReceiver extends Nanobus {
   constructor(fileInfo) {
     super('FileReceiver');
-    this.keychain = new Keychain(fileInfo.secretKey, fileInfo.nonce);
-    if (fileInfo.requiresPassword) {
+    this.keychain = fileInfo.secretKey
+      ? new Keychain(fileInfo.secretKey, fileInfo.nonce)
+      : null;
+    if (fileInfo.requiresPassword && this.keychain) {
       this.keychain.setPassword(fileInfo.password, fileInfo.url);
     }
     this.fileInfo = fileInfo;
@@ -50,6 +52,13 @@ export default class FileReceiver extends Nanobus {
     this.fileInfo.iv = meta.iv;
     this.fileInfo.size = +meta.size;
     this.fileInfo.manifest = meta.manifest;
+    this.fileInfo.encrypted = meta.encrypted;
+
+    // If file is unencrypted but we have a keychain, remove it
+    if (!meta.encrypted && this.keychain) {
+      this.keychain = null;
+    }
+
     this.state = 'ready';
   }
 
@@ -88,16 +97,26 @@ export default class FileReceiver extends Nanobus {
     try {
       const ciphertext = await this.downloadRequest.result;
       this.downloadRequest = null;
-      this.msg = 'decryptingFile';
-      this.state = 'decrypting';
-      this.emit('decrypting');
+
+      let plainStream;
       let size = this.fileInfo.size;
-      let plainStream = this.keychain.decryptStream(blobStream(ciphertext));
+
+      if (this.fileInfo.encrypted !== false && this.keychain) {
+        this.msg = 'decryptingFile';
+        this.state = 'decrypting';
+        this.emit('decrypting');
+        plainStream = this.keychain.decryptStream(blobStream(ciphertext));
+      } else {
+        // File is not encrypted
+        plainStream = blobStream(ciphertext);
+      }
+
       if (this.fileInfo.type === 'send-archive') {
         const zip = new Zip(this.fileInfo.manifest, plainStream);
         plainStream = zip.stream;
         size = zip.size;
       }
+
       const plaintext = await streamToArrayBuffer(plainStream, size);
       if (!noSave) {
         await saveFile({
@@ -142,7 +161,7 @@ export default class FileReceiver extends Nanobus {
         password: this.fileInfo.password,
         url: this.fileInfo.url,
         size: this.fileInfo.size,
-        nonce: this.keychain.nonce,
+        nonce: this.keychain ? this.keychain.nonce : null,
         noSave
       };
       await this.sendMessageToSw(info);

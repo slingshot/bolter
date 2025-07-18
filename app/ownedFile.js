@@ -19,9 +19,11 @@ export default class OwnedFile {
     this.ownerToken = obj.ownerToken;
     this.dlimit = obj.dlimit || 1;
     this.dtotal = obj.dtotal || 0;
-    this.keychain = new Keychain(obj.secretKey, obj.nonce);
+    this.keychain =
+      obj.encrypted !== false ? new Keychain(obj.secretKey, obj.nonce) : null;
     this._hasPassword = !!obj.hasPassword;
     this.timeLimit = obj.timeLimit;
+    this.encrypted = obj.encrypted !== false;
   }
 
   get hasPassword() {
@@ -33,6 +35,9 @@ export default class OwnedFile {
   }
 
   async setPassword(password) {
+    if (!this.encrypted) {
+      throw new Error('Cannot set password on unencrypted file');
+    }
     try {
       this.password = password;
       this._hasPassword = true;
@@ -85,12 +90,13 @@ export default class OwnedFile {
       speed: this.speed,
       createdAt: this.createdAt,
       expiresAt: this.expiresAt,
-      secretKey: arrayToB64(this.keychain.rawSecret),
+      secretKey: this.encrypted ? arrayToB64(this.keychain.rawSecret) : null,
       ownerToken: this.ownerToken,
       dlimit: this.dlimit,
       dtotal: this.dtotal,
       hasPassword: this.hasPassword,
-      timeLimit: this.timeLimit
+      timeLimit: this.timeLimit,
+      encrypted: this.encrypted
     };
   }
 }

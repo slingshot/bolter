@@ -25,7 +25,7 @@ module.exports = async function(req, res) {
       }
 
       const dl = meta.dl + 1;
-      const dlimit = meta.dlimit;
+      const dlimit = +meta.dlimit;
       try {
         if (dl >= dlimit) {
           await storage.del(id);

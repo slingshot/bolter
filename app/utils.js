@@ -67,10 +67,13 @@ const LOCALIZE_NUMBERS = !!(
 
 const UNITS = ['bytes', 'kb', 'mb', 'gb', 'tb'];
 function bytes(num) {
-  if (num < 1) {
+  if (!num || num < 1) {
     return '0B';
   }
-  const exponent = Math.min(Math.floor(Math.log10(num) / 3), UNITS.length - 1);
+  const exponent = Math.min(
+    Math.max(Math.floor(Math.log10(num) / 3), 0),
+    UNITS.length - 1
+  );
   const n = Number(num / Math.pow(1024, exponent));
   const decimalDigits = Math.floor(n) === n ? 0 : 1;
   let nStr = n.toFixed(decimalDigits);
@@ -89,9 +92,11 @@ function bytes(num) {
       // fall through
     }
   }
+  const unit = UNITS[exponent] || 'bytes';
+  const unitTranslation = translate(unit);
   return translate('fileSize', {
     num: nStr,
-    units: translate(UNITS[exponent])
+    units: unitTranslation || unit.toUpperCase()
   });
 }
 

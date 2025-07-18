@@ -119,22 +119,70 @@ export async function fileInfo(id, owner_token) {
 }
 
 export async function metadata(id, keychain) {
-  const result = await fetchWithAuthAndRetry(
-    getApiUrl(`/api/metadata/${id}`),
-    { method: 'GET' },
-    keychain
-  );
+  let result;
+  if (keychain) {
+    result = await fetchWithAuthAndRetry(
+      getApiUrl(`/api/metadata/${id}`),
+      { method: 'GET' },
+      keychain
+    );
+  } else {
+    // For unencrypted files, make a simple GET request without auth
+    const response = await fetch(getApiUrl(`/api/metadata/${id}`), {
+      method: 'GET'
+    });
+    result = { response, ok: response.ok };
+  }
+
   if (result.ok) {
     const data = await result.response.json();
-    const meta = await keychain.decryptMetadata(b64ToArray(data.metadata));
-    return {
-      size: meta.size,
+    console.log('API metadata data:', JSON.stringify(data, null, 2));
+    let meta;
+    if (data.encrypted !== false && keychain) {
+      meta = await keychain.decryptMetadata(b64ToArray(data.metadata));
+    } else {
+      // For unencrypted files, metadata is base64 encoded JSON
+      console.log('Raw metadata before decode:', JSON.stringify(data.metadata));
+      meta = JSON.parse(atob(data.metadata));
+      console.log('Parsed metadata:', JSON.stringify(meta, null, 2));
+    }
+
+    // Handle different metadata structures
+    let processedMeta;
+    if (meta.files && meta.files.length > 0) {
+      // New format: metadata contains files array directly
+      const firstFile = meta.files[0];
+      processedMeta = {
+        name: firstFile.name,
+        size: firstFile.size,
+        type: firstFile.type,
+        iv: meta.iv,
+        manifest: meta
+      };
+    } else {
+      // Old format: metadata contains individual file info
+      processedMeta = {
+        name: meta.name,
+        size: meta.size,
+        type: meta.type,
+        iv: meta.iv,
+        manifest: meta.manifest || {
+          files: [{ name: meta.name, size: meta.size, type: meta.type }]
+        }
+      };
+    }
+
+    const result_meta = {
+      size: processedMeta.size,
       ttl: data.ttl,
-      iv: meta.iv,
-      name: meta.name,
-      type: meta.type,
-      manifest: meta.manifest
+      iv: processedMeta.iv,
+      name: processedMeta.name,
+      type: processedMeta.type,
+      manifest: processedMeta.manifest,
+      encrypted: data.encrypted !== false
     };
+    console.log('Final metadata result:', JSON.stringify(result_meta, null, 2));
+    return result_meta;
   }
   throw new Error(result.response.status);
 }
@@ -192,7 +240,8 @@ async function upload(
   dlimit,
   bearerToken,
   onprogress,
-  canceller
+  canceller,
+  isEncrypted = true
 ) {
   let size = 0;
   const start = Date.now();
@@ -207,13 +256,16 @@ async function upload(
   const ws = await asyncInitWebSocket(endpoint);
 
   try {
-    const metadataHeader = arrayToB64(new Uint8Array(metadata));
+    const metadataHeader = isEncrypted
+      ? arrayToB64(new Uint8Array(metadata))
+      : btoa(metadata);
     const fileMeta = {
       fileMetadata: metadataHeader,
       authorization: `send-v1 ${verifierB64}`,
       bearer: bearerToken,
       timeLimit,
-      dlimit
+      dlimit,
+      encrypted: isEncrypted
     };
     const uploadInfoResponse = listenForResponse(ws, canceller);
     ws.send(JSON.stringify(fileMeta));
@@ -268,7 +320,8 @@ export function uploadWs(
   timeLimit,
   dlimit,
   bearerToken,
-  onprogress
+  onprogress,
+  isEncrypted = true
 ) {
   const canceller = { cancelled: false };
 
@@ -285,7 +338,8 @@ export function uploadWs(
       dlimit,
       bearerToken,
       onprogress,
-      canceller
+      canceller,
+      isEncrypted
     )
   };
 }
@@ -293,16 +347,20 @@ export function uploadWs(
 ////////////////////////
 
 async function downloadS(id, keychain, signal) {
-  const auth = await keychain.authHeader();
+  const headers = {};
+  if (keychain) {
+    const auth = await keychain.authHeader();
+    headers.Authorization = auth;
+  }
 
   const response = await fetch(getApiUrl(`/api/download/${id}`), {
     signal: signal,
     method: 'GET',
-    headers: { Authorization: auth }
+    headers: headers
   });
 
   const authHeader = response.headers.get('WWW-Authenticate');
-  if (authHeader) {
+  if (authHeader && keychain) {
     keychain.nonce = parseNonce(authHeader);
   }
 
@@ -342,7 +400,11 @@ export function downloadStream(id, keychain) {
 //////////////////
 
 async function download(id, keychain, onprogress, canceller) {
-  const auth = await keychain.authHeader();
+  let auth = null;
+  if (keychain) {
+    auth = await keychain.authHeader();
+  }
+
   const xhr = new XMLHttpRequest();
   canceller.oncancel = function() {
     xhr.abort();
@@ -351,7 +413,7 @@ async function download(id, keychain, onprogress, canceller) {
     xhr.addEventListener('loadend', function() {
       canceller.oncancel = function() {};
       const authHeader = xhr.getResponseHeader('WWW-Authenticate');
-      if (authHeader) {
+      if (authHeader && keychain) {
         keychain.nonce = parseNonce(authHeader);
       }
       if (xhr.status !== 200) {
@@ -368,7 +430,11 @@ async function download(id, keychain, onprogress, canceller) {
       }
     });
     xhr.open('get', getApiUrl(`/api/download/blob/${id}`));
-    xhr.setRequestHeader('Authorization', auth);
+
+    if (auth) {
+      xhr.setRequestHeader('Authorization', auth);
+    }
+
     xhr.responseType = 'blob';
     xhr.send();
     onprogress(0);
@@ -429,4 +495,9 @@ export async function getConstants() {
   }
 
   throw new Error(response.status);
+}
+
+export async function reportLink(_id, _keychain, _reason) {
+  // Placeholder function - implement if needed
+  return Promise.resolve();
 }

@@ -23,14 +23,14 @@ module.exports = {
     const id = req.params.id;
     const appState = await state(req);
     try {
-      const { nonce, pwd } = await storage.metadata(id);
+      const { nonce, pwd, encrypted } = await storage.metadata(id);
       res.set('WWW-Authenticate', `send-v1 ${nonce}`);
       res.send(
         stripEvents(
           routes().toString(
             `/download/${id}`,
             Object.assign(appState, {
-              downloadMetadata: { nonce, pwd }
+              downloadMetadata: { nonce, pwd, encrypted: encrypted !== 'false' }
             })
           )
         )

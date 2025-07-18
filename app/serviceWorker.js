@@ -29,16 +29,27 @@ async function decryptStream(id) {
   try {
     let size = file.size;
     let type = file.type;
-    const keychain = new Keychain(file.key, file.nonce);
-    if (file.requiresPassword) {
-      keychain.setPassword(file.password, file.url);
+
+    // Only create keychain for encrypted files
+    let keychain = null;
+    if (file.key) {
+      keychain = new Keychain(file.key, file.nonce);
+      if (file.requiresPassword) {
+        keychain.setPassword(file.password, file.url);
+      }
     }
 
     file.download = downloadStream(id, keychain);
 
     const body = await file.download.result;
 
-    const decrypted = keychain.decryptStream(body);
+    let decrypted;
+    if (keychain) {
+      decrypted = keychain.decryptStream(body);
+    } else {
+      // For unencrypted files, just use the body directly
+      decrypted = body;
+    }
 
     let zipStream = null;
     if (file.type === 'send-archive') {

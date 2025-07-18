@@ -9,12 +9,15 @@ const downloadCompleted = require('./downloadCompleted');
 const BIG_SIZE = 1024 * 1024 * 256;
 
 function createFileInfo(state) {
-  return {
+  const encrypted = downloadMetadata.encrypted !== false;
+  const fileInfo = {
     id: state.params.id,
-    secretKey: state.params.key,
+    secretKey: encrypted ? state.params.key : null,
     nonce: downloadMetadata.nonce,
-    requiresPassword: downloadMetadata.pwd
+    requiresPassword: downloadMetadata.pwd,
+    encrypted: encrypted
   };
+  return fileInfo;
 }
 
 function downloading(state, emit) {
@@ -58,7 +61,7 @@ module.exports = function(state, emit) {
     if (downloadMetadata.status === 404) {
       return notFound(state);
     }
-    if (!state.fileInfo.nonce) {
+    if (!state.fileInfo.nonce && state.fileInfo.encrypted) {
       // coming from something like the browser back button
       return location.reload();
     }

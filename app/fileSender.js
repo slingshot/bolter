@@ -47,12 +47,24 @@ export default class FileSender extends Nanobus {
     if (this.cancelled) {
       throw new Error(0);
     }
-    this.msg = 'encryptingFile';
-    this.emit('encrypting');
-    const totalSize = encryptedSize(archive.size);
-    const encStream = await this.keychain.encryptStream(archive.stream);
-    const metadata = await this.keychain.encryptMetadata(archive);
-    const authKeyB64 = await this.keychain.authKeyB64();
+
+    let encStream, metadata, authKeyB64, totalSize;
+
+    if (archive.encrypted) {
+      this.msg = 'encryptingFile';
+      this.emit('encrypting');
+      totalSize = encryptedSize(archive.size);
+      encStream = await this.keychain.encryptStream(archive.stream);
+      metadata = await this.keychain.encryptMetadata(archive);
+      authKeyB64 = await this.keychain.authKeyB64();
+    } else {
+      this.msg = 'importingFile';
+      this.emit('importing');
+      totalSize = archive.size;
+      encStream = archive.stream;
+      metadata = JSON.stringify(archive.manifest);
+      authKeyB64 = 'unencrypted';
+    }
 
     this.uploadRequest = uploadWs(
       encStream,
@@ -64,7 +76,8 @@ export default class FileSender extends Nanobus {
       p => {
         this.progress = [p, totalSize];
         this.emit('progress');
-      }
+      },
+      archive.encrypted
     );
 
     if (this.cancelled) {
@@ -78,10 +91,12 @@ export default class FileSender extends Nanobus {
       this.msg = 'notifyUploadEncryptDone';
       this.uploadRequest = null;
       this.progress = [1, 1];
-      const secretKey = arrayToB64(this.keychain.rawSecret);
+      const secretKey = archive.encrypted
+        ? arrayToB64(this.keychain.rawSecret)
+        : null;
       const ownedFile = new OwnedFile({
         id: result.id,
-        url: `${result.url}#${secretKey}`,
+        url: archive.encrypted ? `${result.url}#${secretKey}` : result.url,
         name: archive.name,
         size: archive.size,
         manifest: archive.manifest,
@@ -90,10 +105,11 @@ export default class FileSender extends Nanobus {
         createdAt: Date.now(),
         expiresAt: Date.now() + archive.timeLimit * 1000,
         secretKey: secretKey,
-        nonce: this.keychain.nonce,
+        nonce: archive.encrypted ? this.keychain.nonce : null,
         ownerToken: result.ownerToken,
         dlimit: archive.dlimit,
-        timeLimit: archive.timeLimit
+        timeLimit: archive.timeLimit,
+        encrypted: archive.encrypted
       });
 
       return ownedFile;

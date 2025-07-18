@@ -28,6 +28,16 @@ function expiryInfo(translate, archive) {
 function password(state) {
   const MAX_LENGTH = 4096;
 
+  if (!state.archive.encrypted) {
+    return html`
+      <div class="mt-4 mb-2 px-1">
+        <div class="text-sm text-grey-70">
+          ${state.translate('passwordNotAvailable')}
+        </div>
+      </div>
+    `;
+  }
+
   return html`
     <div class="mt-4 mb-2 px-1">
       <input
@@ -147,6 +157,34 @@ function password(state) {
   }
 }
 
+function encryption(state) {
+  return html`
+    <div class="mt-4 mb-2 px-1">
+      <div class="checkbox inline-block mr-3">
+        <input
+          id="encrypt-files"
+          type="checkbox"
+          ${state.archive.encrypted ? 'checked' : ''}
+          autocomplete="off"
+          onchange="${toggleEncryption}"
+        />
+        <label for="encrypt-files">
+          ${state.translate('encryptFiles')}
+        </label>
+      </div>
+      <div class="text-xs text-grey-70 mt-1">
+        ${state.translate('encryptionHelp')}
+      </div>
+    </div>
+  `;
+
+  function toggleEncryption(event) {
+    event.stopPropagation();
+    const checked = event.target.checked;
+    state.archive.encrypted = checked;
+  }
+}
+
 function fileInfo(file, action) {
   return html`
     <send-file class="flex flex-row items-center p-3 w-full">
@@ -180,7 +218,11 @@ function archiveInfo(archive, action) {
 }
 
 function archiveDetails(translate, archive) {
-  if (archive.manifest.files.length > 1) {
+  if (
+    archive.manifest &&
+    archive.manifest.files &&
+    archive.manifest.files.length > 1
+  ) {
     return html`
       <details
         class="w-full pb-1"
@@ -371,6 +413,7 @@ module.exports.wip = function(state, emit) {
         </div>
       </div>
       ${expiryOptions(state, emit)} ${password(state, emit)}
+      ${encryption(state, emit)}
       <button
         id="upload-btn"
         class="btn rounded-lg flex-shrink-0 focus:outline"
@@ -561,7 +604,10 @@ module.exports.preview = function(state, emit) {
   if (archive.open === undefined) {
     archive.open = true;
   }
-  const single = archive.manifest.files.length === 1;
+  const single =
+    archive.manifest && archive.manifest.files
+      ? archive.manifest.files.length === 1
+      : true;
   const details = single
     ? ''
     : html`
@@ -601,6 +647,37 @@ module.exports.preview = function(state, emit) {
       `
     : '';
 
+  const encryptionStatus =
+    archive.encrypted !== false
+      ? html`
+          <div
+            class="mt-2 text-sm text-green-60 dark:text-green-40 flex items-center"
+          >
+            <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path
+                fill-rule="evenodd"
+                d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z"
+                clip-rule="evenodd"
+              />
+            </svg>
+            ${state.translate('encryptionEnabled')}
+          </div>
+        `
+      : html`
+          <div
+            class="mt-2 text-sm text-orange-60 dark:text-orange-40 flex items-center"
+          >
+            <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path
+                fill-rule="evenodd"
+                d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zM8 9V5.5a2 2 0 114 0V9H8z"
+                clip-rule="evenodd"
+              />
+            </svg>
+            ${state.translate('encryptionDisabled')}
+          </div>
+        `;
+
   return html`
     <send-archive
       class="flex flex-col max-h-full bg-white p-4 w-full md:w-128 dark:bg-grey-90"
@@ -608,6 +685,7 @@ module.exports.preview = function(state, emit) {
       <div class="border-default rounded-default py-3 px-6 dark:border-grey-70">
         ${archiveInfo(archive)} ${details}
       </div>
+      ${encryptionStatus}
       <button
         id="download-btn"
         class="btn rounded-lg mt-4 w-full flex-shrink-0 focus:outline"

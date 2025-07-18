@@ -8,13 +8,24 @@ module.exports = {
   hmac: async function(req, res, next) {
     const id = req.params.id;
     const authHeader = req.header('Authorization');
-    if (id && authHeader) {
-      try {
+
+    // First, try to get metadata to check if file is encrypted
+    try {
+      const meta = await storage.metadata(id);
+      if (!meta) {
+        return res.sendStatus(404);
+      }
+
+      // If file is unencrypted, skip authentication
+      if (meta.encrypted === 'false') {
+        req.authorized = true;
+        req.meta = meta;
+        return next();
+      }
+
+      // For encrypted files, require authentication
+      if (authHeader) {
         const auth = req.header('Authorization').split(' ')[1];
-        const meta = await storage.metadata(id);
-        if (!meta) {
-          return res.sendStatus(404);
-        }
         const hmac = crypto.createHmac(
           'sha256',
           Buffer.from(meta.auth, 'base64')
@@ -31,10 +42,15 @@ module.exports = {
           res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
           req.authorized = false;
         }
-      } catch (e) {
+      } else {
+        // No auth header for encrypted file
+        res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
         req.authorized = false;
       }
+    } catch (e) {
+      req.authorized = false;
     }
+
     if (req.authorized) {
       next();
     } else {

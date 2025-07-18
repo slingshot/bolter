@@ -21,6 +21,7 @@ export default class Archive {
     this.timeLimit = defaultTimeLimit;
     this.dlimit = defaultDownloadLimit;
     this.password = null;
+    this.encrypted = false;
   }
 
   get name() {
@@ -80,5 +81,6 @@ export default class Archive {
     this.dlimit = this.defaultDownloadLimit;
     this.timeLimit = this.defaultTimeLimit;
     this.password = null;
+    this.encrypted = false;
   }
 }
