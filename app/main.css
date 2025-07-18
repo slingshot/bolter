@@ -18,6 +18,13 @@ html {
   );
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-primary: #333;
+    --color-primary-accent: #333;
+  }
+}
+
 a {
   color: inherit;
   text-decoration: none;

@@ -35,6 +35,7 @@ module.exports = {
     },
     fontFamily: {
       sans: [
+        'Graphik Web',
         'Inter',
         'system-ui',
         'BlinkMacSystemFont',

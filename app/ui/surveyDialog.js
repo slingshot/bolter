@@ -13,7 +13,7 @@ module.exports = function() {
       <send-survey-dialog
         class="flex flex-col items-center text-center p-4 max-w-sm m-auto"
       >
-        <h1 class="text-3xl font-bold my-4">
+        <h1 class="text-3xl font-semibold my-4">
           Tell us what you think.
         </h1>
         <p class="font-normal leading-normal text-grey-80 px-4">

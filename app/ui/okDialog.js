@@ -4,7 +4,7 @@ module.exports = function(message) {
   return function(state, emit, close) {
     return html`
       <send-ok-dialog class="flex flex-col max-w-sm p-4 m-auto">
-        <h2 class="text-center text-xl font-bold m-8 leading-normal">
+        <h2 class="text-center text-xl font-semibold m-8 leading-normal">
           ${message}
         </h2>
         <button

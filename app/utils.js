@@ -65,7 +65,7 @@ const LOCALIZE_NUMBERS = !!(
   typeof navigator === 'object'
 );
 
-const UNITS = ['bytes', 'kb', 'mb', 'gb'];
+const UNITS = ['bytes', 'kb', 'mb', 'gb', 'tb'];
 function bytes(num) {
   if (num < 1) {
     return '0B';
@@ -80,6 +80,11 @@ function bytes(num) {
         minimumFractionDigits: decimalDigits,
         maximumFractionDigits: decimalDigits
       });
+
+      // remove trailing ".0"
+      if (nStr.endsWith('.0')) {
+        nStr = nStr.slice(0, -2);
+      }
     } catch (e) {
       // fall through
     }

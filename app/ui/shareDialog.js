@@ -6,7 +6,7 @@ module.exports = function(name, url) {
       <send-share-dialog
         class="flex flex-col items-center text-center p-4 max-w-sm m-auto"
       >
-        <h1 class="text-3xl font-bold my-4">
+        <h1 class="text-3xl font-semibold my-4">
           ${state.translate('notifyUploadEncryptDone')}
         </h1>
         <p

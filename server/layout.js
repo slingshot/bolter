@@ -3,9 +3,16 @@ const assets = require('../common/assets');
 const initScript = require('./initScript');
 
 module.exports = function(state, body = '') {
-  const custom_css = state.ui.assets.custom_css !== ''
-    ? html`<link rel="stylesheet" type="text/css" href="${state.ui.assets.custom_css}" />`
-    : ''
+  const custom_css =
+    state.ui.assets.custom_css !== ''
+      ? html`
+          <link
+            rel="stylesheet"
+            type="text/css"
+            href="${state.ui.assets.custom_css}"
+          />
+        `
+      : '';
 
   return html`
     <!DOCTYPE html>
@@ -32,11 +39,21 @@ module.exports = function(state, body = '') {
         <meta name="msapplication-TileColor" content="#220033" />
 
         <link rel="manifest" href="/app.webmanifest" />
-        <link rel="stylesheet" type="text/css" href="/inter.css" />
+        <link
+          rel="stylesheet"
+          type="text/css"
+          href="https://swift.slingshot.fm/sling/graphik/graphik.css"
+        />
         <style nonce=${state.cspNonce}>
           :root {
             --color-primary: ${state.ui.colors.primary};
             --color-primary-accent: ${state.ui.colors.accent};
+          }
+          @media (prefers-color-scheme: dark) {
+            :root {
+              --color-primary: #fff;
+              --color-primary-accent: #eee;
+            }
           }
         </style>
         <link
@@ -68,6 +85,11 @@ module.exports = function(state, body = '') {
           color="#838383"
         />
         <script defer src="${assets.get('app.js')}"></script>
+        <script
+          defer
+          data-domain="fair.fm"
+          src="https://pl.slingshot.fm/js/script.js"
+        ></script>
       </head>
       <noscript>
         <div class="noscript">

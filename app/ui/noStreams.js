@@ -8,7 +8,7 @@ module.exports = function(state, emit) {
     <div
       class="flex flex-col w-full max-w-md h-full mx-auto items-center justify-center"
     >
-      <h1 class="mb-4 text-3xl font-bold">${state.translate(
+      <h1 class="mb-4 text-3xl font-semibold">${state.translate(
         'downloadTitle'
       )}</h1>
       <p
