@@ -131,6 +131,13 @@ module.exports = function(app) {
   app.get('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.get);
   app.post('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.post);
   app.post('/api/upload', auth.fxa, require('./upload'));
+  app.post('/api/upload/url', auth.fxa, require('./uploadUrl'));
+  app.post('/api/upload/complete', auth.fxa, require('./uploadComplete'));
+  app.post(
+    `/api/upload/abort/:id${ID_REGEX}`,
+    auth.fxa,
+    require('./uploadAbort')
+  );
   app.post(`/api/delete/:id${ID_REGEX}`, auth.owner, require('./delete'));
   app.post(`/api/password/:id${ID_REGEX}`, auth.owner, require('./password'));
   app.post(

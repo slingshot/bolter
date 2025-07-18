@@ -51,6 +51,32 @@ class FSStorage {
     // Return null to indicate streaming should be used instead
     return null;
   }
+
+  getSignedUploadUrl(_id) {
+    // For filesystem storage, we can't generate pre-signed URLs
+    // Return null to indicate WebSocket upload should be used instead
+    return null;
+  }
+
+  createMultipartUpload(_id) {
+    // Filesystem storage doesn't support multipart uploads
+    return null;
+  }
+
+  getSignedMultipartUploadUrl(_id, _uploadId, _partNumber) {
+    // Filesystem storage doesn't support multipart uploads
+    return null;
+  }
+
+  completeMultipartUpload(_id, _uploadId, _parts) {
+    // Filesystem storage doesn't support multipart uploads
+    return null;
+  }
+
+  abortMultipartUpload(_id, _uploadId) {
+    // Filesystem storage doesn't support multipart uploads
+    return null;
+  }
 }
 
 module.exports = FSStorage;

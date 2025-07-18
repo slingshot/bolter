@@ -52,6 +52,60 @@ class S3Storage {
       Expires: expiresIn
     });
   }
+
+  // Single part upload pre-signed URL
+  getSignedUploadUrl(id, expiresIn = 3600) {
+    return this.s3.getSignedUrl('putObject', {
+      Bucket: this.bucket,
+      Key: id,
+      Expires: expiresIn
+    });
+  }
+
+  // Multipart upload methods
+  async createMultipartUpload(id) {
+    const result = await this.s3
+      .createMultipartUpload({
+        Bucket: this.bucket,
+        Key: id
+      })
+      .promise();
+    return result.UploadId;
+  }
+
+  getSignedMultipartUploadUrl(id, uploadId, partNumber, expiresIn = 3600) {
+    return this.s3.getSignedUrl('uploadPart', {
+      Bucket: this.bucket,
+      Key: id,
+      UploadId: uploadId,
+      PartNumber: partNumber,
+      Expires: expiresIn
+    });
+  }
+
+  async completeMultipartUpload(id, uploadId, parts) {
+    const result = await this.s3
+      .completeMultipartUpload({
+        Bucket: this.bucket,
+        Key: id,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: parts
+        }
+      })
+      .promise();
+    return result;
+  }
+
+  async abortMultipartUpload(id, uploadId) {
+    await this.s3
+      .abortMultipartUpload({
+        Bucket: this.bucket,
+        Key: id,
+        UploadId: uploadId
+      })
+      .promise();
+  }
 }
 
 module.exports = S3Storage;

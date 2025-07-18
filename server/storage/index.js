@@ -86,6 +86,41 @@ class DB {
     const filePath = await this.getPrefixedId(id);
     return this.storage.getSignedUrl(filePath, expiresIn);
   }
+
+  async getSignedUploadUrl(id, expiresIn = 3600) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.getSignedUploadUrl(filePath, expiresIn);
+  }
+
+  async createMultipartUpload(id) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.createMultipartUpload(filePath);
+  }
+
+  async getSignedMultipartUploadUrl(
+    id,
+    uploadId,
+    partNumber,
+    expiresIn = 3600
+  ) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.getSignedMultipartUploadUrl(
+      filePath,
+      uploadId,
+      partNumber,
+      expiresIn
+    );
+  }
+
+  async completeMultipartUpload(id, uploadId, parts) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.completeMultipartUpload(filePath, uploadId, parts);
+  }
+
+  async abortMultipartUpload(id, uploadId) {
+    const filePath = await this.getPrefixedId(id);
+    return this.storage.abortMultipartUpload(filePath, uploadId);
+  }
 }
 
 module.exports = new DB(config);

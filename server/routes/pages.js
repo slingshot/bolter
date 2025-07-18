@@ -23,7 +23,15 @@ module.exports = {
     const id = req.params.id;
     const appState = await state(req);
     try {
-      const { nonce, pwd, encrypted } = await storage.metadata(id);
+      const metadata = await storage.metadata(id);
+      console.log(
+        'DEBUG: Server download page metadata:',
+        JSON.stringify(metadata, null, 2)
+      );
+
+      const { nonce, pwd, encrypted } = metadata;
+      console.log('DEBUG: Extracted values:', { nonce, pwd, encrypted });
+
       res.set('WWW-Authenticate', `send-v1 ${nonce}`);
       res.send(
         stripEvents(
@@ -36,6 +44,7 @@ module.exports = {
         )
       );
     } catch (e) {
+      console.log('DEBUG: Error in download page:', e);
       next();
     }
   },

@@ -10,6 +10,15 @@ const BIG_SIZE = 1024 * 1024 * 256;
 
 function createFileInfo(state) {
   const encrypted = downloadMetadata.encrypted !== false;
+  console.log('DEBUG: createFileInfo called with:', {
+    stateParamsId: state.params.id,
+    stateParamsKey: state.params.key ? 'present' : 'missing',
+    downloadMetadataEncrypted: downloadMetadata.encrypted,
+    downloadMetadataNonce: downloadMetadata.nonce ? 'present' : 'missing',
+    downloadMetadataPwd: downloadMetadata.pwd,
+    downloadMetadataStatus: downloadMetadata.status
+  });
+
   const fileInfo = {
     id: state.params.id,
     secretKey: encrypted ? state.params.key : null,
@@ -17,6 +26,15 @@ function createFileInfo(state) {
     requiresPassword: downloadMetadata.pwd,
     encrypted: encrypted
   };
+
+  console.log('DEBUG: Created fileInfo:', {
+    id: fileInfo.id,
+    secretKey: fileInfo.secretKey ? 'present' : 'missing',
+    nonce: fileInfo.nonce ? 'present' : 'missing',
+    requiresPassword: fileInfo.requiresPassword,
+    encrypted: fileInfo.encrypted
+  });
+
   return fileInfo;
 }
 

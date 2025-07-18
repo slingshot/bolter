@@ -1,4 +1,4 @@
-import { arrayToB64, b64ToArray, delay } from './utils';
+import { arrayToB64, b64ToArray, delay, streamToArrayBuffer } from './utils';
 import { ECE_RECORD_SIZE } from './ece';
 
 let fileProtocolWssUrl = null;
@@ -119,14 +119,22 @@ export async function fileInfo(id, owner_token) {
 }
 
 export async function metadata(id, keychain) {
+  console.log('DEBUG: metadata API called with:', {
+    id: id,
+    hasKeychain: !!keychain,
+    keychainNonce: keychain ? keychain.nonce : null
+  });
+
   let result;
   if (keychain) {
+    console.log('DEBUG: Making authenticated request to /api/metadata/' + id);
     result = await fetchWithAuthAndRetry(
       getApiUrl(`/api/metadata/${id}`),
       { method: 'GET' },
       keychain
     );
   } else {
+    console.log('DEBUG: Making unauthenticated request to /api/metadata/' + id);
     // For unencrypted files, make a simple GET request without auth
     const response = await fetch(getApiUrl(`/api/metadata/${id}`), {
       method: 'GET'
@@ -134,17 +142,41 @@ export async function metadata(id, keychain) {
     result = { response, ok: response.ok };
   }
 
+  console.log(
+    'DEBUG: metadata API response status:',
+    result.response.status,
+    'ok:',
+    result.ok
+  );
+
   if (result.ok) {
     const data = await result.response.json();
-    console.log('API metadata data:', JSON.stringify(data, null, 2));
+    console.log('DEBUG: API metadata data:', JSON.stringify(data, null, 2));
     let meta;
     if (data.encrypted !== false && keychain) {
+      console.log('DEBUG: Decrypting metadata with keychain');
       meta = await keychain.decryptMetadata(b64ToArray(data.metadata));
     } else {
+      console.log('DEBUG: Decoding unencrypted metadata');
       // For unencrypted files, metadata is base64 encoded JSON
-      console.log('Raw metadata before decode:', JSON.stringify(data.metadata));
-      meta = JSON.parse(decodeURIComponent(escape(atob(data.metadata))));
-      console.log('Parsed metadata:', JSON.stringify(meta, null, 2));
+      console.log(
+        'DEBUG: Raw metadata before decode:',
+        JSON.stringify(data.metadata)
+      );
+      try {
+        // Try Unicode-safe decoding first (for new uploads)
+        meta = JSON.parse(decodeURIComponent(escape(atob(data.metadata))));
+        console.log('DEBUG: Used Unicode-safe decoding');
+      } catch (e) {
+        console.log(
+          'DEBUG: Unicode-safe decoding failed, using simple atob:',
+          e.message
+        );
+        // Fall back to simple atob for old uploads
+        meta = JSON.parse(atob(data.metadata));
+        console.log('DEBUG: Simple atob decoding succeeded');
+      }
+      console.log('DEBUG: Parsed metadata:', JSON.stringify(meta, null, 2));
     }
 
     // Handle different metadata structures
@@ -358,6 +390,314 @@ export function uploadWs(
       isEncrypted
     )
   };
+}
+
+export function uploadDirect(
+  encrypted,
+  metadata,
+  verifierB64,
+  timeLimit,
+  dlimit,
+  bearerToken,
+  totalSize,
+  onprogress,
+  isEncrypted = true
+) {
+  const canceller = { cancelled: false };
+
+  return {
+    cancel: function() {
+      canceller.cancelled = true;
+    },
+
+    result: uploadDirectToS3(
+      encrypted,
+      metadata,
+      verifierB64,
+      timeLimit,
+      dlimit,
+      bearerToken,
+      totalSize,
+      onprogress,
+      canceller,
+      isEncrypted
+    )
+  };
+}
+
+////////////////////////
+
+async function uploadDirectToS3(
+  encrypted,
+  metadata,
+  verifierB64,
+  timeLimit,
+  dlimit,
+  bearerToken,
+  totalSize,
+  onprogress,
+  canceller,
+  isEncrypted = true
+) {
+  const start = Date.now();
+
+  try {
+    // First, get upload URLs
+    const uploadResponse = await fetch(getApiUrl('/api/upload/url'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bearerToken}`
+      },
+      body: JSON.stringify({
+        fileSize: totalSize,
+        encrypted: isEncrypted,
+        timeLimit,
+        dlimit
+      })
+    });
+
+    if (!uploadResponse.ok) {
+      throw new Error(`HTTP ${uploadResponse.status}`);
+    }
+
+    const uploadInfo = await uploadResponse.json();
+
+    // Check if we should use pre-signed URLs
+    if (!uploadInfo.useSignedUrl) {
+      // Fall back to WebSocket upload
+      return upload(
+        encrypted,
+        metadata,
+        verifierB64,
+        timeLimit,
+        dlimit,
+        bearerToken,
+        onprogress,
+        canceller,
+        isEncrypted
+      );
+    }
+
+    // Convert stream to blob for direct upload
+    let fileBlob;
+    if (encrypted.getReader) {
+      // It's a ReadableStream, convert to blob
+      const arrayBuffer = await streamToArrayBuffer(encrypted, totalSize);
+      fileBlob = new Blob([arrayBuffer]);
+    } else {
+      // It's already a blob/file
+      fileBlob = encrypted;
+    }
+
+    let uploadResult;
+
+    if (uploadInfo.multipart) {
+      // Multipart upload
+      uploadResult = await uploadMultipart(
+        fileBlob,
+        uploadInfo,
+        onprogress,
+        canceller
+      );
+    } else {
+      // Single part upload
+      uploadResult = await uploadSinglePart(
+        fileBlob,
+        uploadInfo.url,
+        onprogress,
+        canceller
+      );
+    }
+
+    if (canceller.cancelled) {
+      if (uploadInfo.multipart) {
+        // Abort multipart upload
+        await abortMultipartUpload(
+          uploadInfo.id,
+          uploadInfo.uploadId,
+          bearerToken
+        );
+      }
+      throw new Error('Upload cancelled');
+    }
+
+    // Complete the upload
+    // Convert metadata to string format for JSON transmission
+    const metadataString = isEncrypted
+      ? arrayToB64(new Uint8Array(metadata))
+      : metadata; // For unencrypted, metadata is already a base64 string
+
+    console.log('DEBUG: uploadDirectToS3 - metadata before complete:', {
+      metadataType: typeof metadata,
+      metadataStringType: typeof metadataString,
+      metadataString: metadataString,
+      isEncrypted: isEncrypted
+    });
+
+    const completeResponse = await fetch(getApiUrl('/api/upload/complete'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bearerToken}`
+      },
+      body: JSON.stringify({
+        id: uploadInfo.id,
+        metadata: metadataString,
+        ...(isEncrypted && { authKey: verifierB64 }),
+        actualSize: totalSize,
+        ...(uploadInfo.multipart && { parts: uploadResult.parts })
+      })
+    });
+
+    if (!completeResponse.ok) {
+      throw new Error(`HTTP ${completeResponse.status}`);
+    }
+
+    const completeInfo = await completeResponse.json();
+
+    return {
+      id: uploadInfo.id,
+      url: uploadInfo.completeUrl || completeInfo.url,
+      ownerToken: uploadInfo.owner,
+      duration: Date.now() - start
+    };
+  } catch (e) {
+    if (canceller.cancelled) {
+      throw new Error('Upload cancelled');
+    }
+    throw e;
+  }
+}
+
+async function uploadSinglePart(file, url, onprogress, canceller) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    canceller.cancel = () => {
+      xhr.abort();
+    };
+
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable) {
+        onprogress(e.loaded);
+      }
+    });
+
+    xhr.addEventListener('loadend', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve({ success: true });
+      } else {
+        reject(new Error(`HTTP ${xhr.status}`));
+      }
+    });
+
+    xhr.addEventListener('error', () => {
+      reject(new Error('Network error'));
+    });
+
+    xhr.open('PUT', url);
+    xhr.send(file);
+  });
+}
+
+async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
+  const { parts, partSize } = uploadInfo;
+  const completedParts = [];
+  let totalUploaded = 0;
+
+  // Upload parts in parallel (limit concurrency)
+  const CONCURRENT_UPLOADS = 3;
+  const uploadPromises = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const start = (part.partNumber - 1) * partSize;
+    const end = Math.min(start + partSize, file.size);
+    const partBlob = file.slice(start, end);
+
+    const uploadPromise = uploadPart(
+      partBlob,
+      part.url,
+      part.partNumber,
+      loaded => {
+        totalUploaded += loaded;
+        onprogress(totalUploaded);
+      },
+      canceller
+    );
+
+    uploadPromises.push(uploadPromise);
+
+    // Limit concurrent uploads
+    if (uploadPromises.length >= CONCURRENT_UPLOADS) {
+      const completed = await Promise.all(uploadPromises);
+      completedParts.push(...completed);
+      uploadPromises.length = 0;
+    }
+  }
+
+  // Upload remaining parts
+  if (uploadPromises.length > 0) {
+    const completed = await Promise.all(uploadPromises);
+    completedParts.push(...completed);
+  }
+
+  return {
+    parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber)
+  };
+}
+
+async function uploadPart(partBlob, url, partNumber, onProgress, canceller) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    const originalCancel = canceller.cancel;
+    canceller.cancel = () => {
+      xhr.abort();
+      if (originalCancel) originalCancel();
+    };
+
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable) {
+        onProgress(e.loaded);
+      }
+    });
+
+    xhr.addEventListener('loadend', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const etag = xhr.getResponseHeader('ETag');
+        resolve({
+          PartNumber: partNumber,
+          ETag: etag
+        });
+      } else {
+        reject(new Error(`HTTP ${xhr.status} for part ${partNumber}`));
+      }
+    });
+
+    xhr.addEventListener('error', () => {
+      reject(new Error(`Network error for part ${partNumber}`));
+    });
+
+    xhr.open('PUT', url);
+    xhr.send(partBlob);
+  });
+}
+
+async function abortMultipartUpload(id, uploadId, bearerToken) {
+  try {
+    await fetch(getApiUrl(`/api/upload/abort/${id}`), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bearerToken}`
+      },
+      body: JSON.stringify({ uploadId })
+    });
+  } catch (e) {
+    console.warn('Failed to abort multipart upload:', e);
+  }
 }
 
 ////////////////////////

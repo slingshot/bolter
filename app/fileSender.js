@@ -2,7 +2,7 @@ import Nanobus from 'nanobus';
 import OwnedFile from './ownedFile';
 import Keychain from './keychain';
 import { arrayToB64, bytes } from './utils';
-import { uploadWs } from './api';
+import { uploadDirect } from './api';
 import { encryptedSize } from './utils';
 
 export default class FileSender extends Nanobus {
@@ -66,17 +66,21 @@ export default class FileSender extends Nanobus {
       this.emit('importing');
       totalSize = archive.size;
       encStream = archive.stream;
-      metadata = JSON.stringify(archive.manifest);
+      metadata = btoa(
+        unescape(encodeURIComponent(JSON.stringify(archive.manifest)))
+      );
       authKeyB64 = 'unencrypted';
     }
 
-    this.uploadRequest = uploadWs(
+    // Try direct upload first, fall back to WebSocket
+    this.uploadRequest = uploadDirect(
       encStream,
       metadata,
       authKeyB64,
       archive.timeLimit,
       archive.dlimit,
       bearerToken,
+      totalSize,
       p => {
         this.progress = [p, totalSize];
         this.emit('progress');
@@ -102,7 +106,9 @@ export default class FileSender extends Nanobus {
         : null;
       const ownedFile = new OwnedFile({
         id: result.id,
-        url: archive.encrypted ? `${result.url}#${secretKey}` : result.url,
+        url: archive.encrypted
+          ? `${result.url.split('#')[0]}#${secretKey}`
+          : result.url,
         name: archive.name,
         size: archive.size,
         manifest: archive.manifest,

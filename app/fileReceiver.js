@@ -46,7 +46,25 @@ export default class FileReceiver extends Nanobus {
   }
 
   async getMetadata() {
+    console.log('DEBUG: getMetadata called with:', {
+      fileId: this.fileInfo.id,
+      hasKeychain: !!this.keychain,
+      fileInfoEncrypted: this.fileInfo.encrypted,
+      fileInfoSecretKey: this.fileInfo.secretKey ? 'present' : 'missing',
+      fileInfoNonce: this.fileInfo.nonce ? 'present' : 'missing'
+    });
+
     const meta = await metadata(this.fileInfo.id, this.keychain);
+
+    console.log('DEBUG: metadata response:', {
+      metaName: meta.name,
+      metaSize: meta.size,
+      metaEncrypted: meta.encrypted,
+      metaTtl: meta.ttl,
+      metaIv: meta.iv ? 'present' : 'missing',
+      metaManifest: meta.manifest ? 'present' : 'missing'
+    });
+
     this.fileInfo.name = meta.name;
     this.fileInfo.type = meta.type;
     this.fileInfo.iv = meta.iv;
@@ -56,8 +74,16 @@ export default class FileReceiver extends Nanobus {
 
     // If file is unencrypted but we have a keychain, remove it
     if (!meta.encrypted && this.keychain) {
+      console.log('DEBUG: Removing keychain for unencrypted file');
       this.keychain = null;
     }
+
+    console.log('DEBUG: Final fileInfo state:', {
+      name: this.fileInfo.name,
+      size: this.fileInfo.size,
+      encrypted: this.fileInfo.encrypted,
+      hasKeychain: !!this.keychain
+    });
 
     this.state = 'ready';
   }

@@ -211,19 +211,29 @@ export default function(state, emitter) {
 
   emitter.on('getMetadata', async () => {
     const file = state.fileInfo;
+    console.log('DEBUG: getMetadata event triggered with file:', {
+      id: file.id,
+      secretKey: file.secretKey ? 'present' : 'missing',
+      nonce: file.nonce ? 'present' : 'missing',
+      encrypted: file.encrypted,
+      requiresPassword: file.requiresPassword
+    });
 
     const receiver = new FileReceiver(file);
     try {
       await receiver.getMetadata();
       state.transfer = receiver;
+      console.log('DEBUG: getMetadata successful');
     } catch (e) {
+      console.log('DEBUG: getMetadata failed with error:', e.message, e);
       if (e.message === '401' || e.message === '404') {
         file.password = null;
         if (!file.requiresPassword) {
+          console.log('DEBUG: Redirecting to 404 page');
           return emitter.emit('pushState', '/404');
         }
       } else {
-        console.error(e);
+        console.error('DEBUG: Unexpected error:', e);
         return emitter.emit('pushState', '/error');
       }
     }
