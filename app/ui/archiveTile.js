@@ -499,12 +499,15 @@ module.exports.wip = function(state, emit) {
 
 module.exports.uploading = function(state, emit) {
   const progress = state.transfer.progressRatio;
-  const progressPercent = percent(progress);
+  const isInitializing = progress === 0 || progress === undefined;
+  const progressPercent = isInitializing
+    ? 'Initializing...'
+    : percent(progress);
   const archive = state.archive;
   return html`
     <send-upload-area
       id="${archive.id}"
-      class="flex flex-col items-center rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90"
+      class="flex flex-col items-start rounded-default shadow-light bg-white p-4 w-full dark:bg-grey-90"
     >
       ${archiveInfo(archive)}
       <div class="text-xs opacity-75 w-full mt-2 mb-2">
@@ -517,7 +520,9 @@ module.exports.uploading = function(state, emit) {
       <div class="link-primary text-sm font-medium mt-2">
         ${progressPercent}
       </div>
-      <progress class="my-3" value="${progress}">${progressPercent}</progress>
+      <progress class="my-3" value="${isInitializing ? 0 : progress}"
+        >${progressPercent}</progress
+      >
       <button
         class="link-primary self-end font-medium"
         onclick=${cancel}
@@ -733,7 +738,10 @@ module.exports.preview = function(state, emit) {
 module.exports.downloading = function(state) {
   const archive = state.fileInfo;
   const progress = state.transfer.progressRatio;
-  const progressPercent = percent(progress);
+  const isInitializing = progress === 0 || progress === undefined;
+  const progressPercent = isInitializing
+    ? 'Initializing...'
+    : percent(progress);
   return html`
     <send-archive
       class="flex flex-col bg-white rounded-default shadow-light p-4 w-full max-w-sm md:w-128 dark:bg-grey-90"
@@ -742,7 +750,9 @@ module.exports.downloading = function(state) {
       <div class="link-primary text-sm font-medium mt-2">
         ${progressPercent}
       </div>
-      <progress class="my-3" value="${progress}">${progressPercent}</progress>
+      <progress class="my-3" value="${isInitializing ? 0 : progress}"
+        >${progressPercent}</progress
+      >
     </send-archive>
   `;
 };

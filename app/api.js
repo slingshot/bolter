@@ -405,9 +405,13 @@ export function uploadDirect(
 ) {
   const canceller = { cancelled: false };
 
-  return {
+  const uploadRequest = {
     cancel: function() {
       canceller.cancelled = true;
+      // Call the actual cancellation function if it was set up
+      if (canceller.actualCancel) {
+        canceller.actualCancel();
+      }
     },
 
     result: uploadDirectToS3(
@@ -423,6 +427,8 @@ export function uploadDirect(
       isEncrypted
     )
   };
+
+  return uploadRequest;
 }
 
 ////////////////////////
@@ -483,8 +489,20 @@ async function uploadDirectToS3(
     let fileBlob;
     if (encrypted.getReader) {
       // It's a ReadableStream, convert to blob
-      const arrayBuffer = await streamToArrayBuffer(encrypted, totalSize);
-      fileBlob = new Blob([arrayBuffer]);
+      // For very large files, we'll use a streaming approach
+      if (totalSize > 500 * 1024 * 1024) {
+        // 500MB threshold
+        // For very large files, use the Response API to convert stream to blob
+        fileBlob = await new Response(encrypted).blob();
+        // Ensure it's a proper blob by creating a new one if needed
+        if (!fileBlob.slice) {
+          fileBlob = new Blob([fileBlob]);
+        }
+      } else {
+        // For smaller files, use the arrayBuffer approach
+        const arrayBuffer = await streamToArrayBuffer(encrypted, totalSize);
+        fileBlob = new Blob([arrayBuffer]);
+      }
     } else {
       // It's already a blob/file
       fileBlob = encrypted;
@@ -519,7 +537,7 @@ async function uploadDirectToS3(
           bearerToken
         );
       }
-      throw new Error('Upload cancelled');
+      throw new Error(0);
     }
 
     // Complete the upload
@@ -557,7 +575,7 @@ async function uploadDirectToS3(
     };
   } catch (e) {
     if (canceller.cancelled) {
-      throw new Error('Upload cancelled');
+      throw new Error(0);
     }
     throw e;
   }
@@ -597,7 +615,26 @@ async function uploadSinglePart(file, url, onprogress, canceller) {
 async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
   const { parts, partSize } = uploadInfo;
   const completedParts = [];
-  let totalUploaded = 0;
+  const partProgress = {}; // Track progress per part
+
+  // Ensure we have a blob with slice method
+  if (!file.slice) {
+    throw new Error(
+      'File object does not support slicing for multipart upload'
+    );
+  }
+
+  // Set up cancellation for all XHR requests
+  canceller.actualCancel = () => {
+    canceller.cancelled = true;
+    if (canceller.xhrs) {
+      canceller.xhrs.forEach(xhr => {
+        if (xhr.readyState !== XMLHttpRequest.DONE) {
+          xhr.abort();
+        }
+      });
+    }
+  };
 
   // Upload parts in parallel (limit concurrency)
   const CONCURRENT_UPLOADS = 3;
@@ -614,7 +651,12 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
       part.url,
       part.partNumber,
       loaded => {
-        totalUploaded += loaded;
+        partProgress[part.partNumber] = loaded;
+        // Calculate total progress from all parts
+        const totalUploaded = Object.values(partProgress).reduce(
+          (sum, progress) => sum + progress,
+          0
+        );
         onprogress(totalUploaded);
       },
       canceller
@@ -624,16 +666,34 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
 
     // Limit concurrent uploads
     if (uploadPromises.length >= CONCURRENT_UPLOADS) {
-      const completed = await Promise.all(uploadPromises);
-      completedParts.push(...completed);
+      const completed = await Promise.allSettled(uploadPromises);
+      completed.forEach(result => {
+        if (result.status === 'fulfilled') {
+          completedParts.push(result.value);
+        }
+      });
       uploadPromises.length = 0;
+
+      // Check if cancelled
+      if (canceller.cancelled) {
+        throw new Error(0);
+      }
     }
   }
 
   // Upload remaining parts
   if (uploadPromises.length > 0) {
-    const completed = await Promise.all(uploadPromises);
-    completedParts.push(...completed);
+    const completed = await Promise.allSettled(uploadPromises);
+    completed.forEach(result => {
+      if (result.status === 'fulfilled') {
+        completedParts.push(result.value);
+      }
+    });
+
+    // Check if cancelled
+    if (canceller.cancelled) {
+      throw new Error(0);
+    }
   }
 
   return {
@@ -645,11 +705,17 @@ async function uploadPart(partBlob, url, partNumber, onProgress, canceller) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
 
-    const originalCancel = canceller.cancel;
-    canceller.cancel = () => {
-      xhr.abort();
-      if (originalCancel) originalCancel();
-    };
+    // Check if already cancelled
+    if (canceller.cancelled) {
+      reject(new Error(0));
+      return;
+    }
+
+    // Store the xhr for cancellation
+    if (!canceller.xhrs) {
+      canceller.xhrs = [];
+    }
+    canceller.xhrs.push(xhr);
 
     xhr.upload.addEventListener('progress', e => {
       if (e.lengthComputable) {
