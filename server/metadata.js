@@ -7,7 +7,9 @@ class Metadata {
     this.metadata = obj.metadata;
     this.auth = obj.auth;
     this.nonce = obj.nonce;
-    this.encrypted = obj.encrypted;
+    if (obj.encrypted !== undefined) {
+      this.encrypted = obj.encrypted;
+    }
   }
 }
 

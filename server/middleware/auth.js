@@ -9,7 +9,12 @@ module.exports = {
     const id = req.params.id;
     const authHeader = req.header('Authorization');
 
-    // First, try to get metadata to check if file is encrypted
+    // First check if auth header is present
+    if (!authHeader) {
+      return res.sendStatus(401);
+    }
+
+    // Try to get metadata to check if file is encrypted
     try {
       const meta = await storage.metadata(id);
       if (!meta) {
@@ -24,26 +29,20 @@ module.exports = {
       }
 
       // For encrypted files, require authentication
-      if (authHeader) {
-        const auth = req.header('Authorization').split(' ')[1];
-        const hmac = crypto.createHmac(
-          'sha256',
-          Buffer.from(meta.auth, 'base64')
-        );
-        hmac.update(Buffer.from(meta.nonce, 'base64'));
-        const verifyHash = hmac.digest();
-        if (crypto.timingSafeEqual(verifyHash, Buffer.from(auth, 'base64'))) {
-          req.nonce = crypto.randomBytes(16).toString('base64');
-          storage.setField(id, 'nonce', req.nonce);
-          res.set('WWW-Authenticate', `send-v1 ${req.nonce}`);
-          req.authorized = true;
-          req.meta = meta;
-        } else {
-          res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
-          req.authorized = false;
-        }
+      const auth = req.header('Authorization').split(' ')[1];
+      const hmac = crypto.createHmac(
+        'sha256',
+        Buffer.from(meta.auth, 'base64')
+      );
+      hmac.update(Buffer.from(meta.nonce, 'base64'));
+      const verifyHash = hmac.digest();
+      if (crypto.timingSafeEqual(verifyHash, Buffer.from(auth, 'base64'))) {
+        req.nonce = crypto.randomBytes(16).toString('base64');
+        storage.setField(id, 'nonce', req.nonce);
+        res.set('WWW-Authenticate', `send-v1 ${req.nonce}`);
+        req.authorized = true;
+        req.meta = meta;
       } else {
-        // No auth header for encrypted file
         res.set('WWW-Authenticate', `send-v1 ${meta.nonce}`);
         req.authorized = false;
       }
