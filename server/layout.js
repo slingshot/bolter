@@ -82,7 +82,7 @@ module.exports = function(state, body = '') {
         <script
           defer
           data-domain="send.fm"
-          src="https://pl.slingshot.fm/js/script.tagged-events.js"
+          src="https://pl.slingshot.fm/js/script-te.js"
         ></script>
       </head>
       <noscript>

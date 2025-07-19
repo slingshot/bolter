@@ -1,4 +1,4 @@
-import { arrayToB64, b64ToArray, delay, streamToArrayBuffer } from './utils';
+import { arrayToB64, b64ToArray, delay } from './utils';
 import { ECE_RECORD_SIZE } from './ece';
 
 let fileProtocolWssUrl = null;
@@ -119,22 +119,14 @@ export async function fileInfo(id, owner_token) {
 }
 
 export async function metadata(id, keychain) {
-  console.log('DEBUG: metadata API called with:', {
-    id: id,
-    hasKeychain: !!keychain,
-    keychainNonce: keychain ? keychain.nonce : null
-  });
-
   let result;
   if (keychain) {
-    console.log('DEBUG: Making authenticated request to /api/metadata/' + id);
     result = await fetchWithAuthAndRetry(
       getApiUrl(`/api/metadata/${id}`),
       { method: 'GET' },
       keychain
     );
   } else {
-    console.log('DEBUG: Making unauthenticated request to /api/metadata/' + id);
     // For unencrypted files, make a simple GET request without auth
     const response = await fetch(getApiUrl(`/api/metadata/${id}`), {
       method: 'GET'
@@ -142,41 +134,20 @@ export async function metadata(id, keychain) {
     result = { response, ok: response.ok };
   }
 
-  console.log(
-    'DEBUG: metadata API response status:',
-    result.response.status,
-    'ok:',
-    result.ok
-  );
-
   if (result.ok) {
     const data = await result.response.json();
-    console.log('DEBUG: API metadata data:', JSON.stringify(data, null, 2));
     let meta;
     if (data.encrypted !== false && keychain) {
-      console.log('DEBUG: Decrypting metadata with keychain');
       meta = await keychain.decryptMetadata(b64ToArray(data.metadata));
     } else {
-      console.log('DEBUG: Decoding unencrypted metadata');
       // For unencrypted files, metadata is base64 encoded JSON
-      console.log(
-        'DEBUG: Raw metadata before decode:',
-        JSON.stringify(data.metadata)
-      );
       try {
         // Try Unicode-safe decoding first (for new uploads)
         meta = JSON.parse(decodeURIComponent(escape(atob(data.metadata))));
-        console.log('DEBUG: Used Unicode-safe decoding');
       } catch (e) {
-        console.log(
-          'DEBUG: Unicode-safe decoding failed, using simple atob:',
-          e.message
-        );
         // Fall back to simple atob for old uploads
         meta = JSON.parse(atob(data.metadata));
-        console.log('DEBUG: Simple atob decoding succeeded');
       }
-      console.log('DEBUG: Parsed metadata:', JSON.stringify(meta, null, 2));
     }
 
     // Handle different metadata structures
@@ -229,7 +200,6 @@ export async function metadata(id, keychain) {
       manifest: processedMeta.manifest,
       encrypted: data.encrypted !== false
     };
-    console.log('Final metadata result:', JSON.stringify(result_meta, null, 2));
     return result_meta;
   }
   throw new Error(result.response.status);
@@ -485,43 +455,42 @@ async function uploadDirectToS3(
       );
     }
 
-    // Convert stream to blob for direct upload
-    let fileBlob;
-    if (encrypted.getReader) {
-      // It's a ReadableStream, convert to blob
-      // For very large files, we'll use a streaming approach
-      if (totalSize > 500 * 1024 * 1024) {
-        // 500MB threshold
-        // For very large files, use the Response API to convert stream to blob
-        fileBlob = await new Response(encrypted).blob();
-        // Ensure it's a proper blob by creating a new one if needed
-        if (!fileBlob.slice) {
-          fileBlob = new Blob([fileBlob]);
-        }
-      } else {
-        // For smaller files, use the arrayBuffer approach
-        const arrayBuffer = await streamToArrayBuffer(encrypted, totalSize);
-        fileBlob = new Blob([arrayBuffer]);
-      }
-    } else {
-      // It's already a blob/file
-      fileBlob = encrypted;
-    }
+    // Handle stream vs blob for upload
 
     let uploadResult;
 
     if (uploadInfo.multipart) {
-      // Multipart upload
-      uploadResult = await uploadMultipart(
-        fileBlob,
-        uploadInfo,
-        onprogress,
-        canceller
-      );
+      // For multipart uploads, we can stream directly without blob conversion
+
+      if (encrypted.getReader) {
+        // Stream the data directly to S3 parts
+        uploadResult = await uploadMultipartStream(
+          encrypted,
+          uploadInfo,
+          onprogress,
+          canceller
+        );
+      } else {
+        // It's already a blob/file - use existing multipart logic
+        uploadResult = await uploadMultipart(
+          encrypted,
+          uploadInfo,
+          onprogress,
+          canceller
+        );
+      }
     } else {
-      // Single part upload
+      // Single part upload - need blob for simplicity
+      let fileData;
+      if (encrypted.getReader) {
+        onprogress(1); // Show 1 byte to indicate we're working
+        const blob = await new Response(encrypted).blob();
+        fileData = blob.slice ? blob : new Blob([blob]);
+      } else {
+        fileData = encrypted;
+      }
       uploadResult = await uploadSinglePart(
-        fileBlob,
+        fileData,
         uploadInfo.url,
         onprogress,
         canceller
@@ -612,17 +581,203 @@ async function uploadSinglePart(file, url, onprogress, canceller) {
   });
 }
 
+async function uploadMultipartStream(
+  stream,
+  uploadInfo,
+  onprogress,
+  canceller
+) {
+  const { parts, partSize } = uploadInfo;
+  const partProgress = {}; // Track progress per part
+  const partExpectedSizes = {}; // Track expected size for each part
+  let totalExpectedSize = 0; // Track total expected upload size
+
+  // Initialize all parts with 0 progress upfront
+  parts.forEach(part => {
+    partProgress[part.partNumber] = 0;
+    partExpectedSizes[part.partNumber] = 0; // Will be set when we create the part
+  });
+
+  // Set up cancellation for all XHR requests
+  canceller.actualCancel = () => {
+    canceller.cancelled = true;
+    if (canceller.xhrs) {
+      canceller.xhrs.forEach(xhr => {
+        if (xhr.readyState !== XMLHttpRequest.DONE) {
+          xhr.abort();
+        }
+      });
+    }
+  };
+
+  const reader = stream.getReader();
+  let currentPartIndex = 0;
+  let currentPartData = [];
+  let currentPartSize = 0;
+  let leftoverData = null; // Store data that didn't fit in the previous part
+
+  const allUploads = []; // Track all upload promises
+
+  try {
+    let streamDone = false;
+
+    while (currentPartIndex < parts.length) {
+      const part = parts[currentPartIndex];
+      const targetPartSize = partSize;
+
+      // Add any leftover data from the previous part first
+      if (leftoverData) {
+        currentPartData.push(leftoverData);
+        currentPartSize += leftoverData.length;
+        leftoverData = null;
+      }
+
+      // Read data for this part (only if we haven't reached the end of stream)
+      while (currentPartSize < targetPartSize && !streamDone) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          streamDone = true;
+          break;
+        }
+
+        if (canceller.cancelled) {
+          throw new Error(0);
+        }
+
+        // Check if adding this chunk would exceed the target part size
+        const wouldExceed = currentPartSize + value.length > targetPartSize;
+
+        if (wouldExceed && currentPartIndex < parts.length - 1) {
+          // For non-final parts, we must not exceed the target size
+          // Split the chunk to fit exactly
+          const remainingSpace = targetPartSize - currentPartSize;
+          if (remainingSpace > 0) {
+            const partialChunk = value.slice(0, remainingSpace);
+            currentPartData.push(partialChunk);
+            currentPartSize += partialChunk.length;
+
+            // Store the remaining data for the next part
+            leftoverData = value.slice(remainingSpace);
+          } else {
+            // No space left, store the entire chunk for next part
+            leftoverData = value;
+          }
+          break; // Exit the reading loop for this part
+        } else {
+          // Safe to add the whole chunk
+          currentPartData.push(value);
+          currentPartSize += value.length;
+        }
+
+        // No progress update during reading phase
+      }
+
+      // Upload if we have data for this part (even if stream is done)
+      if (currentPartData.length > 0) {
+        // Create blob from accumulated chunks for this part
+        const partBlob = new Blob(currentPartData);
+
+        // Track the expected size for this part
+        partExpectedSizes[part.partNumber] = partBlob.size;
+        totalExpectedSize += partBlob.size;
+
+        // Upload this part
+        const uploadPromise = uploadPart(
+          partBlob,
+          part.url,
+          part.partNumber,
+          loaded => {
+            // Update upload progress
+            if (loaded > 0) {
+              partProgress[part.partNumber] = loaded;
+              // Calculate upload progress based on parts created so far
+              if (totalExpectedSize > 0) {
+                const totalUploaded = Math.min(
+                  Object.values(partProgress).reduce(
+                    (sum, progress) => sum + progress,
+                    0
+                  ),
+                  totalExpectedSize
+                );
+                onprogress(totalUploaded);
+              }
+            }
+          },
+          canceller
+        ).then(result => {
+          // Keep the part at its expected size when completed
+          partProgress[part.partNumber] = partExpectedSizes[part.partNumber];
+          if (totalExpectedSize > 0) {
+            const totalUploaded = Math.min(
+              Object.values(partProgress).reduce(
+                (sum, progress) => sum + progress,
+                0
+              ),
+              totalExpectedSize
+            );
+            onprogress(totalUploaded);
+          }
+          return result;
+        });
+
+        allUploads.push(uploadPromise);
+
+        // Reset for next part
+        currentPartData = [];
+        currentPartSize = 0;
+      } else if (streamDone) {
+        // No more data and stream is done, break out
+        break;
+      }
+
+      currentPartIndex++;
+    }
+
+    // Mark that all parts have been created
+
+    // Final progress update now that we know the true total
+    const finalProgress = Object.values(partProgress).reduce(
+      (sum, progress) => sum + progress,
+      0
+    );
+    if (totalExpectedSize > 0) {
+      onprogress(finalProgress);
+    }
+
+    // Wait for all uploads to complete
+    const allResults = await Promise.all(allUploads);
+
+    if (canceller.cancelled) {
+      throw new Error(0);
+    }
+
+    // Ensure final progress shows 100% completion
+    onprogress(totalExpectedSize);
+
+    return {
+      parts: allResults.sort((a, b) => a.PartNumber - b.PartNumber)
+    };
+  } finally {
+    // Clean up reader
+    try {
+      reader.releaseLock();
+    } catch (e) {
+      // Reader may already be released
+    }
+  }
+}
+
 async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
   const { parts, partSize } = uploadInfo;
   const completedParts = [];
   const partProgress = {}; // Track progress per part
+  const totalFileSize = file.size; // Track actual total file size
 
-  // Ensure we have a blob with slice method
-  if (!file.slice) {
-    throw new Error(
-      'File object does not support slicing for multipart upload'
-    );
-  }
+  // Initialize all parts with 0 progress upfront to avoid jumping
+  parts.forEach(part => {
+    partProgress[part.partNumber] = 0;
+  });
 
   // Set up cancellation for all XHR requests
   canceller.actualCancel = () => {
@@ -644,6 +799,7 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
     const part = parts[i];
     const start = (part.partNumber - 1) * partSize;
     const end = Math.min(start + partSize, file.size);
+
     const partBlob = file.slice(start, end);
 
     const uploadPromise = uploadPart(
@@ -651,13 +807,19 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
       part.url,
       part.partNumber,
       loaded => {
-        partProgress[part.partNumber] = loaded;
-        // Calculate total progress from all parts
-        const totalUploaded = Object.values(partProgress).reduce(
-          (sum, progress) => sum + progress,
-          0
-        );
-        onprogress(totalUploaded);
+        // Only update progress if we have actual progress to avoid flickering
+        if (loaded > 0) {
+          partProgress[part.partNumber] = loaded;
+          // Calculate total progress from all parts, but cap at totalFileSize
+          const totalUploaded = Math.min(
+            Object.values(partProgress).reduce(
+              (sum, progress) => sum + progress,
+              0
+            ),
+            totalFileSize
+          );
+          onprogress(totalUploaded);
+        }
       },
       canceller
     );

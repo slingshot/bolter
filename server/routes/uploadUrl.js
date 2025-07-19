@@ -5,9 +5,40 @@ const mozlog = require('../log');
 const log = mozlog('send.uploadUrl');
 
 const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100MB
-const PART_SIZE = 50 * 1024 * 1024; // 50MB per part
+const DEFAULT_PART_SIZE = 50 * 1024 * 1024; // 50MB per part
+const MAX_PARTS = 10000; // Cloudflare R2 limit
+const MAX_PART_SIZE = 5 * 1024 * 1024 * 1024; // 5GB per part (Cloudflare R2 limit)
+
+function calculateOptimalPartSize(fileSize) {
+  // Start with default part size
+  let partSize = DEFAULT_PART_SIZE;
+  let numParts = Math.ceil(fileSize / partSize);
+
+  // If we exceed max parts, increase part size
+  if (numParts > MAX_PARTS) {
+    partSize = Math.ceil(fileSize / MAX_PARTS);
+
+    // Ensure part size doesn't exceed maximum
+    if (partSize > MAX_PART_SIZE) {
+      throw new Error(
+        `File too large: would require parts larger than 5GB limit`
+      );
+    }
+
+    // Round up to nearest MB for cleaner part sizes
+    partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+    numParts = Math.ceil(fileSize / partSize);
+  }
+
+  return { partSize, numParts };
+}
 
 module.exports = async function(req, res) {
+  // Increase timeout for very large files
+  const timeoutMs = 300000; // 5 minutes
+  req.setTimeout(timeoutMs);
+  res.setTimeout(timeoutMs);
+
   try {
     const { fileSize, encrypted, timeLimit, dlimit } = req.body;
 
@@ -46,28 +77,57 @@ module.exports = async function(req, res) {
     const useMultipart = fileSize > MULTIPART_THRESHOLD;
 
     if (useMultipart) {
+      // Calculate optimal part size for this file
+      const { partSize, numParts } = calculateOptimalPartSize(fileSize);
+
+      log.info('multipartUploadPlan', {
+        fileSize,
+        partSize,
+        numParts,
+        fileSizeGB: Math.round((fileSize / (1024 * 1024 * 1024)) * 100) / 100,
+        partSizeMB: Math.round(partSize / (1024 * 1024))
+      });
+
       // Create multipart upload
       const uploadId = await storage.createMultipartUpload(id);
       if (!uploadId) {
         return res.json({ useSignedUrl: false });
       }
 
-      // Calculate number of parts
-      const numParts = Math.ceil(fileSize / PART_SIZE);
+      // Generate URLs in parallel batches to avoid timeouts
+      const BATCH_SIZE = 100; // Generate 100 URLs at a time
       const parts = [];
 
-      for (let i = 1; i <= numParts; i++) {
-        const partUrl = await storage.getSignedMultipartUploadUrl(
-          id,
-          uploadId,
-          i
-        );
-        parts.push({
-          partNumber: i,
-          url: partUrl,
-          minSize: i === numParts ? 0 : PART_SIZE,
-          maxSize: PART_SIZE
-        });
+      for (
+        let batchStart = 1;
+        batchStart <= numParts;
+        batchStart += BATCH_SIZE
+      ) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, numParts);
+        const batchPromises = [];
+
+        for (let i = batchStart; i <= batchEnd; i++) {
+          batchPromises.push(
+            storage.getSignedMultipartUploadUrl(id, uploadId, i).then(url => ({
+              partNumber: i,
+              url: url,
+              minSize: i === numParts ? 0 : partSize,
+              maxSize: partSize
+            }))
+          );
+        }
+
+        const batchParts = await Promise.all(batchPromises);
+        parts.push(...batchParts);
+
+        // Log progress for very large uploads
+        if (numParts > 1000) {
+          log.info('uploadUrlProgress', {
+            generated: parts.length,
+            total: numParts,
+            percentage: Math.round((parts.length / numParts) * 100)
+          });
+        }
       }
 
       // Store multipart upload info
@@ -82,7 +142,7 @@ module.exports = async function(req, res) {
         owner,
         uploadId,
         parts,
-        partSize: PART_SIZE,
+        partSize,
         url: `${config.deriveBaseUrl(req)}/download/${id}#${owner}`
       });
     } else {

@@ -500,9 +500,7 @@ module.exports.wip = function(state, emit) {
 module.exports.uploading = function(state, emit) {
   const progress = state.transfer.progressRatio;
   const isInitializing = progress === 0 || progress === undefined;
-  const progressPercent = isInitializing
-    ? 'Initializing...'
-    : percent(progress);
+  const progressPercent = isInitializing ? 'Preparing...' : percent(progress);
   const archive = state.archive;
   return html`
     <send-upload-area
@@ -739,9 +737,7 @@ module.exports.downloading = function(state) {
   const archive = state.fileInfo;
   const progress = state.transfer.progressRatio;
   const isInitializing = progress === 0 || progress === undefined;
-  const progressPercent = isInitializing
-    ? 'Initializing...'
-    : percent(progress);
+  const progressPercent = isInitializing ? 'Preparing...' : percent(progress);
   return html`
     <send-archive
       class="flex flex-col bg-white rounded-default shadow-light p-4 w-full max-w-sm md:w-128 dark:bg-grey-90"
