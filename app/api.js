@@ -1,6 +1,11 @@
 import { arrayToB64, b64ToArray, delay } from './utils';
 import { ECE_RECORD_SIZE } from './ece';
 
+// Retry configuration for multipart uploads
+const MAX_RETRIES = 5;
+const RETRY_DELAY_BASE = 1000; // 1 second base delay
+const MAX_RETRY_DELAY = 300000; // 5 minutes max delay
+
 let fileProtocolWssUrl = null;
 try {
   fileProtocolWssUrl = localStorage.getItem('wssURL');
@@ -683,7 +688,7 @@ async function uploadMultipartStream(
         totalExpectedSize += partBlob.size;
 
         // Upload this part
-        const uploadPromise = uploadPart(
+        const uploadPromise = uploadPartWithRetry(
           partBlob,
           part.url,
           part.partNumber,
@@ -755,6 +760,26 @@ async function uploadMultipartStream(
     // Ensure final progress shows 100% completion
     onprogress(totalExpectedSize);
 
+    // Check if all parts were uploaded successfully
+    if (allResults.length !== parts.length) {
+      const failedParts = [];
+      const completedPartNumbers = new Set(allResults.map(p => p.PartNumber));
+
+      for (const part of parts) {
+        if (!completedPartNumbers.has(part.partNumber)) {
+          failedParts.push(part.partNumber);
+        }
+      }
+
+      const error = new Error(
+        `Failed to upload ${failedParts.length} parts: ${failedParts.join(
+          ', '
+        )}`
+      );
+      error.failedParts = failedParts;
+      throw error;
+    }
+
     return {
       parts: allResults.sort((a, b) => a.PartNumber - b.PartNumber)
     };
@@ -802,7 +827,7 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
 
     const partBlob = file.slice(start, end);
 
-    const uploadPromise = uploadPart(
+    const uploadPromise = uploadPartWithRetry(
       partBlob,
       part.url,
       part.partNumber,
@@ -858,6 +883,24 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
     }
   }
 
+  // Check if all parts were uploaded successfully
+  if (completedParts.length !== parts.length) {
+    const failedParts = [];
+    const completedPartNumbers = new Set(completedParts.map(p => p.PartNumber));
+
+    for (const part of parts) {
+      if (!completedPartNumbers.has(part.partNumber)) {
+        failedParts.push(part.partNumber);
+      }
+    }
+
+    const error = new Error(
+      `Failed to upload ${failedParts.length} parts: ${failedParts.join(', ')}`
+    );
+    error.failedParts = failedParts;
+    throw error;
+  }
+
   return {
     parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber)
   };
@@ -904,6 +947,86 @@ async function uploadPart(partBlob, url, partNumber, onProgress, canceller) {
     xhr.open('PUT', url);
     xhr.send(partBlob);
   });
+}
+
+function isRetriableError(error) {
+  // Network errors, 5xx errors, and 429 (too many requests) errors
+  const errorMessage = error.message || '';
+
+  // Network errors
+  if (errorMessage.includes('Network error')) {
+    return true;
+  }
+
+  // HTTP errors that are retryable
+  if (errorMessage.includes('HTTP')) {
+    // 5xx server errors
+    if (errorMessage.match(/HTTP 5\d\d/)) {
+      return true;
+    }
+    // 429 Too Many Requests
+    if (errorMessage.includes('HTTP 429')) {
+      return true;
+    }
+    // 408 Request Timeout
+    if (errorMessage.includes('HTTP 408')) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function uploadPartWithRetry(
+  partBlob,
+  url,
+  partNumber,
+  onProgress,
+  canceller,
+  retryCount = 0
+) {
+  try {
+    return await uploadPart(partBlob, url, partNumber, onProgress, canceller);
+  } catch (error) {
+    // Don't retry if cancelled
+    if (canceller.cancelled || error.message === '0') {
+      throw error;
+    }
+
+    // Check if we should retry
+    if (retryCount < MAX_RETRIES && isRetriableError(error)) {
+      // Calculate exponential backoff with jitter
+      const baseDelay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
+      const jitter = Math.random() * 0.3 * baseDelay; // up to 30% jitter
+      const delay = Math.min(baseDelay + jitter, MAX_RETRY_DELAY);
+
+      console.log(
+        `Retrying part ${partNumber} after ${Math.round(
+          delay
+        )}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`
+      );
+
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      // Retry the upload
+      return uploadPartWithRetry(
+        partBlob,
+        url,
+        partNumber,
+        onProgress,
+        canceller,
+        retryCount + 1
+      );
+    }
+
+    // Max retries exhausted or non-retryable error
+    console.error(
+      `Failed to upload part ${partNumber} after ${retryCount} retries:`,
+      error
+    );
+    throw error;
+  }
 }
 
 async function abortMultipartUpload(id, uploadId, bearerToken) {
