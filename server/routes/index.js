@@ -90,7 +90,7 @@ module.exports = function(app) {
     }
     next();
   });
-  app.use(bodyParser.json());
+  app.use(bodyParser.json({ limit: '10mb' }));
   app.use(bodyParser.text());
   app.get('/', language, pages.index);
   app.get('/config', function(req, res) {
