@@ -104,7 +104,7 @@ class Footer extends Component {
     // Terms/Privacy
     footer.push(html`
       <li class="m-2">
-        <a href="https://legal.slingshot.fm/send-terms-2507a" target="_blank">
+        <a href="https://legal.slingshot.fm/send-terms-2507b" target="_blank">
           Terms
         </a>
       </li>
