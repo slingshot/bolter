@@ -27,14 +27,20 @@ module.exports = function(state, body = '') {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
 
         <meta property="og:title" content="${state.title}" />
+        <meta property="og:type" content="website" />
+        <meta property="og:site_name" content="${state.title}" />
         <meta name="twitter:title" content="${state.title}" />
         <meta name="description" content="${state.description}" />
         <meta property="og:description" content="${state.description}" />
         <meta name="twitter:description" content="${state.description}" />
-        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:card" content="summary_large_image" />
         <meta property="og:image" content="${state.ui.assets.facebook}" />
         <meta name="twitter:image" content="${state.ui.assets.twitter}" />
         <meta property="og:url" content="${state.baseUrl}" />
+        <link
+          rel="canonical"
+          href="${state.baseUrl}${state.route ? state.route.path : ''}"
+        />
         <meta name="theme-color" content="#220033" />
         <meta name="msapplication-TileColor" content="#220033" />
 
@@ -78,6 +84,22 @@ module.exports = function(state, body = '') {
           href="${state.ui.assets.safari_pinned_tab}"
           color="#838383"
         />
+        <script type="application/ld+json">
+          {
+            "@context": "https://schema.org",
+            "@type": "WebApplication",
+            "name": "${state.title}",
+            "url": "${state.baseUrl}",
+            "description": "${state.description}",
+            "applicationCategory": "Utilities",
+            "operatingSystem": "All",
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            }
+          }
+        </script>
         <script defer src="${assets.get('app.js')}"></script>
         <script
           defer

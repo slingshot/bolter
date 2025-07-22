@@ -100,6 +100,7 @@ module.exports = function(app) {
   app.get('/oauth', language, pages.blank);
   app.get('/login', language, pages.index);
   app.get('/app.webmanifest', language, require('./webmanifest'));
+  app.get('/sitemap.xml', require('./sitemap'));
   app.get(`/download/:id${ID_REGEX}`, language, pages.download);
   app.get('/unsupported/:reason', language, pages.unsupported);
   app.get(
