@@ -19,6 +19,14 @@ class Footer extends Component {
     if (this.state != undefined && this.state.WEB_UI != undefined) {
       const WEB_UI = this.state.WEB_UI;
 
+      links.push(html`
+        <li class="m-2">
+          <a href="mailto:help@slingshot.fm" target="_blank">
+            Support
+          </a>
+        </li>
+      `);
+
       if (WEB_UI.FOOTER_DONATE_URL != '') {
         links.push(html`
           <li class="m-2">
@@ -28,15 +36,15 @@ class Footer extends Component {
           </li>
         `);
       }
-      if (WEB_UI.FOOTER_CLI_URL != '') {
-        links.push(html`
-          <li class="m-2">
-            <a href="${WEB_UI.FOOTER_CLI_URL}" target="_blank">
-              ${translate('footerLinkCli')}
-            </a>
-          </li>
-        `);
-      }
+      // if (WEB_UI.FOOTER_CLI_URL != '') {
+      //   links.push(html`
+      //     <li class="m-2">
+      //       <a href="${WEB_UI.FOOTER_CLI_URL}" target="_blank">
+      //         ${translate('footerLinkCli')}
+      //       </a>
+      //     </li>
+      //   `);
+      // }
       if (WEB_UI.FOOTER_DMCA_URL != '') {
         links.push(html`
           <li class="m-2">

@@ -179,6 +179,15 @@ export default class FileReceiver extends Nanobus {
       const urlData = await response.json();
 
       if (urlData.useSignedUrl) {
+        // Mark as complete immediately (before triggering download)
+        // This ensures Safari shows the success page even if the download mechanism has issues
+        this.msg = 'downloadFinish';
+        this.state = 'complete';
+        this.emit('complete');
+
+        // Small delay to ensure UI updates before download triggers
+        await new Promise(resolve => setTimeout(resolve, 100));
+
         // Create a temporary link element with the signed URL
         const a = document.createElement('a');
         a.href = urlData.url;
@@ -189,24 +198,40 @@ export default class FileReceiver extends Nanobus {
         const fileName = decodeURIComponent(this.fileInfo.name);
         a.download = fileName;
 
-        // Add to body (needed for Firefox)
-        document.body.appendChild(a);
+        // Safari-specific handling
+        if (/^((?!chrome|android).)*safari/i.test(navigator.userAgent)) {
+          // For Safari, use window.open as fallback
+          try {
+            // Try the standard approach first
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          } catch (e) {
+            // Fallback to window.open for Safari
+            window.open(urlData.url, '_blank');
+          }
+        } else {
+          // Standard approach for other browsers
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
 
-        // Trigger the download
-        a.click();
-
-        // Clean up
-        document.body.removeChild(a);
-
-        // Report download completion
-        await fetch(getApiUrl(`/api/download/complete/${this.fileInfo.id}`), {
-          method: 'POST'
-        });
-
-        // Mark as complete
-        this.msg = 'downloadFinish';
-        this.emit('complete');
-        this.state = 'complete';
+        // Report download completion after a delay (to avoid premature deletion)
+        // This gives the browser time to start the download
+        setTimeout(async () => {
+          try {
+            await fetch(
+              getApiUrl(`/api/download/complete/${this.fileInfo.id}`),
+              {
+                method: 'POST'
+              }
+            );
+          } catch (e) {
+            // Ignore errors in completion reporting
+            console.warn('Failed to report download completion:', e);
+          }
+        }, 2000);
       } else {
         // Fallback to blob download if no signed URL is available
         return this.downloadBlob();
