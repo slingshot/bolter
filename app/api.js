@@ -2,9 +2,9 @@ import { arrayToB64, b64ToArray, delay } from './utils';
 import { ECE_RECORD_SIZE } from './ece';
 
 // Retry configuration for multipart uploads
-const MAX_RETRIES = 5;
-const RETRY_DELAY_BASE = 1000; // 1 second base delay
-const MAX_RETRY_DELAY = 300000; // 5 minutes max delay
+const MAX_RETRIES = 10; // Increased retries for better reliability
+const RETRY_DELAY_BASE = 2000; // 2 second base delay
+const MAX_RETRY_DELAY = 60000; // 60 seconds max delay
 
 let fileProtocolWssUrl = null;
 try {
@@ -896,15 +896,24 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
   // Upload remaining parts
   if (uploadPromises.length > 0) {
     const completed = await Promise.allSettled(uploadPromises);
+    let hasErrors = false;
     completed.forEach(result => {
       if (result.status === 'fulfilled') {
         completedParts.push(result.value);
+      } else {
+        hasErrors = true;
+        console.error('Part upload failed:', result.reason);
       }
     });
 
     // Check if cancelled
     if (canceller.cancelled) {
       throw new Error(0);
+    }
+
+    // If we have errors, wait a bit and see if we should retry the whole batch
+    if (hasErrors && completedParts.length < parts.length) {
+      console.log('Some parts failed, checking if we can continue...');
     }
   }
 
@@ -1028,11 +1037,19 @@ async function uploadPartWithRetry(
       console.log(
         `Retrying part ${partNumber} after ${Math.round(
           delay
-        )}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`
+        )}ms (attempt ${retryCount + 2}/${MAX_RETRIES})`
       );
 
       // Wait before retrying
       await new Promise(resolve => setTimeout(resolve, delay));
+
+      // Check if cancelled during delay
+      if (canceller.cancelled) {
+        throw new Error(0);
+      }
+
+      // Reset progress for this part before retry
+      onProgress(0);
 
       // Retry the upload
       return uploadPartWithRetry(

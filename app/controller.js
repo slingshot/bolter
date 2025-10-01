@@ -26,6 +26,9 @@ export default function(state, emitter) {
   }
 
   function updateProgress() {
+    if (!state.transfer) {
+      return;
+    }
     if (updateTitle) {
       emitter.emit('DOMTitleChange', percent(state.transfer.progressRatio));
     }
