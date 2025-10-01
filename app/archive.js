@@ -1,4 +1,5 @@
 import { blobStream, concatStream } from './streams';
+import Zip from './zip';
 
 function isDupe(newFile, array) {
   for (const file of array) {
@@ -33,7 +34,14 @@ export default class Archive {
   }
 
   get size() {
-    return this.files.reduce((total, file) => total + file.size, 0);
+    const rawSize = this.files.reduce((total, file) => total + file.size, 0);
+    // For unencrypted multi-file archives, add ZIP overhead
+    if (!this.encrypted && this.files.length > 1) {
+      // Calculate ZIP overhead: headers, data descriptors, central directory
+      const zip = new Zip(this.manifest, null);
+      return rawSize + zip.size;
+    }
+    return rawSize;
   }
 
   get numFiles() {
@@ -51,7 +59,15 @@ export default class Archive {
   }
 
   get stream() {
-    return concatStream(this.files.map(file => blobStream(file)));
+    // For encrypted files or single files, concatenate raw streams
+    // For unencrypted multi-file archives, create a ZIP stream
+    if (!this.encrypted && this.files.length > 1) {
+      const rawStream = concatStream(this.files.map(file => blobStream(file)));
+      const zip = new Zip(this.manifest, rawStream);
+      return zip.stream;
+    } else {
+      return concatStream(this.files.map(file => blobStream(file)));
+    }
   }
 
   addFiles(files, maxSize, maxFiles) {

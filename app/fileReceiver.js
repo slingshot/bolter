@@ -160,6 +160,63 @@ export default class FileReceiver extends Nanobus {
     }
   }
 
+  async downloadDirect() {
+    // For unencrypted files, get signed URL and download directly
+    this.state = 'downloading';
+
+    try {
+      const response = await fetch(
+        getApiUrl(`/api/download/url/${this.fileInfo.id}`),
+        {
+          method: 'GET'
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('Failed to get download URL');
+      }
+
+      const urlData = await response.json();
+
+      if (urlData.useSignedUrl) {
+        // Create a temporary link element with the signed URL
+        const a = document.createElement('a');
+        a.href = urlData.url;
+
+        // The download attribute is optional since S3 presigned URL
+        // includes ResponseContentDisposition header with filename
+        // But we'll still set it as a fallback
+        const fileName = decodeURIComponent(this.fileInfo.name);
+        a.download = fileName;
+
+        // Add to body (needed for Firefox)
+        document.body.appendChild(a);
+
+        // Trigger the download
+        a.click();
+
+        // Clean up
+        document.body.removeChild(a);
+
+        // Report download completion
+        await fetch(getApiUrl(`/api/download/complete/${this.fileInfo.id}`), {
+          method: 'POST'
+        });
+
+        // Mark as complete
+        this.msg = 'downloadFinish';
+        this.emit('complete');
+        this.state = 'complete';
+      } else {
+        // Fallback to blob download if no signed URL is available
+        return this.downloadBlob();
+      }
+    } catch (e) {
+      this.state = 'error';
+      throw e;
+    }
+  }
+
   async downloadStream(noSave = false) {
     const start = Date.now();
     const onprogress = p => {
@@ -254,6 +311,12 @@ export default class FileReceiver extends Nanobus {
   }
 
   download(options) {
+    // For unencrypted files, use direct download (unless noSave is true)
+    // Archives (send-archive type) are already zipped on the server, so direct download works
+    if (!this.fileInfo.encrypted && !options.noSave) {
+      return this.downloadDirect();
+    }
+    // For encrypted files or when noSave is true, use existing methods
     if (options.stream) {
       return this.downloadStream(options.noSave);
     }

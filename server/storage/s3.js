@@ -45,12 +45,19 @@ class S3Storage {
     return this.s3.headBucket({ Bucket: this.bucket }).promise();
   }
 
-  getSignedUrl(id, expiresIn = 3600) {
-    return this.s3.getSignedUrl('getObject', {
+  getSignedUrl(id, filename = null, expiresIn = 3600) {
+    const params = {
       Bucket: this.bucket,
       Key: id,
       Expires: expiresIn
-    });
+    };
+
+    // Add ResponseContentDisposition to force download with specific filename
+    if (filename) {
+      params.ResponseContentDisposition = `attachment; filename="${filename}"`;
+    }
+
+    return this.s3.getSignedUrl('getObject', params);
   }
 
   // Single part upload pre-signed URL

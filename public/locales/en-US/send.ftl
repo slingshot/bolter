@@ -15,6 +15,7 @@ unlockInputPlaceholder = Password
 unlockButtonLabel = Unlock
 downloadButtonLabel = Download
 downloadFinish = Download complete
+downloadStarted = Download started
 fileSizeProgress = ({ $partialSize } of { $totalSize })
 # sendYourFilesLink = Try Send
 errorPageHeader = Something went wrong!

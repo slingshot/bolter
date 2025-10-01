@@ -46,7 +46,7 @@ class FSStorage {
     return Promise.resolve();
   }
 
-  getSignedUrl(_id) {
+  getSignedUrl(_id, _filename = null) {
     // For filesystem storage, we can't generate pre-signed URLs
     // Return null to indicate streaming should be used instead
     return null;

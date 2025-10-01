@@ -82,9 +82,9 @@ class DB {
     return result && new Metadata(result);
   }
 
-  async getSignedUrl(id, expiresIn = 3600) {
+  async getSignedUrl(id, filename = null, expiresIn = 3600) {
     const filePath = await this.getPrefixedId(id);
-    return this.storage.getSignedUrl(filePath, expiresIn);
+    return this.storage.getSignedUrl(filePath, filename, expiresIn);
   }
 
   async getSignedUploadUrl(id, expiresIn = 3600) {

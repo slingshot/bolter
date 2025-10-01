@@ -6,6 +6,7 @@ const noStreams = require('./noStreams');
 const notFound = require('./notFound');
 const downloadPassword = require('./downloadPassword');
 const downloadCompleted = require('./downloadCompleted');
+const downloadStarted = require('./downloadStarted');
 const BIG_SIZE = 1024 * 1024 * 256;
 
 function createFileInfo(state) {
@@ -100,7 +101,12 @@ module.exports = function(state, emit) {
         content = downloading(state, emit);
         break;
       case 'complete':
-        content = downloadCompleted(state);
+        // Show "Download started" for unencrypted files, "Download completed" for encrypted
+        if (!state.fileInfo.encrypted) {
+          content = downloadStarted(state);
+        } else {
+          content = downloadCompleted(state);
+        }
         break;
       default:
         content = preview(state, emit);

@@ -38,11 +38,18 @@ class GCSStorage {
     return this.bucket.exists();
   }
 
-  async getSignedUrl(id, expiresIn = 3600) {
-    const [url] = await this.bucket.file(id).getSignedUrl({
+  async getSignedUrl(id, filename = null, expiresIn = 3600) {
+    const options = {
       action: 'read',
       expires: Date.now() + expiresIn * 1000
-    });
+    };
+
+    // Add response disposition for download with specific filename
+    if (filename) {
+      options.responseDisposition = `attachment; filename="${filename}"`;
+    }
+
+    const [url] = await this.bucket.file(id).getSignedUrl(options);
     return url;
   }
 
