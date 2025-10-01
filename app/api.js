@@ -520,23 +520,48 @@ async function uploadDirectToS3(
       ? arrayToB64(new Uint8Array(metadata))
       : metadata; // For unencrypted, metadata is already a base64 string
 
-    const completeResponse = await fetch(getApiUrl('/api/upload/complete'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${bearerToken}`
-      },
-      body: JSON.stringify({
-        id: uploadInfo.id,
-        metadata: metadataString,
-        ...(isEncrypted && { authKey: verifierB64 }),
-        actualSize: totalSize,
-        ...(uploadInfo.multipart && { parts: uploadResult.parts })
-      })
-    });
+    let completeResponse;
+    let retries = 3;
+    let lastError;
 
-    if (!completeResponse.ok) {
-      throw new Error(`HTTP ${completeResponse.status}`);
+    while (retries > 0) {
+      try {
+        completeResponse = await fetch(getApiUrl('/api/upload/complete'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${bearerToken}`
+          },
+          body: JSON.stringify({
+            id: uploadInfo.id,
+            metadata: metadataString,
+            ...(isEncrypted && { authKey: verifierB64 }),
+            actualSize: totalSize,
+            ...(uploadInfo.multipart && { parts: uploadResult.parts })
+          })
+        });
+
+        if (!completeResponse.ok) {
+          throw new Error(`HTTP ${completeResponse.status}`);
+        }
+
+        break; // Success, exit retry loop
+      } catch (e) {
+        lastError = e;
+        retries--;
+
+        if (retries > 0) {
+          // Wait before retrying (exponential backoff)
+          await new Promise(resolve =>
+            setTimeout(resolve, (4 - retries) * 1000)
+          );
+        }
+      }
+    }
+
+    if (!completeResponse) {
+      console.error('Failed to complete upload after retries:', lastError);
+      throw lastError || new Error('Failed to complete upload');
     }
 
     const completeInfo = await completeResponse.json();

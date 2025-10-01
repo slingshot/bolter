@@ -33,6 +33,10 @@ module.exports = async function(req, res) {
 
       // Complete the multipart upload
       const uploadId = fileInfo.uploadId;
+      if (!uploadId) {
+        return res.status(400).json({ error: 'Upload ID not found' });
+      }
+
       const sortedParts = parts.sort((a, b) => a.PartNumber - b.PartNumber);
 
       await storage.completeMultipartUpload(id, uploadId, sortedParts);
@@ -84,7 +88,12 @@ module.exports = async function(req, res) {
       url: `${config.deriveBaseUrl(req)}/download/${id}#${fileInfo.owner}`
     });
   } catch (e) {
-    log.error('uploadCompleteError', e);
+    log.error('uploadCompleteError', {
+      error: e.message,
+      stack: e.stack,
+      id: req.body.id,
+      multipart: req.body.parts ? true : false
+    });
 
     // Try to clean up failed multipart upload
     if (req.body.id && req.body.uploadId) {
@@ -95,6 +104,24 @@ module.exports = async function(req, res) {
       }
     }
 
-    res.status(500).json({ error: 'Failed to complete upload' });
+    // Provide more specific error messages
+    let statusCode = 500;
+    let errorMessage = 'Failed to complete upload';
+
+    if (e.code === 'NoSuchUpload') {
+      statusCode = 404;
+      errorMessage = 'Upload not found or expired';
+    } else if (e.code === 'InvalidPart' || e.code === 'InvalidPartOrder') {
+      statusCode = 400;
+      errorMessage = 'Invalid upload parts';
+    } else if (e.code === 'EntityTooSmall') {
+      statusCode = 400;
+      errorMessage = 'Upload parts too small';
+    }
+
+    res.status(statusCode).json({
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? e.message : undefined
+    });
   }
 };
