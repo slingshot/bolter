@@ -128,6 +128,16 @@ export default class FileSender extends Nanobus {
     } catch (e) {
       this.msg = 'errorPageHeader';
       this.uploadRequest = null;
+
+      // Log error details for debugging
+      console.error('Upload failed in FileSender:', {
+        fileName: archive.name,
+        fileSize: archive.size,
+        encrypted: archive.encrypted,
+        timeLimit: archive.timeLimit,
+        error: e.message
+      });
+
       throw e;
     }
   }

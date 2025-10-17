@@ -422,6 +422,13 @@ async function uploadDirectToS3(
 ) {
   const start = Date.now();
 
+  console.log(`Starting direct S3 upload:`, {
+    totalSize: totalSize,
+    isEncrypted: isEncrypted,
+    timeLimit: timeLimit,
+    dlimit: dlimit
+  });
+
   try {
     // First, get upload URLs
     const uploadResponse = await fetch(getApiUrl('/api/upload/url'), {
@@ -444,8 +451,17 @@ async function uploadDirectToS3(
 
     const uploadInfo = await uploadResponse.json();
 
+    console.log(`Upload info received:`, {
+      id: uploadInfo.id,
+      useSignedUrl: uploadInfo.useSignedUrl,
+      multipart: uploadInfo.multipart,
+      parts: uploadInfo.parts ? uploadInfo.parts.length : 0,
+      partSize: uploadInfo.partSize
+    });
+
     // Check if we should use pre-signed URLs
     if (!uploadInfo.useSignedUrl) {
+      console.log('Using WebSocket upload (pre-signed URLs not available)');
       // Fall back to WebSocket upload
       return upload(
         encrypted,
@@ -576,6 +592,35 @@ async function uploadDirectToS3(
     if (canceller.cancelled) {
       throw new Error(0);
     }
+
+    // Log the full error details before re-throwing
+    console.error('=== UPLOAD FAILED ===');
+    console.error('Error message:', e.message);
+
+    // If we have a shareable message, display it prominently
+    if (e.shareableMessage) {
+      console.error('\n' + e.shareableMessage);
+    } else if (e.failedParts) {
+      // Fallback to basic error info if no summary
+      console.error('Failed parts:', e.failedParts);
+      if (e.partErrors) {
+        console.error(
+          'Part error details:',
+          JSON.stringify(e.partErrors, null, 2)
+        );
+      }
+    }
+
+    console.error('\nStack trace:', e.stack);
+    console.error('===================');
+
+    // Add a user-friendly message to copy
+    if (e.shareableMessage) {
+      console.error(
+        '\n📋 TO SHARE THIS ERROR FOR DEBUGGING, COPY THE ERROR SUMMARY ABOVE 📋'
+      );
+    }
+
     throw e;
   }
 }
@@ -611,6 +656,81 @@ async function uploadSinglePart(file, url, onprogress, canceller) {
   });
 }
 
+// Helper function to create consolidated error summary
+function createUploadErrorSummary(
+  failedParts,
+  partErrors,
+  uploadInfo,
+  totalFileSize
+) {
+  const summary = {
+    timestamp: new Date().toISOString(),
+    totalParts: uploadInfo.parts.length,
+    failedParts: failedParts.length,
+    partSize: uploadInfo.partSize,
+    totalFileSize: totalFileSize || 'unknown',
+    failedPartNumbers: failedParts,
+    errors: {}
+  };
+
+  // Group errors by type
+  const errorTypes = {};
+  failedParts.forEach(partNum => {
+    const error = partErrors[partNum];
+    if (error) {
+      summary.errors[partNum] = error;
+      const errorType = error.error || 'Unknown';
+      if (!errorTypes[errorType]) {
+        errorTypes[errorType] = [];
+      }
+      errorTypes[errorType].push(partNum);
+    }
+  });
+
+  summary.errorTypes = errorTypes;
+
+  // Create a shareable error message
+  const shareableMessage = `
+=== MULTIPART UPLOAD ERROR SUMMARY ===
+Time: ${summary.timestamp}
+Failed: ${summary.failedParts}/${summary.totalParts} parts
+Part size: ${(summary.partSize / 1024 / 1024).toFixed(2)} MB
+Total file: ${
+    typeof summary.totalFileSize === 'number'
+      ? (summary.totalFileSize / 1024 / 1024).toFixed(2) + ' MB'
+      : summary.totalFileSize
+  }
+
+Error breakdown:
+${Object.entries(errorTypes)
+  .map(
+    ([type, parts]) =>
+      `  ${type}: ${parts.length} parts (${parts.slice(0, 5).join(', ')}${
+        parts.length > 5 ? '...' : ''
+      })`
+  )
+  .join('\n')}
+
+Failed parts: ${failedParts.slice(0, 10).join(', ')}${
+    failedParts.length > 10 ? `... and ${failedParts.length - 10} more` : ''
+  }
+
+Sample errors:
+${failedParts
+  .slice(0, 3)
+  .map(partNum => {
+    const err = partErrors[partNum];
+    return err
+      ? `  Part ${partNum}: ${err.error} (size: ${err.size || 'unknown'})`
+      : `  Part ${partNum}: No error details`;
+  })
+  .join('\n')}
+=====================================
+  `.trim();
+
+  return { summary, shareableMessage };
+}
+
 async function uploadMultipartStream(
   stream,
   uploadInfo,
@@ -621,6 +741,11 @@ async function uploadMultipartStream(
   const partProgress = {}; // Track progress per part
   const partExpectedSizes = {}; // Track expected size for each part
   let totalExpectedSize = 0; // Track total expected upload size
+  const partErrors = {}; // Track specific errors for each part
+
+  console.log(
+    `Starting multipart stream upload with ${parts.length} parts, part size: ${partSize}`
+  );
 
   // Initialize all parts with 0 progress upfront
   parts.forEach(part => {
@@ -735,21 +860,39 @@ async function uploadMultipartStream(
             }
           },
           canceller
-        ).then(result => {
-          // Keep the part at its expected size when completed
-          partProgress[part.partNumber] = partExpectedSizes[part.partNumber];
-          if (totalExpectedSize > 0) {
-            const totalUploaded = Math.min(
-              Object.values(partProgress).reduce(
-                (sum, progress) => sum + progress,
-                0
-              ),
-              totalExpectedSize
+        )
+          .then(result => {
+            // Keep the part at its expected size when completed
+            partProgress[part.partNumber] = partExpectedSizes[part.partNumber];
+            console.log(
+              `Part ${part.partNumber} uploaded successfully (size: ${partBlob.size} bytes)`
             );
-            onprogress(totalUploaded);
-          }
-          return result;
-        });
+            if (totalExpectedSize > 0) {
+              const totalUploaded = Math.min(
+                Object.values(partProgress).reduce(
+                  (sum, progress) => sum + progress,
+                  0
+                ),
+                totalExpectedSize
+              );
+              onprogress(totalUploaded);
+            }
+            return result;
+          })
+          .catch(error => {
+            // Capture the error details for this part
+            partErrors[part.partNumber] = {
+              error: error.message,
+              size: partBlob.size,
+              timestamp: new Date().toISOString()
+            };
+            console.error(`Part ${part.partNumber} failed after all retries:`, {
+              error: error.message,
+              partSize: partBlob.size,
+              partNumber: part.partNumber
+            });
+            throw error;
+          });
 
         allUploads.push(uploadPromise);
 
@@ -776,37 +919,67 @@ async function uploadMultipartStream(
     }
 
     // Wait for all uploads to complete
-    const allResults = await Promise.all(allUploads);
+    const allResults = await Promise.allSettled(allUploads);
 
     if (canceller.cancelled) {
       throw new Error(0);
     }
 
-    // Ensure final progress shows 100% completion
-    onprogress(totalExpectedSize);
+    // Process results and collect successful uploads
+    const successfulParts = [];
+    const failedParts = [];
 
-    // Check if all parts were uploaded successfully
-    if (allResults.length !== parts.length) {
-      const failedParts = [];
-      const completedPartNumbers = new Set(allResults.map(p => p.PartNumber));
-
-      for (const part of parts) {
-        if (!completedPartNumbers.has(part.partNumber)) {
-          failedParts.push(part.partNumber);
+    allResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        successfulParts.push(result.value);
+      } else {
+        const partNumber = parts[index].partNumber;
+        failedParts.push(partNumber);
+        // Log if we don't already have error details
+        if (!partErrors[partNumber]) {
+          partErrors[partNumber] = {
+            error: (result.reason && result.reason.message) || 'Unknown error',
+            timestamp: new Date().toISOString()
+          };
         }
       }
+    });
+
+    console.log(
+      `Upload results: ${successfulParts.length} successful, ${failedParts.length} failed out of ${parts.length} total parts`
+    );
+
+    // Ensure final progress shows 100% completion if all succeeded
+    if (failedParts.length === 0) {
+      onprogress(totalExpectedSize);
+    }
+
+    // Check if all parts were uploaded successfully
+    if (failedParts.length > 0) {
+      // Generate consolidated error summary
+      const { summary, shareableMessage } = createUploadErrorSummary(
+        failedParts,
+        partErrors,
+        uploadInfo,
+        totalExpectedSize
+      );
+
+      console.error(shareableMessage);
+      console.error('Full error details:', summary);
 
       const error = new Error(
-        `Failed to upload ${failedParts.length} parts: ${failedParts.join(
-          ', '
-        )}`
+        `Failed to upload ${failedParts.length} parts. Check console for detailed error summary.`
       );
       error.failedParts = failedParts;
+      error.partErrors = partErrors;
+      error.summary = summary;
+      error.shareableMessage = shareableMessage;
+
       throw error;
     }
 
     return {
-      parts: allResults.sort((a, b) => a.PartNumber - b.PartNumber)
+      parts: successfulParts.sort((a, b) => a.PartNumber - b.PartNumber)
     };
   } finally {
     // Clean up reader
@@ -823,6 +996,11 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
   const completedParts = [];
   const partProgress = {}; // Track progress per part
   const totalFileSize = file.size; // Track actual total file size
+  const partErrors = {}; // Track specific errors for each part
+
+  console.log(
+    `Starting multipart upload with ${parts.length} parts, part size: ${partSize}, total file size: ${totalFileSize}`
+  );
 
   // Initialize all parts with 0 progress upfront to avoid jumping
   parts.forEach(part => {
@@ -872,7 +1050,27 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
         }
       },
       canceller
-    );
+    )
+      .then(result => {
+        console.log(
+          `Part ${part.partNumber} uploaded successfully (size: ${partBlob.size} bytes)`
+        );
+        return result;
+      })
+      .catch(error => {
+        // Capture the error details for this part
+        partErrors[part.partNumber] = {
+          error: error.message,
+          size: partBlob.size,
+          timestamp: new Date().toISOString()
+        };
+        console.error(`Part ${part.partNumber} failed:`, {
+          error: error.message,
+          partSize: partBlob.size,
+          partNumber: part.partNumber
+        });
+        throw error;
+      });
 
     uploadPromises.push(uploadPromise);
 
@@ -917,6 +1115,10 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
     }
   }
 
+  console.log(
+    `Upload completed: ${completedParts.length} successful out of ${parts.length} total parts`
+  );
+
   // Check if all parts were uploaded successfully
   if (completedParts.length !== parts.length) {
     const failedParts = [];
@@ -925,13 +1127,35 @@ async function uploadMultipart(file, uploadInfo, onprogress, canceller) {
     for (const part of parts) {
       if (!completedPartNumbers.has(part.partNumber)) {
         failedParts.push(part.partNumber);
+        // Add error details if we don't have them
+        if (!partErrors[part.partNumber]) {
+          partErrors[part.partNumber] = {
+            error: 'Upload failed - no specific error captured',
+            timestamp: new Date().toISOString()
+          };
+        }
       }
     }
 
+    // Generate consolidated error summary
+    const { summary, shareableMessage } = createUploadErrorSummary(
+      failedParts,
+      partErrors,
+      uploadInfo,
+      totalFileSize
+    );
+
+    console.error(shareableMessage);
+    console.error('Full error details:', summary);
+
     const error = new Error(
-      `Failed to upload ${failedParts.length} parts: ${failedParts.join(', ')}`
+      `Failed to upload ${failedParts.length} parts. Check console for detailed error summary.`
     );
     error.failedParts = failedParts;
+    error.partErrors = partErrors;
+    error.summary = summary;
+    error.shareableMessage = shareableMessage;
+
     throw error;
   }
 
@@ -956,9 +1180,29 @@ async function uploadPart(partBlob, url, partNumber, onProgress, canceller) {
     }
     canceller.xhrs.push(xhr);
 
+    let lastProgressTime = Date.now();
+    let lastProgressLoaded = 0;
+
     xhr.upload.addEventListener('progress', e => {
       if (e.lengthComputable) {
         onProgress(e.loaded);
+
+        // Log upload speed periodically (every 5 seconds)
+        const now = Date.now();
+        if (now - lastProgressTime > 5000) {
+          const bytesPerSecond =
+            (e.loaded - lastProgressLoaded) / ((now - lastProgressTime) / 1000);
+          const speedMB = (bytesPerSecond / (1024 * 1024)).toFixed(2);
+          console.log(
+            `Part ${partNumber} upload progress: ${e.loaded}/${
+              e.total
+            } bytes (${Math.round(
+              (e.loaded * 100) / e.total
+            )}%), speed: ${speedMB} MB/s`
+          );
+          lastProgressTime = now;
+          lastProgressLoaded = e.loaded;
+        }
       }
     });
 
@@ -970,15 +1214,54 @@ async function uploadPart(partBlob, url, partNumber, onProgress, canceller) {
           ETag: etag
         });
       } else {
-        reject(new Error(`HTTP ${xhr.status} for part ${partNumber}`));
+        // Try to get more information about the error
+        let errorDetails = `HTTP ${xhr.status}`;
+        if (xhr.statusText) {
+          errorDetails += ` (${xhr.statusText})`;
+        }
+        if (xhr.responseText) {
+          try {
+            // Try to parse JSON error response
+            const errorResponse = JSON.parse(xhr.responseText);
+            errorDetails += ` - ${errorResponse.message ||
+              errorResponse.error ||
+              xhr.responseText}`;
+          } catch (e) {
+            // Not JSON, use raw text
+            errorDetails += ` - ${xhr.responseText.substring(0, 200)}`; // Limit error message length
+          }
+        }
+
+        console.error(`Part ${partNumber} HTTP error:`, {
+          status: xhr.status,
+          statusText: xhr.statusText,
+          responseText: xhr.responseText
+            ? xhr.responseText.substring(0, 500)
+            : null,
+          url: url.replace(/\?.*/, '?...') // Log URL without sensitive query params
+        });
+
+        reject(new Error(`${errorDetails} for part ${partNumber}`));
       }
     });
 
     xhr.addEventListener('error', () => {
+      console.error(`Part ${partNumber} network error:`, {
+        readyState: xhr.readyState,
+        status: xhr.status,
+        statusText: xhr.statusText,
+        url: url.replace(/\?.*/, '?...') // Log URL without sensitive query params
+      });
       reject(new Error(`Network error for part ${partNumber}`));
     });
 
+    xhr.addEventListener('timeout', () => {
+      console.error(`Part ${partNumber} timeout after ${xhr.timeout}ms`);
+      reject(new Error(`Timeout for part ${partNumber}`));
+    });
+
     xhr.open('PUT', url);
+    xhr.timeout = 120000; // 2 minute timeout per part
     xhr.send(partBlob);
   });
 }
@@ -989,6 +1272,11 @@ function isRetriableError(error) {
 
   // Network errors
   if (errorMessage.includes('Network error')) {
+    return true;
+  }
+
+  // Timeout errors
+  if (errorMessage.includes('Timeout')) {
     return true;
   }
 
@@ -1006,6 +1294,14 @@ function isRetriableError(error) {
     if (errorMessage.includes('HTTP 408')) {
       return true;
     }
+    // 503 Service Unavailable
+    if (errorMessage.includes('HTTP 503')) {
+      return true;
+    }
+    // 504 Gateway Timeout
+    if (errorMessage.includes('HTTP 504')) {
+      return true;
+    }
   }
 
   return false;
@@ -1020,12 +1316,30 @@ async function uploadPartWithRetry(
   retryCount = 0
 ) {
   try {
+    if (retryCount === 0) {
+      console.log(
+        `Starting upload of part ${partNumber} (size: ${partBlob.size} bytes)`
+      );
+    }
     return await uploadPart(partBlob, url, partNumber, onProgress, canceller);
   } catch (error) {
     // Don't retry if cancelled
     if (canceller.cancelled || error.message === '0') {
+      console.log(`Part ${partNumber} upload cancelled`);
       throw error;
     }
+
+    // Log the error details
+    console.error(
+      `Part ${partNumber} upload attempt ${retryCount + 1} failed:`,
+      {
+        error: error.message,
+        partNumber: partNumber,
+        partSize: partBlob.size,
+        isRetriable: isRetriableError(error),
+        retryCount: retryCount
+      }
+    );
 
     // Check if we should retry
     if (retryCount < MAX_RETRIES && isRetriableError(error)) {
@@ -1037,7 +1351,8 @@ async function uploadPartWithRetry(
       console.log(
         `Retrying part ${partNumber} after ${Math.round(
           delay
-        )}ms (attempt ${retryCount + 2}/${MAX_RETRIES})`
+        )}ms delay (attempt ${retryCount + 2}/${MAX_RETRIES + 1}), ` +
+          `error was: ${error.message}`
       );
 
       // Wait before retrying
@@ -1045,6 +1360,7 @@ async function uploadPartWithRetry(
 
       // Check if cancelled during delay
       if (canceller.cancelled) {
+        console.log(`Part ${partNumber} retry cancelled during delay`);
         throw new Error(0);
       }
 
@@ -1063,11 +1379,29 @@ async function uploadPartWithRetry(
     }
 
     // Max retries exhausted or non-retryable error
-    console.error(
-      `Failed to upload part ${partNumber} after ${retryCount} retries:`,
-      error
+    const finalMessage =
+      retryCount > 0
+        ? `Failed to upload part ${partNumber} after ${retryCount +
+            1} attempts (max retries: ${MAX_RETRIES + 1})`
+        : `Failed to upload part ${partNumber} - error is not retriable`;
+
+    console.error(finalMessage, {
+      error: error.message,
+      partNumber: partNumber,
+      partSize: partBlob.size,
+      totalAttempts: retryCount + 1,
+      wasRetriable: isRetriableError(error)
+    });
+
+    // Include more context in the thrown error
+    const enhancedError = new Error(
+      `Part ${partNumber} upload failed: ${error.message} (after ${retryCount +
+        1} attempts)`
     );
-    throw error;
+    enhancedError.originalError = error;
+    enhancedError.partNumber = partNumber;
+    enhancedError.attempts = retryCount + 1;
+    throw enhancedError;
   }
 }
 
