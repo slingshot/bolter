@@ -176,11 +176,18 @@ export default class Zip {
   }
 
   get size() {
-    const entries = this.files.reduce(
-      (total, file) => total + file.byteLength * 2 - file.size,
-      0
-    );
-    const eod = 22;
-    return entries + eod;
+    // Calculate actual ZIP overhead
+    // Each file has:
+    // - Local header: 30 bytes + filename
+    // - Data descriptor: 16 bytes
+    // - Central directory entry: 46 bytes + filename
+    // Total per file: 92 bytes + 2 * filename length
+    let overhead = 0;
+    for (const file of this.files) {
+      overhead += 92 + 2 * file.name.byteLength;
+    }
+    // Plus end of central directory: 22 bytes
+    overhead += 22;
+    return overhead;
   }
 }

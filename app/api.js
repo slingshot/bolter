@@ -456,7 +456,8 @@ async function uploadDirectToS3(
       useSignedUrl: uploadInfo.useSignedUrl,
       multipart: uploadInfo.multipart,
       parts: uploadInfo.parts ? uploadInfo.parts.length : 0,
-      partSize: uploadInfo.partSize
+      partSize: uploadInfo.partSize,
+      uploadId: uploadInfo.uploadId
     });
 
     // Check if we should use pre-signed URLs
@@ -489,7 +490,8 @@ async function uploadDirectToS3(
           encrypted,
           uploadInfo,
           onprogress,
-          canceller
+          canceller,
+          totalSize
         );
       } else {
         // It's already a blob/file - use existing multipart logic
@@ -540,6 +542,20 @@ async function uploadDirectToS3(
     let retries = 3;
     let lastError;
 
+    // Use actual uploaded size if available from multipart upload
+    const actualUploadedSize = uploadResult.actualUploadedSize || totalSize;
+
+    // Log what we're sending to complete endpoint
+    if (uploadInfo.multipart && uploadResult.partsCreated) {
+      console.log(`Completing multipart upload:`, {
+        id: uploadInfo.id,
+        partsToComplete: uploadResult.parts.length,
+        partsAllocated: uploadResult.partsAllocated,
+        actualSize: actualUploadedSize,
+        originalSize: totalSize
+      });
+    }
+
     while (retries > 0) {
       try {
         completeResponse = await fetch(getApiUrl('/api/upload/complete'), {
@@ -552,19 +568,39 @@ async function uploadDirectToS3(
             id: uploadInfo.id,
             metadata: metadataString,
             ...(isEncrypted && { authKey: verifierB64 }),
-            actualSize: totalSize,
+            actualSize: actualUploadedSize,
             ...(uploadInfo.multipart && { parts: uploadResult.parts })
           })
         });
 
         if (!completeResponse.ok) {
-          throw new Error(`HTTP ${completeResponse.status}`);
+          let errorMessage = `HTTP ${completeResponse.status}`;
+          try {
+            const errorBody = await completeResponse.text();
+            if (errorBody) {
+              errorMessage += `: ${errorBody}`;
+            }
+            console.error('Complete endpoint error:', {
+              status: completeResponse.status,
+              body: errorBody,
+              partsUploaded: uploadResult.parts ? uploadResult.parts.length : 0,
+              actualSize: actualUploadedSize
+            });
+          } catch (e) {
+            // Ignore error parsing
+          }
+          throw new Error(errorMessage);
         }
 
         break; // Success, exit retry loop
       } catch (e) {
         lastError = e;
         retries--;
+
+        console.error(
+          `Complete upload attempt failed (${4 - retries}/3):`,
+          e.message
+        );
 
         if (retries > 0) {
           // Wait before retrying (exponential backoff)
@@ -580,7 +616,14 @@ async function uploadDirectToS3(
       throw lastError || new Error('Failed to complete upload');
     }
 
-    const completeInfo = await completeResponse.json();
+    let completeInfo;
+    try {
+      completeInfo = await completeResponse.json();
+    } catch (e) {
+      // Response body may have been consumed by error handling
+      console.error('Could not parse complete response:', e);
+      completeInfo = {}; // Use empty object as fallback
+    }
 
     return {
       id: uploadInfo.id,
@@ -735,7 +778,8 @@ async function uploadMultipartStream(
   stream,
   uploadInfo,
   onprogress,
-  canceller
+  canceller,
+  originalTotalSize
 ) {
   const { parts, partSize } = uploadInfo;
   const partProgress = {}; // Track progress per part
@@ -744,7 +788,7 @@ async function uploadMultipartStream(
   const partErrors = {}; // Track specific errors for each part
 
   console.log(
-    `Starting multipart stream upload with ${parts.length} parts, part size: ${partSize}`
+    `Starting multipart stream upload with up to ${parts.length} parts allocated, part size: ${partSize}, expected total: ${originalTotalSize}`
   );
 
   // Initialize all parts with 0 progress upfront
@@ -772,6 +816,7 @@ async function uploadMultipartStream(
   let leftoverData = null; // Store data that didn't fit in the previous part
 
   const allUploads = []; // Track all upload promises
+  const uploadPartNumbers = []; // Track which part number each upload corresponds to
 
   try {
     let streamDone = false;
@@ -793,6 +838,11 @@ async function uploadMultipartStream(
 
         if (done) {
           streamDone = true;
+          console.log(
+            `Stream ended at part ${currentPartIndex + 1}/${
+              parts.length
+            }, bytes read so far: ${totalExpectedSize + currentPartSize}`
+          );
           break;
         }
 
@@ -833,6 +883,13 @@ async function uploadMultipartStream(
         // Create blob from accumulated chunks for this part
         const partBlob = new Blob(currentPartData);
 
+        console.log(`Creating part ${part.partNumber}:`, {
+          partSize: partBlob.size,
+          targetSize: targetPartSize,
+          streamDone: streamDone,
+          isLastPart: currentPartIndex === parts.length - 1
+        });
+
         // Track the expected size for this part
         partExpectedSizes[part.partNumber] = partBlob.size;
         totalExpectedSize += partBlob.size;
@@ -846,17 +903,19 @@ async function uploadMultipartStream(
             // Update upload progress
             if (loaded > 0) {
               partProgress[part.partNumber] = loaded;
-              // Calculate upload progress based on parts created so far
-              if (totalExpectedSize > 0) {
-                const totalUploaded = Math.min(
-                  Object.values(partProgress).reduce(
-                    (sum, progress) => sum + progress,
-                    0
-                  ),
-                  totalExpectedSize
-                );
-                onprogress(totalUploaded);
-              }
+              // Calculate actual bytes uploaded
+              const actualUploaded = Object.values(partProgress).reduce(
+                (sum, progress) => sum + progress,
+                0
+              );
+
+              // Never report more than the original total size
+              // This prevents progress from exceeding 100%
+              const reportedProgress = originalTotalSize
+                ? Math.min(actualUploaded, originalTotalSize)
+                : actualUploaded;
+
+              onprogress(reportedProgress);
             }
           },
           canceller
@@ -867,16 +926,20 @@ async function uploadMultipartStream(
             console.log(
               `Part ${part.partNumber} uploaded successfully (size: ${partBlob.size} bytes)`
             );
-            if (totalExpectedSize > 0) {
-              const totalUploaded = Math.min(
-                Object.values(partProgress).reduce(
-                  (sum, progress) => sum + progress,
-                  0
-                ),
-                totalExpectedSize
-              );
-              onprogress(totalUploaded);
-            }
+
+            // Report actual progress
+            const totalUploaded = Object.values(partProgress).reduce(
+              (sum, progress) => sum + progress,
+              0
+            );
+
+            // Never report more than the original total size
+            const reportedProgress = originalTotalSize
+              ? Math.min(totalUploaded, originalTotalSize)
+              : totalUploaded;
+
+            onprogress(reportedProgress);
+
             return result;
           })
           .catch(error => {
@@ -895,6 +958,7 @@ async function uploadMultipartStream(
           });
 
         allUploads.push(uploadPromise);
+        uploadPartNumbers.push(part.partNumber); // Track which part this upload is for
 
         // Reset for next part
         currentPartData = [];
@@ -907,15 +971,43 @@ async function uploadMultipartStream(
       currentPartIndex++;
     }
 
+    // If stream ended early, log the mismatch but don't create empty parts
+    if (streamDone && currentPartIndex < parts.length) {
+      console.warn(
+        `Stream ended early at part ${currentPartIndex}/${parts.length}. Server allocated too many parts.`
+      );
+      console.warn(
+        `Expected size: ${originalTotalSize}, Actual size: ${totalExpectedSize}`
+      );
+    }
+
     // Mark that all parts have been created
+    console.log(
+      `Created ${uploadPartNumbers.length} parts from stream (allocated ${parts.length})`
+    );
+
+    // Log detailed information about the upload
+    console.log(`Stream upload details:`, {
+      totalBytesUploaded: totalExpectedSize,
+      originalTotalSize: originalTotalSize,
+      partsCreated: uploadPartNumbers.length,
+      partsAllocated: parts.length,
+      averagePartSize: totalExpectedSize / uploadPartNumbers.length,
+      expectedPartSize: partSize,
+      streamEnded: true
+    });
 
     // Final progress update now that we know the true total
     const finalProgress = Object.values(partProgress).reduce(
       (sum, progress) => sum + progress,
       0
     );
-    if (totalExpectedSize > 0) {
-      onprogress(finalProgress);
+    // Report progress, but cap at original total size
+    const reportedProgress = originalTotalSize
+      ? Math.min(finalProgress, originalTotalSize)
+      : finalProgress;
+    if (reportedProgress > 0) {
+      onprogress(reportedProgress);
     }
 
     // Wait for all uploads to complete
@@ -933,7 +1025,8 @@ async function uploadMultipartStream(
       if (result.status === 'fulfilled') {
         successfulParts.push(result.value);
       } else {
-        const partNumber = parts[index].partNumber;
+        // Use the tracked part number, not parts[index]
+        const partNumber = uploadPartNumbers[index];
         failedParts.push(partNumber);
         // Log if we don't already have error details
         if (!partErrors[partNumber]) {
@@ -946,21 +1039,32 @@ async function uploadMultipartStream(
     });
 
     console.log(
-      `Upload results: ${successfulParts.length} successful, ${failedParts.length} failed out of ${parts.length} total parts`
+      `Upload results: ${successfulParts.length} successful, ${failedParts.length} failed out of ${uploadPartNumbers.length} parts attempted (${parts.length} parts allocated)`
     );
 
     // Ensure final progress shows 100% completion if all succeeded
     if (failedParts.length === 0) {
-      onprogress(totalExpectedSize);
+      // Report the original total size to indicate 100% completion
+      // When we successfully upload all parts we created (even if less than allocated),
+      // we should report 100% completion
+      const finalReportedSize = originalTotalSize || totalExpectedSize;
+      onprogress(finalReportedSize);
+      console.log(
+        `All ${uploadPartNumbers.length} parts uploaded successfully. Reporting 100% completion (${finalReportedSize} bytes)`
+      );
     }
 
     // Check if all parts were uploaded successfully
     if (failedParts.length > 0) {
-      // Generate consolidated error summary
+      // Generate consolidated error summary (use actual attempted parts count)
+      const modifiedUploadInfo = {
+        ...uploadInfo,
+        parts: uploadPartNumbers.map(num => ({ partNumber: num }))
+      };
       const { summary, shareableMessage } = createUploadErrorSummary(
         failedParts,
         partErrors,
-        uploadInfo,
+        modifiedUploadInfo,
         totalExpectedSize
       );
 
@@ -979,7 +1083,10 @@ async function uploadMultipartStream(
     }
 
     return {
-      parts: successfulParts.sort((a, b) => a.PartNumber - b.PartNumber)
+      parts: successfulParts.sort((a, b) => a.PartNumber - b.PartNumber),
+      actualUploadedSize: totalExpectedSize,
+      partsCreated: uploadPartNumbers.length,
+      partsAllocated: parts.length
     };
   } finally {
     // Clean up reader

@@ -1,6 +1,8 @@
 import { blobStream, concatStream } from './streams';
 import Zip from './zip';
 
+const encoder = new TextEncoder();
+
 function isDupe(newFile, array) {
   for (const file of array) {
     if (
@@ -35,11 +37,26 @@ export default class Archive {
 
   get size() {
     const rawSize = this.files.reduce((total, file) => total + file.size, 0);
-    // For unencrypted multi-file archives, add ZIP overhead
+    // For unencrypted multi-file archives, calculate actual ZIP size
     if (!this.encrypted && this.files.length > 1) {
-      // Calculate ZIP overhead: headers, data descriptors, central directory
-      const zip = new Zip(this.manifest, null);
-      return rawSize + zip.size;
+      // ZIP overhead per file:
+      // - Local header: 30 bytes + filename length
+      // - Data descriptor: 16 bytes
+      // - Central directory entry: 46 bytes + filename length
+      // Total overhead = 92 bytes + 2 * filename length per file
+      // Plus end of central directory: 22 bytes
+
+      let overhead = 22; // End of central directory
+      for (const file of this.files) {
+        const nameLength = encoder.encode(file.name).byteLength;
+        overhead += 92 + 2 * nameLength;
+      }
+
+      console.log(
+        `Archive size calculation: raw=${rawSize}, overhead=${overhead}, total=${rawSize +
+          overhead}`
+      );
+      return rawSize + overhead;
     }
     return rawSize;
   }
