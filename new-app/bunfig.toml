@@ -1,0 +1,7 @@
+[install]
+# Use the same lockfile for all workspaces
+frozen = false
+
+[install.scopes]
+# Scope for workspace packages
+"@bolter" = { token = "" }
