@@ -1,0 +1,13 @@
+{
+  "name": "bolter-monorepo",
+  "private": true,
+  "workspaces": ["frontend", "backend"],
+  "scripts": {
+    "dev": "bun run --cwd backend dev & bun run --cwd frontend dev",
+    "dev:frontend": "bun run --cwd frontend dev",
+    "dev:backend": "bun run --cwd backend dev",
+    "build": "bun run --cwd frontend build",
+    "start": "bun run --cwd backend start",
+    "install:all": "cd frontend && bun install && cd ../backend && bun install"
+  }
+}
