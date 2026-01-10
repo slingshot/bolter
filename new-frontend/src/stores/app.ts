@@ -1,0 +1,203 @@
+import { create } from 'zustand';
+import { Keychain } from '@/lib/crypto';
+import { Canceller, type UploadProgress } from '@/lib/api';
+
+export interface FileItem {
+  id: string;
+  file: File;
+  status: 'pending' | 'uploading' | 'completed' | 'error';
+  progress: number;
+  error?: string;
+}
+
+export interface UploadedFile {
+  id: string;
+  url: string;
+  secretKey: string;
+  ownerToken: string;
+  name: string;
+  size: number;
+  expiresAt: Date;
+  downloadLimit: number;
+  downloadCount: number;
+}
+
+export interface AppState {
+  // Theme
+  theme: 'light' | 'dark' | 'system';
+  setTheme: (theme: 'light' | 'dark' | 'system') => void;
+
+  // Files to upload
+  files: FileItem[];
+  addFiles: (files: File[]) => void;
+  removeFile: (id: string) => void;
+  clearFiles: () => void;
+
+  // Upload settings
+  encrypted: boolean;
+  setEncrypted: (encrypted: boolean) => void;
+  timeLimit: number;
+  setTimeLimit: (seconds: number) => void;
+  downloadLimit: number;
+  setDownloadLimit: (limit: number) => void;
+
+  // Upload state
+  isUploading: boolean;
+  uploadProgress: UploadProgress | null;
+  uploadError: string | null;
+  currentCanceller: Canceller | null;
+  currentKeychain: Keychain | null;
+
+  setUploading: (uploading: boolean) => void;
+  setUploadProgress: (progress: UploadProgress | null) => void;
+  setUploadError: (error: string | null) => void;
+  setCanceller: (canceller: Canceller | null) => void;
+  setKeychain: (keychain: Keychain | null) => void;
+
+  // Uploaded files history
+  uploadedFiles: UploadedFile[];
+  addUploadedFile: (file: UploadedFile) => void;
+  removeUploadedFile: (id: string) => void;
+  clearUploadedFiles: () => void;
+
+  // Config
+  config: {
+    maxFileSize: number;
+    maxFilesPerArchive: number;
+    maxExpireSeconds: number;
+    maxDownloads: number;
+    defaultExpireSeconds: number;
+    defaultDownloads: number;
+    expireTimes: number[];
+    downloadCounts: number[];
+    customTitle?: string;
+    customDescription?: string;
+  } | null;
+  setConfig: (config: AppState['config']) => void;
+
+  // Toasts
+  toasts: { id: string; title: string; description?: string; variant?: 'default' | 'destructive' | 'success' }[];
+  addToast: (toast: Omit<AppState['toasts'][0], 'id'>) => void;
+  removeToast: (id: string) => void;
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+  // Theme
+  theme: (typeof window !== 'undefined' && localStorage.getItem('theme') as AppState['theme']) || 'system',
+  setTheme: (theme) => {
+    localStorage.setItem('theme', theme);
+    set({ theme });
+    applyTheme(theme);
+  },
+
+  // Files
+  files: [],
+  addFiles: (newFiles) => {
+    const items: FileItem[] = newFiles.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      status: 'pending',
+      progress: 0,
+    }));
+    set((state) => ({ files: [...state.files, ...items] }));
+  },
+  removeFile: (id) => set((state) => ({ files: state.files.filter((f) => f.id !== id) })),
+  clearFiles: () => set({ files: [] }),
+
+  // Settings
+  encrypted: true,
+  setEncrypted: (encrypted) => set({ encrypted }),
+  timeLimit: 86400, // 1 day
+  setTimeLimit: (timeLimit) => set({ timeLimit }),
+  downloadLimit: 1,
+  setDownloadLimit: (downloadLimit) => set({ downloadLimit }),
+
+  // Upload state
+  isUploading: false,
+  uploadProgress: null,
+  uploadError: null,
+  currentCanceller: null,
+  currentKeychain: null,
+
+  setUploading: (isUploading) => set({ isUploading }),
+  setUploadProgress: (uploadProgress) => set({ uploadProgress }),
+  setUploadError: (uploadError) => set({ uploadError }),
+  setCanceller: (currentCanceller) => set({ currentCanceller }),
+  setKeychain: (currentKeychain) => set({ currentKeychain }),
+
+  // Uploaded files
+  uploadedFiles: loadUploadedFiles(),
+  addUploadedFile: (file) => {
+    set((state) => {
+      const newFiles = [file, ...state.uploadedFiles];
+      saveUploadedFiles(newFiles);
+      return { uploadedFiles: newFiles };
+    });
+  },
+  removeUploadedFile: (id) => {
+    set((state) => {
+      const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
+      saveUploadedFiles(newFiles);
+      return { uploadedFiles: newFiles };
+    });
+  },
+  clearUploadedFiles: () => {
+    localStorage.removeItem('uploadedFiles');
+    set({ uploadedFiles: [] });
+  },
+
+  // Config
+  config: null,
+  setConfig: (config) => set({ config }),
+
+  // Toasts
+  toasts: [],
+  addToast: (toast) => {
+    const id = crypto.randomUUID();
+    set((state) => ({ toasts: [...state.toasts, { ...toast, id }] }));
+    setTimeout(() => get().removeToast(id), 5000);
+  },
+  removeToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
+}));
+
+// Helper functions
+function loadUploadedFiles(): UploadedFile[] {
+  try {
+    const stored = localStorage.getItem('uploadedFiles');
+    if (!stored) return [];
+    const files = JSON.parse(stored);
+    return files.map((f: any) => ({
+      ...f,
+      expiresAt: new Date(f.expiresAt),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function saveUploadedFiles(files: UploadedFile[]) {
+  try {
+    localStorage.setItem('uploadedFiles', JSON.stringify(files));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function applyTheme(theme: 'light' | 'dark' | 'system') {
+  const root = document.documentElement;
+  const isDark =
+    theme === 'dark' ||
+    (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+  if (isDark) {
+    root.classList.add('dark');
+  } else {
+    root.classList.remove('dark');
+  }
+}
+
+// Initialize theme
+if (typeof window !== 'undefined') {
+  const theme = (localStorage.getItem('theme') as AppState['theme']) || 'system';
+  applyTheme(theme);
+}
