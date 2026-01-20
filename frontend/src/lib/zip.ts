@@ -1,8 +1,9 @@
 /**
- * Zip utilities for handling multiple file downloads
+ * Zip utilities for handling file uploads and downloads
  */
 
 import JSZip from 'jszip';
+import { downloadZip } from 'client-zip';
 
 export interface FileInfo {
   name: string;
@@ -14,6 +15,180 @@ export interface FileSlice {
   name: string;
   data: Uint8Array;
   type: string;
+}
+
+/**
+ * Read a file with streaming progress
+ */
+async function readFileWithProgress(
+  file: File,
+  onProgress: (bytesRead: number) => void
+): Promise<Uint8Array> {
+  const reader = file.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let totalRead = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    chunks.push(value);
+    totalRead += value.length;
+    onProgress(totalRead);
+  }
+
+  // Combine chunks
+  const result = new Uint8Array(totalRead);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  return result;
+}
+
+/**
+ * Create a zip blob from File objects (for upload-time zipping)
+ * Uses DEFLATE compression for smaller upload size
+ * Progress is byte-based: 0-50% for reading files, 50-100% for compression
+ */
+export async function createZipFromUploadFiles(
+  files: File[],
+  onProgress?: (percent: number) => void
+): Promise<{ blob: Blob; filename: string }> {
+  const zip = new JSZip();
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  let totalBytesRead = 0;
+
+  // Handle duplicate filenames
+  const nameCount: Record<string, number> = {};
+
+  // Read files with streaming progress tracking (0-50%)
+  for (const file of files) {
+    let name = file.name;
+
+    if (nameCount[name] !== undefined) {
+      const lastDot = name.lastIndexOf('.');
+      const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
+      const extension = lastDot > 0 ? name.slice(lastDot) : '';
+      nameCount[name]++;
+      name = `${baseName} (${nameCount[name]})${extension}`;
+    } else {
+      nameCount[name] = 0;
+    }
+
+    // Read file with progress
+    const baseBytes = totalBytesRead;
+    const buffer = await readFileWithProgress(file, (bytesRead) => {
+      // Report reading progress (0-50% of total)
+      onProgress?.(Math.round(((baseBytes + bytesRead) / totalSize) * 50));
+    });
+    totalBytesRead += file.size;
+
+    // Add to zip with DEFLATE compression
+    zip.file(name, buffer, { compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  }
+
+  // Generate zip with progress tracking (50-100%)
+  const blob = await zip.generateAsync(
+    {
+      type: 'blob',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 },
+    },
+    (metadata) => {
+      // Report compression progress (50-100% of total)
+      onProgress?.(50 + Math.round(metadata.percent / 2));
+    }
+  );
+
+  const filename = generateZipFilename(files.map(f => ({ name: f.name, size: f.size, type: f.type })));
+
+  return { blob, filename };
+}
+
+/**
+ * Create a streaming zip from File objects
+ * Uses client-zip which streams data without buffering the entire zip in memory
+ * This is suitable for large files (multi-GB) that would exceed browser memory limits
+ *
+ * Note: client-zip uses STORE compression (no compression) for streaming capability
+ */
+export function createStreamingZip(
+  files: File[],
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+): { stream: ReadableStream<Uint8Array>; filename: string; estimatedSize: number } {
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  let bytesProcessed = 0;
+
+  // Handle duplicate filenames
+  const nameCount: Record<string, number> = {};
+  const renamedFiles: { name: string; input: File }[] = [];
+
+  for (const file of files) {
+    let name = file.name;
+
+    if (nameCount[name] !== undefined) {
+      const lastDot = name.lastIndexOf('.');
+      const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
+      const extension = lastDot > 0 ? name.slice(lastDot) : '';
+      nameCount[name]++;
+      name = `${baseName} (${nameCount[name]})${extension}`;
+    } else {
+      nameCount[name] = 0;
+    }
+
+    renamedFiles.push({ name, input: file });
+  }
+
+  // Create file entries with progress tracking
+  // Each entry wraps the file stream with progress reporting
+  const entries = renamedFiles.map(({ name, input }) => ({
+    name,
+    lastModified: new Date(input.lastModified),
+    input: createProgressStream(input.stream(), input.size, (bytes) => {
+      bytesProcessed += bytes;
+      onProgress?.(bytesProcessed, totalSize);
+    }),
+  }));
+
+  // Use client-zip to create the streaming zip
+  const response = downloadZip(entries);
+  const stream = response.body!;
+
+  // Estimate zip size (STORE compression = input size + ~100 bytes per file for headers)
+  const estimatedSize = totalSize + files.length * 100 + 22; // 22 bytes for end of central directory
+
+  const filename = generateZipFilename(files.map(f => ({ name: f.name, size: f.size, type: f.type })));
+
+  return { stream, filename, estimatedSize };
+}
+
+/**
+ * Wrap a stream to track bytes read for progress reporting
+ */
+function createProgressStream(
+  stream: ReadableStream<Uint8Array>,
+  _totalSize: number,
+  onBytes: (bytes: number) => void
+): ReadableStream<Uint8Array> {
+  const reader = stream.getReader();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      onBytes(value.length);
+      controller.enqueue(value);
+    },
+    cancel() {
+      reader.cancel();
+    },
+  });
 }
 
 /**
@@ -74,6 +249,7 @@ function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
 
 /**
  * Create a zip blob from file slices
+ * Uses STORE compression (no compression) to reduce memory usage for large files
  */
 export async function createZipFromFiles(fileSlices: FileSlice[]): Promise<Blob> {
   const zip = new JSZip();
@@ -82,10 +258,23 @@ export async function createZipFromFiles(fileSlices: FileSlice[]): Promise<Blob>
   const dedupedSlices = deduplicateFilenames(fileSlices);
 
   for (const slice of dedupedSlices) {
-    zip.file(slice.name, slice.data);
+    // Use STORE compression (level 0) to minimize memory usage
+    zip.file(slice.name, slice.data, { compression: 'STORE' });
   }
 
-  return zip.generateAsync({ type: 'blob' });
+  try {
+    return await zip.generateAsync({
+      type: 'blob',
+      compression: 'STORE', // No compression to save memory
+      streamFiles: true, // Stream files to reduce memory peaks
+    });
+  } catch (error: any) {
+    // If blob creation fails due to memory, throw a more helpful error
+    if (error.message?.includes("can't construct the Blob")) {
+      throw new Error('Download too large for browser. Try downloading fewer files at once.');
+    }
+    throw error;
+  }
 }
 
 /**

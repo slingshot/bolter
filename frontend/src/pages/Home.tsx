@@ -33,6 +33,7 @@ export function HomePage() {
     setUploadError,
     setCanceller,
     setKeychain,
+    setZippingProgress,
     addUploadedFile,
     addToast,
     config,
@@ -48,6 +49,7 @@ export function HomePage() {
     setUploadError(null);
     setCanceller(canceller);
     setKeychain(keychain);
+    setZippingProgress(null);
 
     try {
       const result = await uploadFiles(
@@ -57,7 +59,11 @@ export function HomePage() {
           timeLimit,
           downloadLimit,
           onProgress: (progress) => {
+            setZippingProgress(null); // Clear zipping when upload starts
             setUploadProgress(progress);
+          },
+          onZipProgress: (percent) => {
+            setZippingProgress(percent);
           },
           onError: (error) => {
             console.error('Upload error:', error);

@@ -1,18 +1,51 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { File, Link2, Download, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { formatBytes, formatTimeLimit, formatDownloadLimit } from '@/lib/utils';
+import { formatBytes, formatTimeLimit } from '@/lib/utils';
 import { useAppStore, type UploadedFile } from '@/stores/app';
 import { ShareDialog } from './ShareDialog';
+import { getFileInfo } from '@/lib/api';
 
 export function UploadedFilesList() {
-  const { uploadedFiles, clearUploadedFiles } = useAppStore();
+  const { uploadedFiles, clearUploadedFiles, removeUploadedFile, updateUploadedFile } = useAppStore();
   const [selectedFile, setSelectedFile] = useState<UploadedFile | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Filter out expired files
   const validFiles = uploadedFiles.filter(
     (f) => f.expiresAt.getTime() > Date.now()
   );
+
+  // Poll for download count updates
+  useEffect(() => {
+    const pollFileInfo = async () => {
+      for (const file of validFiles) {
+        const info = await getFileInfo(file.id, file.ownerToken);
+        if (info === null) {
+          // File no longer exists - remove from list
+          removeUploadedFile(file.id);
+        } else if (info.dl >= info.dlimit) {
+          // Download limit reached - remove from list
+          removeUploadedFile(file.id);
+        } else if (info.dl !== file.downloadCount) {
+          // Update download count
+          updateUploadedFile(file.id, { downloadCount: info.dl });
+        }
+      }
+    };
+
+    // Poll immediately on mount
+    pollFileInfo();
+
+    // Poll every 5 seconds
+    pollIntervalRef.current = setInterval(pollFileInfo, 5000);
+
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, [validFiles.length]); // Re-run when file count changes
 
   if (validFiles.length === 0) return null;
 
@@ -57,7 +90,7 @@ export function UploadedFilesList() {
                         {file.name}
                       </p>
                       <p className="text-paragraph-xxs text-content-secondary">
-                        {formatBytes(file.size)} | Expires after {formatDownloadLimit(file.downloadLimit)} or {formatTimeLimit(timeUntilExpiry)}
+                        {formatBytes(file.size)} | {file.downloadCount}/{file.downloadLimit} downloads | Expires in {formatTimeLimit(timeUntilExpiry)}
                       </p>
                     </div>
 

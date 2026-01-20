@@ -47,17 +47,20 @@ export interface AppState {
   uploadError: string | null;
   currentCanceller: Canceller | null;
   currentKeychain: Keychain | null;
+  zippingProgress: number | null; // 0-100 percentage while zipping multiple files
 
   setUploading: (uploading: boolean) => void;
   setUploadProgress: (progress: UploadProgress | null) => void;
   setUploadError: (error: string | null) => void;
   setCanceller: (canceller: Canceller | null) => void;
   setKeychain: (keychain: Keychain | null) => void;
+  setZippingProgress: (progress: number | null) => void;
 
   // Uploaded files history
   uploadedFiles: UploadedFile[];
   addUploadedFile: (file: UploadedFile) => void;
   removeUploadedFile: (id: string) => void;
+  updateUploadedFile: (id: string, updates: Partial<UploadedFile>) => void;
   clearUploadedFiles: () => void;
 
   // Config
@@ -118,12 +121,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   uploadError: null,
   currentCanceller: null,
   currentKeychain: null,
+  zippingProgress: null,
 
   setUploading: (isUploading) => set({ isUploading }),
   setUploadProgress: (uploadProgress) => set({ uploadProgress }),
   setUploadError: (uploadError) => set({ uploadError }),
   setCanceller: (currentCanceller) => set({ currentCanceller }),
   setKeychain: (currentKeychain) => set({ currentKeychain }),
+  setZippingProgress: (zippingProgress) => set({ zippingProgress }),
 
   // Uploaded files
   uploadedFiles: loadUploadedFiles(),
@@ -137,6 +142,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   removeUploadedFile: (id) => {
     set((state) => {
       const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
+      saveUploadedFiles(newFiles);
+      return { uploadedFiles: newFiles };
+    });
+  },
+  updateUploadedFile: (id, updates) => {
+    set((state) => {
+      const newFiles = state.uploadedFiles.map((f) =>
+        f.id === id ? { ...f, ...updates } : f
+      );
       saveUploadedFiles(newFiles);
       return { uploadedFiles: newFiles };
     });

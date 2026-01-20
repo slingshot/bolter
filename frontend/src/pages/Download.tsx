@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Keychain } from '@/lib/crypto';
-import { getMetadata, downloadFile, fileExists } from '@/lib/api';
+import { getMetadata, downloadFile, fileExists, getDownloadStatus, API_BASE_URL } from '@/lib/api';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
@@ -25,6 +25,8 @@ interface FileMetadata {
   ttl: number;
   encrypted: boolean;
   files?: { name: string; size: number; type: string }[];
+  zipped?: boolean;
+  zipFilename?: string;
 }
 
 export function DownloadPage() {
@@ -37,6 +39,7 @@ export function DownloadPage() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [keychain, setKeychain] = useState<Keychain | null>(null);
+  const [canDownloadAgain, setCanDownloadAgain] = useState(true);
   const loadingRef = useRef(false);
 
   // Extract secret key from URL hash
@@ -57,6 +60,13 @@ export function DownloadPage() {
         // Check if file exists
         const exists = await fileExists(id);
         if (!exists) {
+          setState('not-found');
+          return;
+        }
+
+        // Check if download limit already reached
+        const status = await getDownloadStatus(id);
+        if (status && status.dl >= status.dlimit) {
           setState('not-found');
           return;
         }
@@ -86,6 +96,33 @@ export function DownloadPage() {
   const handleDownload = async () => {
     if (!id) return;
 
+    // Direct download for unencrypted files (uses native browser download)
+    // Works for: single files, or multi-file zips (zipped at upload time)
+    const canDirectDownload =
+      metadata &&
+      !metadata.encrypted &&
+      (metadata.zipped || !metadata.files || metadata.files.length <= 1);
+
+    if (canDirectDownload) {
+      // Use hidden iframe to trigger download without leaving the page
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = `${API_BASE_URL}/download/direct/${id}`;
+      document.body.appendChild(iframe);
+
+      // Clean up iframe and check if download limit was reached
+      setTimeout(async () => {
+        document.body.removeChild(iframe);
+        // Check download count vs limit to determine if more downloads available
+        const status = await getDownloadStatus(id);
+        const hasMoreDownloads = status ? status.dl < status.dlimit : false;
+        setCanDownloadAgain(hasMoreDownloads);
+        setState('complete');
+      }, 1500);
+      return;
+    }
+
+    // JavaScript-based download for encrypted files or multiple files (needs decryption/ZIP)
     setState('downloading');
     setProgress(0);
 
@@ -100,6 +137,11 @@ export function DownloadPage() {
 
       // Trigger browser download
       triggerDownload(result.blob, result.filename);
+
+      // Check download count vs limit to determine if more downloads available
+      const status = await getDownloadStatus(id);
+      const hasMoreDownloads = status ? status.dl < status.dlimit : false;
+      setCanDownloadAgain(hasMoreDownloads);
       setState('complete');
     } catch (e: any) {
       console.error('Download failed:', e);
@@ -213,16 +255,20 @@ export function DownloadPage() {
                   Download complete!
                 </h2>
                 <p className="text-paragraph-xs text-content-secondary">
-                  Your file has been downloaded successfully.
+                  {canDownloadAgain
+                    ? 'Your file has been downloaded successfully.'
+                    : 'Your file has been downloaded. Download limit reached.'}
                 </p>
               </div>
 
               {/* Actions */}
               <div className="w-full flex flex-col gap-3">
-                <Button className="w-full" onClick={handleDownload}>
-                  Download again
-                </Button>
-                <Button variant="outline" className="w-full" onClick={() => navigate('/')}>
+                {canDownloadAgain && (
+                  <Button className="w-full" onClick={handleDownload}>
+                    Download again
+                  </Button>
+                )}
+                <Button variant={canDownloadAgain ? 'outline' : 'default'} className="w-full" onClick={() => navigate('/')}>
                   Upload a new file
                 </Button>
               </div>

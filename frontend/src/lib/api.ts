@@ -4,10 +4,13 @@
  */
 
 import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
-import { sliceConcatenatedData, createZipFromFiles, generateZipFilename, type FileInfo } from './zip';
+import { sliceConcatenatedData, createZipFromFiles, createZipFromUploadFiles, createStreamingZip, generateZipFilename, type FileInfo } from './zip';
+
+// Threshold for using streaming zip (500MB) - below this, buffered zip is fine
+const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
 
 // API base URL - defaults to localhost for development
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 // Retry configuration
 const MAX_RETRIES = 10;
@@ -36,6 +39,7 @@ export interface UploadOptions {
   timeLimit?: number;
   downloadLimit?: number;
   onProgress?: (progress: UploadProgress) => void;
+  onZipProgress?: (percent: number) => void;
   onError?: (error: UploadError) => void;
 }
 
@@ -217,14 +221,53 @@ export async function deleteFile(id: string, ownerToken: string): Promise<boolea
 }
 
 /**
+ * Get file info (download count, limit, TTL) - requires owner token
+ */
+export async function getFileInfo(id: string, ownerToken: string): Promise<{
+  dl: number;
+  dlimit: number;
+  ttl: number;
+} | null> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/info/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner_token: ownerToken }),
+    });
+    if (!response.ok) return null;
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get download status (dl, dlimit) - works for unencrypted files without auth
+ */
+export async function getDownloadStatus(id: string): Promise<{
+  dl: number;
+  dlimit: number;
+} | null> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/download/url/${id}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return { dl: data.dl, dlimit: data.dlimit };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Upload files with resilient multipart support
+ * Multi-file uploads are zipped at upload time for efficient downloads
  */
 export async function uploadFiles(
   options: UploadOptions,
   keychain: Keychain,
   canceller: Canceller
 ): Promise<UploadResult> {
-  const { files, encrypted = true, timeLimit, downloadLimit, onProgress, onError } = options;
+  const { files, encrypted = true, timeLimit, downloadLimit, onProgress, onZipProgress, onError } = options;
 
   const startTime = Date.now();
   let lastProgressTime = startTime;
@@ -233,12 +276,55 @@ export async function uploadFiles(
   let smoothedSpeed = 0;
   let smoothedRemaining = 0;
 
+  // Determine upload strategy for multi-file uploads
+  const isMultiFile = files.length > 1;
+  const totalInputSize = files.reduce((sum, f) => sum + f.size, 0);
+  const useStreamingZip = isMultiFile && totalInputSize >= STREAMING_ZIP_THRESHOLD;
+
+  // For multiple files, create a zip (buffered for small, streaming for large)
+  let uploadBlob: Blob | null = null;
+  let zipFilename: string | null = null;
+  let streamingZipStream: ReadableStream<Uint8Array> | null = null;
+  let estimatedZipSize = 0;
+
+  if (isMultiFile) {
+    if (useStreamingZip) {
+      // Large files: use streaming zip to avoid memory issues
+      // Progress will be reported during upload as bytes are processed
+      const streamingResult = createStreamingZip(files, (processed, total) => {
+        // Report zipping progress as percentage
+        onZipProgress?.(Math.round((processed / total) * 100));
+      });
+      streamingZipStream = streamingResult.stream;
+      zipFilename = streamingResult.filename;
+      estimatedZipSize = streamingResult.estimatedSize;
+    } else {
+      // Small files: use buffered zip for compression benefits
+      const zipResult = await createZipFromUploadFiles(files, onZipProgress);
+      uploadBlob = zipResult.blob;
+      zipFilename = zipResult.filename;
+      // Clear zipping progress now that we're done
+      onZipProgress?.(100);
+    }
+  }
+
   // Calculate total size
-  const plainSize = files.reduce((sum, f) => sum + f.size, 0);
+  // For streaming zip: use estimated size (actual uncompressed + headers)
+  // For buffered zip: use actual blob size
+  // For single file: use file size
+  const plainSize = streamingZipStream
+    ? estimatedZipSize
+    : uploadBlob
+      ? uploadBlob.size
+      : totalInputSize;
   const totalSize = encrypted ? calculateEncryptedSize(plainSize) : plainSize;
 
-  // Create metadata
-  const metadata = {
+  // Create metadata - keep original file info for display, mark as zipped if applicable
+  const metadata: {
+    files: { name: string; size: number; type: string }[];
+    zipped?: boolean;
+    zipFilename?: string;
+  } = {
     files: files.map((f) => ({
       name: f.name,
       size: f.size,
@@ -246,8 +332,26 @@ export async function uploadFiles(
     })),
   };
 
-  // Create stream from files
-  const stream = createFileStream(files, keychain, encrypted);
+  if (isMultiFile && zipFilename) {
+    metadata.zipped = true;
+    metadata.zipFilename = zipFilename;
+  }
+
+  // Create stream based on upload type:
+  // - Streaming zip for large multi-file uploads
+  // - Blob stream for buffered zip
+  // - File stream for single files
+  let stream: ReadableStream<Uint8Array>;
+  if (streamingZipStream) {
+    // Streaming zip - optionally encrypt
+    stream = encrypted
+      ? streamingZipStream.pipeThrough(createEncryptionStream(keychain))
+      : streamingZipStream;
+  } else if (uploadBlob) {
+    stream = createBlobStream(uploadBlob, keychain, encrypted);
+  } else {
+    stream = createFileStream(files, keychain, encrypted);
+  }
 
   // Request upload URLs
   const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
@@ -404,6 +508,23 @@ function createFileStream(
       }
     },
   });
+
+  if (!encrypt) {
+    return baseStream;
+  }
+
+  return baseStream.pipeThrough(createEncryptionStream(keychain));
+}
+
+/**
+ * Create a readable stream from a blob (for zipped multi-file uploads)
+ */
+function createBlobStream(
+  blob: Blob,
+  keychain: Keychain,
+  encrypt: boolean
+): ReadableStream<Uint8Array> {
+  const baseStream = blob.stream();
 
   if (!encrypt) {
     return baseStream;
@@ -859,11 +980,20 @@ export async function downloadFile(
     headers: keychain ? { Authorization: await keychain.authHeader() } : {},
   }).catch(console.warn);
 
-  // Handle multiple files - create zip archive
+  // Handle multiple files
   const files = metadata.files as FileInfo[] | undefined;
 
+  // If file was zipped at upload time, return the zip directly
+  if (metadata.zipped) {
+    return {
+      blob: new Blob([decryptedData], { type: 'application/zip' }),
+      filename: metadata.zipFilename || generateZipFilename(files || []),
+    };
+  }
+
+  // Legacy: multiple files uploaded before zip-at-upload-time feature
+  // Slice data and create zip on the fly (may fail for very large files)
   if (files && files.length > 1) {
-    // Multiple files: slice data and create zip
     const fileSlices = sliceConcatenatedData(decryptedData, files);
     const zipBlob = await createZipFromFiles(fileSlices);
     return {
@@ -872,7 +1002,7 @@ export async function downloadFile(
     };
   }
 
-  // Single file: return as-is (existing behavior)
+  // Single file: return as-is
   return {
     blob: new Blob([decryptedData]),
     filename: metadata.name || 'download',

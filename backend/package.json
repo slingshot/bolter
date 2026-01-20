@@ -9,13 +9,14 @@
     "build": "bun build src/index.ts --outdir ./dist --target bun"
   },
   "dependencies": {
-    "@bolter/shared": "workspace:*",
     "@aws-sdk/client-s3": "^3.500.0",
     "@aws-sdk/s3-request-presigner": "^3.500.0",
+    "@bolter/shared": "workspace:*",
     "@elysiajs/cors": "^1.0.0",
     "@elysiajs/static": "^1.0.0",
     "convict": "^6.2.4",
     "elysia": "^1.0.0",
+    "jszip": "^3.10.1",
     "nanoid": "^5.0.0",
     "pino": "^10.2.1",
     "pino-pretty": "^13.1.3",
