@@ -52,7 +52,7 @@ function App() {
   }, [setConfig]);
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="h-dvh flex flex-col overflow-auto">
       <Header />
       <main className="flex-1">
         <Routes>

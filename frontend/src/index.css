@@ -13,7 +13,9 @@
 
   html,
   body {
-    min-height: 100vh;
+    height: 100vh;
+    height: 100dvh; /* Uses dynamic viewport height when supported */
+    overflow: hidden;
   }
 
   body {
@@ -29,13 +31,14 @@
   body::before {
     content: '';
     position: fixed;
-    bottom: 0;
-    left: 0;
+    inset: 0;
     width: 100%;
-    height: 100%;
-    background: linear-gradient(to bottom, #000 0%, transparent 50%),
-      url('/gradient-bg.jpg') bottom center / 100% auto no-repeat;
-    background-color: #000;
+    min-height: 100dvh;
+    min-height: 100vh; /* Fallback for browsers without dvh support */
+    background:
+      linear-gradient(to bottom, #000 0%, transparent 50%),
+      url('/gradient-bg.jpg') bottom center / 100% auto no-repeat,
+      #000;
     pointer-events: none;
     z-index: -2;
   }
