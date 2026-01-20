@@ -35,7 +35,7 @@ function calculateOptimalPartSize(fileSize: number): { partSize: number; numPart
   return { partSize, numParts };
 }
 
-export const uploadRoutes = new Elysia({ prefix: '/api' })
+export const uploadRoutes = new Elysia()
   // Get upload URL(s)
   .post('/upload/url', async ({ body, request }) => {
     const { fileSize, encrypted, timeLimit, dlimit } = body;

@@ -52,7 +52,7 @@ const app = new Elysia()
   }))
 
   // Health check endpoints (Docker/K8s compatible)
-  .get('/api/health', async ({ set }) => {
+  .get('/health', async ({ set }) => {
     const health = await storage.ping();
     const isHealthy = health.redis && health.s3;
     if (!isHealthy) {
@@ -68,12 +68,12 @@ const app = new Elysia()
     };
   })
 
-  .get('/api/health/live', () => ({
+  .get('/health/live', () => ({
     status: 'alive',
     timestamp: new Date().toISOString(),
   }))
 
-  .get('/api/health/ready', async ({ set }) => {
+  .get('/health/ready', async ({ set }) => {
     const health = await storage.ping();
     const isReady = health.redis && health.s3;
     if (!isReady) {

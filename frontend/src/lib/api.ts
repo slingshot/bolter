@@ -5,6 +5,9 @@
 
 import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
 
+// API base URL - defaults to localhost for development
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+
 // Retry configuration
 const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
@@ -90,7 +93,7 @@ export class Canceller {
  * Get API configuration
  */
 export async function getConfig() {
-  const response = await fetch('/config');
+  const response = await fetch(`${API_BASE_URL}/config`);
   if (!response.ok) throw new Error('Failed to fetch config');
   return response.json();
 }
@@ -99,7 +102,7 @@ export async function getConfig() {
  * Check if file exists
  */
 export async function fileExists(id: string): Promise<boolean> {
-  const response = await fetch(`/api/exists/${id}`);
+  const response = await fetch(`${API_BASE_URL}/exists/${id}`);
   if (!response.ok) return false;
   const data = await response.json();
   return data.exists;
@@ -115,7 +118,7 @@ export async function getMetadata(id: string, keychain?: Keychain) {
     headers['Authorization'] = await keychain.authHeader();
   }
 
-  const response = await fetch(`/api/metadata/${id}`, { headers });
+  const response = await fetch(`${API_BASE_URL}/metadata/${id}`, { headers });
 
   const authHeader = response.headers.get('WWW-Authenticate');
   if (authHeader && keychain) {
@@ -190,7 +193,7 @@ export async function getMetadata(id: string, keychain?: Keychain) {
  * Delete a file
  */
 export async function deleteFile(id: string, ownerToken: string): Promise<boolean> {
-  const response = await fetch(`/api/delete/${id}`, {
+  const response = await fetch(`${API_BASE_URL}/delete/${id}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ owner_token: ownerToken }),
@@ -229,7 +232,7 @@ export async function uploadFiles(
   const stream = createFileStream(files, keychain, encrypted);
 
   // Request upload URLs
-  const uploadResponse = await fetch('/api/upload/url', {
+  const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -310,7 +313,7 @@ export async function uploadFiles(
     ? arrayToB64(await keychain.encryptMetadata(metadata))
     : btoa(unescape(encodeURIComponent(JSON.stringify(metadata))));
 
-  const completeResponse = await fetchWithRetry('/api/upload/complete', {
+  const completeResponse = await fetchWithRetry(`${API_BASE_URL}/upload/complete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -662,7 +665,7 @@ function isRetryableError(error: Error): boolean {
  */
 async function abortMultipartUpload(id: string, uploadId: string): Promise<void> {
   try {
-    await fetch(`/api/upload/abort/${id}`, {
+    await fetch(`${API_BASE_URL}/upload/abort/${id}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ uploadId }),
@@ -714,7 +717,7 @@ export async function downloadFile(
     headers['Authorization'] = await keychain.authHeader();
   }
 
-  const urlResponse = await fetch(`/api/download/url/${id}`, { headers });
+  const urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
 
   if (keychain) {
     const authHeader = urlResponse.headers.get('WWW-Authenticate');
@@ -731,7 +734,7 @@ export async function downloadFile(
   const urlData = await urlResponse.json();
 
   // Download from signed URL or stream
-  const downloadUrl = urlData.useSignedUrl ? urlData.url : `/api/download/${id}`;
+  const downloadUrl = urlData.useSignedUrl ? urlData.url : `${API_BASE_URL}/download/${id}`;
   const downloadHeaders: Record<string, string> = {};
 
   if (!urlData.useSignedUrl && keychain) {
@@ -791,7 +794,7 @@ export async function downloadFile(
   }
 
   // Report download complete
-  await fetch(`/api/download/complete/${id}`, {
+  await fetch(`${API_BASE_URL}/download/complete/${id}`, {
     method: 'POST',
     headers: keychain ? { Authorization: await keychain.authHeader() } : {},
   }).catch(console.warn);

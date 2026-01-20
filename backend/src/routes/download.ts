@@ -3,7 +3,7 @@ import { storage } from '../storage';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
 import { downloadLogger as logger } from '../logger';
 
-export const downloadRoutes = new Elysia({ prefix: '/api' })
+export const downloadRoutes = new Elysia()
   // Get download URL (with optional pre-signed URL for direct download)
   .get('/download/url/:id', async ({ params, headers, set }) => {
     const { id } = params;
