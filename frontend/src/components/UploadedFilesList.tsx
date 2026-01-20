@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { File, Link2, Download, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { formatBytes, formatTimeLimit } from '@/lib/utils';
+import { formatBytes, formatTimeLimit, formatDownloadLimit } from '@/lib/utils';
 import { useAppStore, type UploadedFile } from '@/stores/app';
 import { ShareDialog } from './ShareDialog';
 
@@ -57,7 +57,7 @@ export function UploadedFilesList() {
                         {file.name}
                       </p>
                       <p className="text-paragraph-xxs text-content-secondary">
-                        {formatBytes(file.size)} | Expires after {file.downloadLimit} downloads or {formatTimeLimit(timeUntilExpiry)}
+                        {formatBytes(file.size)} | Expires after {formatDownloadLimit(file.downloadLimit)} or {formatTimeLimit(timeUntilExpiry)}
                       </p>
                     </div>
 

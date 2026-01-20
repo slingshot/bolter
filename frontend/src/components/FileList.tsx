@@ -30,57 +30,53 @@ export function FileList() {
   const totalSize = files.reduce((sum, f) => sum + f.file.size, 0);
 
   return (
-    <div className="flex flex-col gap-2">
-      {files.map((item, index) => {
+    <div className="flex flex-col divide-y-[0.5px] divide-border-medium">
+      {files.map((item) => {
         const Icon = getFileIcon(item.file.type);
 
         return (
-          <div key={item.id}>
-            <div
-              className={cn(
-                'flex items-center gap-[10px] py-2',
-                item.status === 'error' && 'opacity-50'
-              )}
-            >
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-overlay-medium">
-                <Icon className="h-4 w-4 text-content-secondary" />
-              </div>
-
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-paragraph-xs text-content-primary font-medium leading-[1.5]">
-                  {item.file.name}
-                </p>
-                <p className="text-paragraph-xxs text-content-tertiary leading-[1.5]">
-                  {formatBytes(item.file.size)}
-                </p>
-              </div>
-
-              {item.status === 'uploading' && (
-                <div className="h-1 w-16 overflow-hidden rounded-full bg-overlay-medium">
-                  <div
-                    className="h-full bg-content-primary transition-all"
-                    style={{ width: `${item.progress}%` }}
-                  />
-                </div>
-              )}
-
-              {item.status === 'error' && (
-                <span className="text-paragraph-xxs text-red-600">{item.error}</span>
-              )}
-
-              {!isUploading && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-[18px] w-[18px] shrink-0 p-0"
-                  onClick={() => removeFile(item.id)}
-                >
-                  <X className="h-[18px] w-[18px] text-content-primary" />
-                </Button>
-              )}
+          <div
+            key={item.id}
+            className={cn(
+              'flex items-center gap-[10px] py-2',
+              item.status === 'error' && 'opacity-50'
+            )}
+          >
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-overlay-medium">
+              <Icon className="h-4 w-4 text-content-secondary" />
             </div>
-            {index < files.length - 1 && (
-              <div className="h-[0.5px] bg-border-medium" />
+
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-paragraph-xs text-content-primary font-medium leading-[1.5]">
+                {item.file.name}
+              </p>
+              <p className="text-paragraph-xxs text-content-tertiary">
+                {formatBytes(item.file.size)}
+              </p>
+            </div>
+
+            {item.status === 'uploading' && (
+              <div className="h-1 w-16 overflow-hidden rounded-full bg-overlay-medium">
+                <div
+                  className="h-full bg-content-primary transition-all"
+                  style={{ width: `${item.progress}%` }}
+                />
+              </div>
+            )}
+
+            {item.status === 'error' && (
+              <span className="text-paragraph-xxs text-red-600">{item.error}</span>
+            )}
+
+            {!isUploading && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-[18px] w-[18px] shrink-0 p-0"
+                onClick={() => removeFile(item.id)}
+              >
+                <X className="h-[18px] w-[18px] text-content-primary" />
+              </Button>
             )}
           </div>
         );

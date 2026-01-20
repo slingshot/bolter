@@ -155,7 +155,10 @@ export function HomePage() {
                       onClick={() => setFilesExpanded(!filesExpanded)}
                     >
                       <p className="text-paragraph-sm text-content-primary font-medium">
-                        {files.length} file{files.length !== 1 ? 's' : ''} · {formatBytes(totalSize)} / {config?.maxFileSize ? formatBytes(config.maxFileSize) : '1TB'}
+                        {files.length} file{files.length !== 1 ? 's' : ''}
+                        {' '}
+                        <span className="font-normal">· {formatBytes(totalSize)} / {config?.maxFileSize ? formatBytes(config.maxFileSize) : '1TB'}
+                        </span>
                       </p>
                       {filesExpanded ? (
                         <ChevronUp className="h-[18px] w-[18px] text-content-primary" />

@@ -33,10 +33,17 @@ export function formatDuration(seconds: number): string {
  * Format time limit for display
  */
 export function formatTimeLimit(seconds: number): string {
-  if (seconds < 60) return `${seconds} seconds`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)} minutes`;
-  if (seconds < 86400) return `${Math.round(seconds / 3600)} hours`;
-  return `${Math.round(seconds / 86400)} days`;
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  if (seconds < 3600) {
+    const mins = Math.round(seconds / 60);
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  if (seconds < 86400) {
+    const hrs = Math.round(seconds / 3600);
+    return `${hrs} hour${hrs === 1 ? '' : 's'}`;
+  }
+  const days = Math.round(seconds / 86400);
+  return `${days} day${days === 1 ? '' : 's'}`;
 }
 
 /**
