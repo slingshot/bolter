@@ -24,21 +24,21 @@ export function Footer() {
         {/* Footer Links */}
         <div className="w-full flex items-center justify-between text-paragraph-xxs text-content-secondary font-medium">
           <div className="flex items-center gap-5">
-            <a href="/terms" className="hover:text-content-primary transition-colors">
+            <a target="_blank" href="https://legal.slingshot.fm/send-terms-2507b" className="hover:text-content-primary transition-colors" rel="noreferrer noopener">
               Terms
             </a>
-            <a href="/privacy" className="hover:text-content-primary transition-colors">
+            <a target="_blank" href="https://legal.slingshot.fm/send-privacy-2507a" className="hover:text-content-primary transition-colors" rel="noreferrer noopener">
               Privacy
             </a>
           </div>
           <div className="flex items-center gap-5">
-            <a href="/cli" className="hover:text-content-primary transition-colors">
-              CLI
+            <a href="mailto:help@slingshot.fm" className="hover:text-content-primary transition-colors">
+              Help
             </a>
-            <a href="/dmca" className="hover:text-content-primary transition-colors">
+            <a href="mailto:legal+dmca@slingshot.fm" className="hover:text-content-primary transition-colors">
               DMCA
             </a>
-            <a href="/source" className="hover:text-content-primary transition-colors">
+            <a target="_blank" href="https://github.com/slingshot/bolter" className="hover:text-content-primary transition-colors" rel="noreferrer noopener">
               Source
             </a>
           </div>
