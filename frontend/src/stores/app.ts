@@ -105,7 +105,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearFiles: () => set({ files: [] }),
 
   // Settings
-  encrypted: true,
+  encrypted: false,
   setEncrypted: (encrypted) => set({ encrypted }),
   timeLimit: 86400, // 1 day
   setTimeLimit: (timeLimit) => set({ timeLimit }),

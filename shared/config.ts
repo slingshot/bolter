@@ -20,9 +20,10 @@ export const UPLOAD_LIMITS = {
 
 // Time limits in seconds
 export const TIME_LIMITS = {
-  MAX_EXPIRE_SECONDS: 86400 * 7, // 7 days
+  MAX_EXPIRE_SECONDS: 86400 * 180, // 6 months
   DEFAULT_EXPIRE_SECONDS: 86400, // 1 day
-  EXPIRE_TIMES: [300, 3600, 86400, 604800], // 5min, 1hr, 1day, 7days
+  EXPIRE_TIMES: [300, 3600, 86400, 604800, 1209600, 2592000, 7776000, 15552000],
+  // 5min, 1hr, 1day, 7days, 14days, 30days, 3months, 6months
 } as const;
 
 // Download limits

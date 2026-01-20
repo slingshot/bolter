@@ -42,8 +42,12 @@ export function formatTimeLimit(seconds: number): string {
     const hrs = Math.round(seconds / 3600);
     return `${hrs} hour${hrs === 1 ? '' : 's'}`;
   }
-  const days = Math.round(seconds / 86400);
-  return `${days} day${days === 1 ? '' : 's'}`;
+  if (seconds < 86400 * 30) {
+    const days = Math.round(seconds / 86400);
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+  const months = Math.round(seconds / (86400 * 30));
+  return `${months} month${months === 1 ? '' : 's'}`;
 }
 
 /**
