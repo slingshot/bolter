@@ -5,7 +5,7 @@ export function Footer() {
     <footer className="w-full pb-6">
       <div className="max-w-container mx-auto px-6 flex flex-col gap-6 items-center">
         {/* Powered by Section */}
-        <div className="flex flex-col items-center gap-5">
+        <a target="_blank" href="https://slingshot.fm/?utm_source=bolter&utm_medium=internal&utm_campaign=powered-by" className="flex flex-col items-center gap-5">
           <div className="flex flex-col items-center gap-1">
             <p className="text-paragraph-xxs text-content-tertiary">Powered by</p>
             <div className="h-4 w-[84.628px]">
@@ -16,7 +16,7 @@ export function Footer() {
           <p className="text-paragraph-xxs text-content-secondary text-center">
             Modern business management for artists & creatives
           </p>
-        </div>
+        </a>
 
         {/* Divider */}
         <div className="w-full h-[0.5px] bg-content-primary opacity-20" />
