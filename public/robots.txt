@@ -1,6 +1,0 @@
-User-agent: *
-Allow: /
-Disallow: /api/
-Disallow: /download/
-
-Sitemap: https://send.fm/sitemap.xml

@@ -1,172 +1,131 @@
-# [![Send](./assets/icon-64x64.png)](https://gitlab.com/timvisee/send/) Send
+# Bolter - Encrypted File Sharing
 
-[![Build status on GitLab CI][gitlab-ci-master-badge]][gitlab-ci-link]
-[![Latest release][release-badge]][release-link]
-[![Docker image][docker-image-badge]][docker-image-link]
-[![Project license][repo-license-badge]](LICENSE)
+A modern, end-to-end encrypted file sharing application built with Bun.
 
-[docker-image-badge]: https://img.shields.io/badge/docker-latest-blue.svg
-[docker-image-link]: https://gitlab.com/timvisee/send/container_registry/eyJuYW1lIjoidGltdmlzZWUvc2VuZCIsInRhZ3NfcGF0aCI6Ii90aW12aXNlZS9zZW5kL3JlZ2lzdHJ5L3JlcG9zaXRvcnkvMTQxODUwNC90YWdzP2Zvcm1hdD1qc29uIiwiaWQiOjE0MTg1MDQsImNsZWFudXBfcG9saWN5X3N0YXJ0ZWRfYXQiOm51bGx9
-[gitlab-ci-link]: https://gitlab.com/timvisee/send/pipelines
-[gitlab-ci-master-badge]: https://gitlab.com/timvisee/send/badges/master/pipeline.svg
-[release-badge]: https://img.shields.io/github/v/tag/timvisee/send
-[release-link]: https://gitlab.com/timvisee/send/-/tags
-[repo-license-badge]: https://img.shields.io/github/license/timvisee/send.svg
+## Stack
 
-A fork of Mozilla's [Firefox Send][mozilla-send].
-Mozilla discontinued Send, this fork is a community effort to keep the project
-up-to-date and alive.
+- **Frontend**: Vite + React + TypeScript + Tailwind CSS (Figma-based design system)
+- **Backend**: Elysia (Bun) + S3/R2 + Redis
+- **Encryption**: AES-GCM with HKDF key derivation (client-side)
+- **Design**: Custom dark theme with Slingshot branding
 
-- Forked [at][fork-commit] Mozilla's last publicly hosted version
-- _Mozilla_ & _Firefox_ branding [is][remove-branding-pr] removed so you can legally self-host
-- Kept compatible with [`ffsend`][ffsend] (CLI for Send)
-- Dependencies have been updated
-- Mozilla's [changes][mozilla-patches] since the fork have been selectively [merged][mozilla-patches-pr]
-- Mozilla's experimental report feature, download tokens, trust warnings and FxA changes are not included
+## Quick Start
 
-Find an up-to-date Docker image here: [docs/docker.md](docs/docker.md)
+```bash
+# Install dependencies for all workspaces
+cd new-app
+bun install
 
-The original project by Mozilla can be found [here][mozilla-send].
-The [`mozilla-master`][branch-mozilla-master] branch holds the `master` branch
-as left by Mozilla.
-The [`send-v3`][branch-send-v3] branch holds the commit tree of Mozilla's last
-publicly hosted version, which this fork is based on.
-The [`send-v4`][branch-send-v4] branch holds the commit tree of Mozilla's last
-experimental version which was still a work in progress (featuring file
-reporting, download tokens, trust warnings and FxA changes), this has
-selectively been merged into this fork.
-Please consider to [donate][donate] to allow me to keep working on this.
+# Run both frontend and backend in development
+bun run dev
 
-Thanks [Mozilla][mozilla] for building this amazing tool!
-
-[branch-mozilla-master]: https://gitlab.com/timvisee/send/-/tree/mozilla-master
-[branch-send-v3]: https://gitlab.com/timvisee/send/-/tree/send-v3
-[branch-send-v4]: https://gitlab.com/timvisee/send/-/tree/send-v4
-[donate]: https://timvisee.com/donate
-[ffsend]: https://github.com/timvisee/ffsend
-[fork-commit]: https://gitlab.com/timvisee/send/-/commit/3e9be676413a6e1baaf6a354c180e91899d10bec
-[mozilla-patches-pr]: https://gitlab.com/timvisee/send/-/merge_requests/3
-[mozilla-patches]: https://gitlab.com/timvisee/send/-/compare/3e9be676413a6e1baaf6a354c180e91899d10bec...mozilla-master
-[mozilla-send]: https://github.com/mozilla/send
-[mozilla]: https://mozilla.org/
-[remove-branding-pr]: https://gitlab.com/timvisee/send/-/merge_requests/2
-
----
-
-**Docs:** [FAQ](docs/faq.md), [Encryption](docs/encryption.md), [Build](docs/build.md), [Docker](docs/docker.md), [More](docs/)
-
----
-
-## Table of Contents
-
-* [What it does](#what-it-does)
-* [Requirements](#requirements)
-* [Development](#development)
-* [Commands](#commands)
-* [Configuration](#configuration)
-* [Localization](#localization)
-* [Contributing](#contributing)
-* [Instances](#instances)
-* [Deployment](#deployment)
-* [Clients](#clients)
-* [License](#license)
-
----
-
-## What it does
-
-A file sharing experiment which allows you to send encrypted files to other users.
-
----
-
-## Requirements
-
-- [Node.js 16.x](https://nodejs.org/)
-- [Redis server](https://redis.io/) (optional for development)
-- [AWS S3](https://aws.amazon.com/s3/) or compatible service (optional)
-
----
-
-## Development
-
-To start an ephemeral development server, run:
-
-```sh
-npm install
-npm start
+# Or run them separately:
+bun run dev:frontend  # Frontend on http://localhost:3000
+bun run dev:backend   # Backend on http://localhost:3001
 ```
 
-Then, browse to http://localhost:8080
+## Project Structure
 
----
+```
+new-app/
+├── frontend/          # Vite + React frontend
+│   ├── src/
+│   │   ├── components/   # UI components (shadcn-style)
+│   │   ├── lib/          # Crypto, API utilities
+│   │   ├── pages/        # Route pages
+│   │   └── stores/       # Zustand state
+│   └── package.json
+├── backend/           # Elysia backend
+│   ├── src/
+│   │   ├── routes/       # API endpoints
+│   │   ├── storage/      # S3 + Redis adapters
+│   │   └── middleware/   # Auth, etc
+│   └── package.json
+├── shared/            # Shared configuration constants
+│   └── config.ts         # BYTES, UPLOAD_LIMITS, TIME_LIMITS, etc.
+└── package.json       # Workspace root
+```
 
-## Commands
+## Environment Variables
 
-| Command          | Description |
-|------------------|-------------|
-| `npm run format` | Formats the frontend and server code using **prettier**.
-| `npm run lint`   | Lints the CSS and JavaScript code.
-| `npm test`       | Runs the suite of mocha tests.
-| `npm start`      | Runs the server in development configuration.
-| `npm run build`  | Builds the production assets.
-| `npm run prod`   | Runs the server in production configuration.
+Create a `.env.local` file in the `new-app` directory:
 
----
+```bash
+# S3/R2 Storage (required)
+S3_BUCKET=your-bucket
+S3_ENDPOINT=https://your-r2-endpoint.r2.cloudflarestorage.com
+AWS_ACCESS_KEY_ID=xxx
+AWS_SECRET_ACCESS_KEY=xxx
 
-## Configuration
+# Redis (required) - Use full connection string
+REDIS_URL=redis://localhost:6379
+# For Redis with auth: redis://username:password@host:port
+# For TLS: rediss://username:password@host:port
 
-The server is configured with environment variables. See [server/config.js](server/config.js) for all options and [docs/docker.md](docs/docker.md) for examples.
+# Server
+PORT=3001
+BASE_URL=http://localhost:3001
+DETECT_BASE_URL=false  # Set to 'true' to auto-detect from request headers
 
----
+# Upload Limits
+MAX_FILE_SIZE=1099511627776      # Max file size in bytes (default: 1TB)
+MAX_FILES_PER_ARCHIVE=64         # Max files per archive (default: 64)
 
-## Localization
+# Time Limits
+MAX_EXPIRE_SECONDS=604800        # Max expiration time in seconds (default: 7 days)
+DEFAULT_EXPIRE_SECONDS=86400     # Default expiration in seconds (default: 1 day)
+EXPIRE_TIMES_SECONDS=300,3600,86400,604800  # Comma-separated expire time options
 
-See: [docs/localization.md](docs/localization.md)
+# Download Limits
+MAX_DOWNLOADS=100                # Maximum download count option (default: 100)
+DEFAULT_DOWNLOADS=1              # Default download limit (default: 1)
+DOWNLOAD_COUNTS=1,2,3,4,5,20,50,100  # Comma-separated download count options
 
----
+# UI Customization (backend - runtime)
+CUSTOM_TITLE=Slingshot Send      # App title shown in header and page title
+CUSTOM_DESCRIPTION=Encrypt and send files with a link that automatically expires.
 
-## Contributing
+# UI Customization (frontend - build time)
+VITE_APP_TITLE=Slingshot Send    # HTML title tag (set at build time)
+VITE_APP_DESCRIPTION=Encrypt and send files with a link that automatically expires.
+```
 
-Pull requests are always welcome! Feel free to check out the list of "good first issues" (to be implemented).
+> **Note**: The dev commands automatically load `.env` and `.env.local` files via `@dotenvx/dotenvx`. Values in `.env.local` override those in `.env`.
 
----
+### Build-time vs Runtime Configuration
 
-## Instances
+- **Build-time** (`VITE_APP_*`): Used for HTML `<title>` and `<meta>` tags. Set these before running `bun run build`.
+- **Runtime** (`CUSTOM_*`): Served by the backend via `/config` endpoint. The frontend updates the page title/description after loading config, overriding build-time values.
 
-Find a list of public instances here: https://github.com/timvisee/send-instances/
+### Environment Variable Reference
 
----
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_BUCKET` | (required) | S3/R2 bucket name |
+| `S3_ENDPOINT` | (required) | S3/R2 endpoint URL |
+| `AWS_ACCESS_KEY_ID` | (required) | S3/R2 access key |
+| `AWS_SECRET_ACCESS_KEY` | (required) | S3/R2 secret key |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+| `PORT` | `3001` | Backend server port |
+| `BASE_URL` | `http://localhost:3001` | Public base URL |
+| `DETECT_BASE_URL` | `false` | Auto-detect base URL from requests |
+| `MAX_FILE_SIZE` | `1099511627776` (1TB) | Maximum upload size in bytes |
+| `MAX_FILES_PER_ARCHIVE` | `64` | Max files per upload |
+| `MAX_EXPIRE_SECONDS` | `604800` (7 days) | Maximum expiration time |
+| `DEFAULT_EXPIRE_SECONDS` | `86400` (1 day) | Default expiration time |
+| `EXPIRE_TIMES_SECONDS` | `300,3600,86400,604800` | Dropdown options for expiration |
+| `MAX_DOWNLOADS` | `100` | Maximum download limit |
+| `DEFAULT_DOWNLOADS` | `1` | Default download limit |
+| `DOWNLOAD_COUNTS` | `1,2,3,4,5,20,50,100` | Dropdown options for downloads |
+| `CUSTOM_TITLE` | `Slingshot Send` | App title for branding (runtime) |
+| `CUSTOM_DESCRIPTION` | (see above) | App description for SEO (runtime) |
+| `VITE_APP_TITLE` | `Slingshot Send` | HTML title tag (build-time) |
+| `VITE_APP_DESCRIPTION` | (see above) | HTML meta description (build-time) |
 
-## Deployment
+## Features
 
-See: [docs/deployment.md](docs/deployment.md)
-
-Docker quickstart: [docs/docker.md](docs/docker.md)
-
-AWS example using Ubuntu Server `20.04`: [docs/AWS.md](docs/AWS.md)
-
----
-
-## Clients
-
-- Web: _this repository_
-- Command-line: [`ffsend`](https://github.com/timvisee/ffsend)
-- Android: _see [Android](#android) section_
-- Thunderbird: [FileLink provider for Send](https://addons.thunderbird.net/thunderbird/addon/filelink-provider-for-send/)
-
-#### Android
-
-The android implementation is contained in the `android` directory,
-and can be viewed locally for easy testing and editing by running `ANDROID=1 npm
-start` and then visiting <http://localhost:8080>. CSS and image files are
-located in the `android/app/src/main/assets` directory.
-
----
-
-## License
-
-[Mozilla Public License Version 2.0](LICENSE)
-
-[qrcode.js](https://github.com/kazuhikoarase/qrcode-generator) licensed under MIT
-
----
+- **Direct-to-cloud uploads**: Files upload directly to S3/R2 via pre-signed URLs
+- **Multipart support**: Large files (>100MB) use multipart uploads with resume
+- **End-to-end encryption**: Files encrypted in browser before upload
+- **Automatic expiration**: Files auto-delete after time or download limit
+- **No account required**: Share links contain the encryption key

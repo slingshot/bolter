@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="c5946727-91af-4ca4-b3cc-9e8ab8c0da0d" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/../.editorconfig" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/package.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/config.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/index.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/logger.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/middleware/auth.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/routes/download.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/routes/upload.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/storage/index.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/storage/redis.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/src/storage/s3.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/bun.lock" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/bunfig.toml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/index.html" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/package.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/postcss.config.js" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/bolt.svg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/favicon.ico" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/glow.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/gradient-bg.jpg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Black-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Black-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-BlackItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-BlackItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Bold-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Bold-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-BoldItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-BoldItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Extralight-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Extralight-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-ExtralightItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-ExtralightItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Light-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Light-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-LightItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-LightItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Medium-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Medium-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-MediumItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-MediumItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Regular-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Regular-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-RegularItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-RegularItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Semibold-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Semibold-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-SemiboldItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-SemiboldItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Super-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Super-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-SuperItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-SuperItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Thin-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-Thin-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-ThinItalic-Web.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/Graphik-ThinItalic-Web.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/graphik/graphik.css" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/README.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/android-chrome-192x192.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/android-chrome-512x512.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/apple-touch-icon-precomposed.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/apple-touch-icon.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/browserconfig.xml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/favicon-16x16.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/favicon-32x32.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/favicon.ico" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/html_code.html" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/mstile-144x144.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/mstile-150x150.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/mstile-310x150.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/mstile-310x310.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/mstile-70x70.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/safari-pinned-tab.svg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/icons/site.webmanifest" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/public/logo-white.svg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/App.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/DropZone.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/FileList.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/Footer.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/Header.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ShareDialog.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/Toaster.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/UploadProgress.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/UploadSettings.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/UploadedFilesList.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/button.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/card.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/progress.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/select.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/toast.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/components/ui/toggle.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/index.css" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/lib/api.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/lib/crypto.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/lib/utils.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/main.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/pages/Download.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/pages/Home.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/stores/app.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/tailwind.config.js" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/tsconfig.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/tsconfig.node.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/vite.config.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/package.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/shared/config.ts" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/shared/package.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../package-lock.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../package.json" beforeDir="false" afterPath="$PROJECT_DIR$/../package.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Black.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Black.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-BlackItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-BlackItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Bold.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Bold.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-BoldItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-BoldItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraBold.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraBold.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraBoldItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraBoldItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraLight.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraLight.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraLightItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ExtraLightItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Italic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Italic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Light.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Light.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-LightItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-LightItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Medium.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Medium.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-MediumItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-MediumItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Regular.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Regular.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-SemiBold.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-SemiBold.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-SemiBoldItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-SemiBoldItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Thin.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-Thin.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ThinItalic.woff" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-ThinItalic.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-italic.var.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter-upright.var.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/Inter.var.woff2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/browserconfig.xml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/contribute.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/favicon.ico" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/inter.css" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/an/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ar/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ast/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/az/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/azz/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/be/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/bn/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/br/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/bs/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ca/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/cak/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ckb/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/cs/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/cy/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/da/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/de/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/dsb/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/el/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/en-CA/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/en-GB/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/en-US/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/es-AR/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/es-CL/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/es-ES/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/es-MX/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/et/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/eu/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/fa/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/fi/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/fr/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/fy-NL/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/gn/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/gor/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/he/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/hr/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/hsb/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/hu/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/hus/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/hy-AM/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ia/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/id/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ig/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/it/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ixl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ja/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ka/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/kab/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ko/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/lt/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/lus/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/meh/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/mix/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ml/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ms/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/nb-NO/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/nl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/nn-NO/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/oc/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/pa-IN/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/pai/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/pl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ppl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/pt-BR/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/pt-PT/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/quc/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ro/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/ru/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sk/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sn/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sq/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sr/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/su/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/sv-SE/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/te/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/th/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/tl/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/tr/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/trs/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/uk/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/vi/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/yo/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/yua/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/zgh/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/zh-CN/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/locales/zh-TW/send.ftl" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/logo.svg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/mstile-144x144.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/mstile-150x150.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/mstile-310x150.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/mstile-310x310.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/mstile-70x70.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../public/robots.txt" beforeDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="EmbeddingIndexingInfo">
+    <option name="cachedIndexableFilesCount" value="47" />
+    <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$/.." />
+  </component>
+  <component name="McpProjectServerCommands">
+    <commands />
+    <urls />
+  </component>
+  <component name="ProjectColorInfo"><![CDATA[{
+  "associatedIndex": 3
+}]]></component>
+  <component name="ProjectId" id="38UrUJ39HcsNKx9gfB0kNOKyw7L" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.MCP Project settings loaded": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "git-widget-placeholder": "claude/rebuild-vite-elysia-frontend-Sgw8v",
+    "javascript.preferred.runtime.type.id": "bun",
+    "last_opened_file_path": "/Users/sanil/Projects/Slingshot/bolter/new-app/frontend/public",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "bun",
+    "settings.editor.selected.configurable": "settings.sync",
+    "ts.external.directory.path": "/Users/sanil/Projects/Slingshot/bolter/new-app/frontend/node_modules/typescript/lib"
+  }
+}]]></component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/frontend/public" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/frontend/public" />
+    </key>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-js-predefined-d6986cc7102b-9b0f141eb926-JavaScript-WS-253.29346.242" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="c5946727-91af-4ca4-b3cc-9e8ab8c0da0d" name="Changes" comment="" />
+      <created>1768865008517</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1768865008517</updated>
+      <workItem from="1768865009709" duration="11126000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+</project>

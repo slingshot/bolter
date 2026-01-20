@@ -1,8 +1,0 @@
-.circleci
-.nyc_output
-.vscode
-.DS_Store
-coverage
-docs
-firefox
-node_modules
