@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
+import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Keychain } from '@/lib/crypto';
 import { getMetadata, downloadFile, fileExists } from '@/lib/api';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
@@ -284,19 +285,7 @@ export function DownloadPage() {
 
                 {/* Individual files list */}
                 <div className="bg-overlay-subtle border border-border-medium rounded-element p-2 max-h-[200px] overflow-y-auto">
-                  <div className="space-y-1">
-                    {metadata.files.map((file, index) => (
-                      <div key={index} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-overlay-medium">
-                        <FileIcon className="h-4 w-4 text-content-secondary shrink-0" />
-                        <span className="truncate text-paragraph-xs text-content-primary flex-1">
-                          {file.name}
-                        </span>
-                        <span className="text-paragraph-xs text-content-tertiary shrink-0">
-                          {formatBytes(file.size)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                  <DownloadFileTree files={metadata.files} />
                 </div>
               </div>
             ) : (
