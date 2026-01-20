@@ -32,7 +32,7 @@ const app = new Elysia()
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    exposedHeaders: ['WWW-Authenticate'],
+    exposeHeaders: ['WWW-Authenticate'],
   }))
 
   // Health check endpoints

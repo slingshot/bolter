@@ -56,8 +56,11 @@ export async function verifyAuth(
       .update(nonceBuffer)
       .digest('base64');
 
+    // Convert URL-safe base64 to standard base64
+    const standardSig = providedSig.replace(/-/g, '+').replace(/_/g, '/');
+
     // Timing-safe comparison
-    const providedBuffer = Buffer.from(providedSig, 'base64');
+    const providedBuffer = Buffer.from(standardSig, 'base64');
     const expectedBuffer = Buffer.from(expectedSig, 'base64');
 
     if (providedBuffer.length !== expectedBuffer.length) {
