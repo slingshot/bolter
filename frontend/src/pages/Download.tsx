@@ -40,6 +40,7 @@ export function DownloadPage() {
   const [error, setError] = useState<string | null>(null);
   const [keychain, setKeychain] = useState<Keychain | null>(null);
   const [canDownloadAgain, setCanDownloadAgain] = useState(true);
+  const [downloadsLeft, setDownloadsLeft] = useState<number | null>(null);
   const loadingRef = useRef(false);
 
   // Extract secret key from URL hash
@@ -75,6 +76,11 @@ export function DownloadPage() {
         if (status && status.dl >= status.dlimit) {
           setState('not-found');
           return;
+        }
+
+        // Store downloads left for display
+        if (status) {
+          setDownloadsLeft(status.dlimit - status.dl);
         }
 
         // Create keychain if we have a secret key
@@ -123,6 +129,9 @@ export function DownloadPage() {
         const status = await getDownloadStatus(id);
         const hasMoreDownloads = status ? status.dl < status.dlimit : false;
         setCanDownloadAgain(hasMoreDownloads);
+        if (status) {
+          setDownloadsLeft(status.dlimit - status.dl);
+        }
         setState('complete');
       }, 1500);
       return;
@@ -148,6 +157,9 @@ export function DownloadPage() {
       const status = await getDownloadStatus(id);
       const hasMoreDownloads = status ? status.dl < status.dlimit : false;
       setCanDownloadAgain(hasMoreDownloads);
+      if (status) {
+        setDownloadsLeft(status.dlimit - status.dl);
+      }
       setState('complete');
     } catch (e: any) {
       console.error('Download failed:', e);
@@ -373,9 +385,12 @@ export function DownloadPage() {
               </Button>
             )}
 
-            {/* Expiration Notice */}
+            {/* Download limit and expiration notice */}
             <p className="text-paragraph-xs text-content-tertiary text-center">
-              Expires after {metadata?.ttl ? formatTimeLimit(metadata.ttl) : '7 days'}.
+              {downloadsLeft !== null && (
+                <>{downloadsLeft} download{downloadsLeft !== 1 ? 's' : ''} left · </>
+              )}
+              Expires in {metadata?.ttl ? formatTimeLimit(metadata.ttl) : '7 days'}
             </p>
           </div>
         </div>

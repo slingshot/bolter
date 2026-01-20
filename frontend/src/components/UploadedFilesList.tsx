@@ -90,7 +90,7 @@ export function UploadedFilesList() {
                         {file.name}
                       </p>
                       <p className="text-paragraph-xxs text-content-secondary">
-                        {formatBytes(file.size)} | {file.downloadCount}/{file.downloadLimit} downloads | Expires in {formatTimeLimit(timeUntilExpiry)}
+                        {formatBytes(file.size)} | {file.downloadLimit - file.downloadCount} download{file.downloadLimit - file.downloadCount !== 1 ? 's' : ''} left | Expires in {formatTimeLimit(timeUntilExpiry)}
                       </p>
                     </div>
 
