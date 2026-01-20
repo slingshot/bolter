@@ -97,7 +97,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   files: [],
   addFiles: (newFiles) => {
     const items: FileItem[] = newFiles.map((file) => ({
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       file,
       status: 'pending',
       progress: 0,
@@ -167,7 +167,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Toasts
   toasts: [],
   addToast: (toast) => {
-    const id = crypto.randomUUID();
+    const id = generateUUID();
     set((state) => ({ toasts: [...state.toasts, { ...toast, id }] }));
     setTimeout(() => get().removeToast(id), 5000);
   },
@@ -208,6 +208,17 @@ function applyTheme(theme: 'light' | 'dark' | 'system') {
   } else {
     root.classList.remove('dark');
   }
+}
+
+// Generate UUID with fallback for older browsers (iOS Safari < 15.4)
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback using crypto.getRandomValues()
+  return '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (c) =>
+    (+c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (+c / 4)))).toString(16)
+  );
 }
 
 // Initialize theme
