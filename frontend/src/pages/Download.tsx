@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   Download,
@@ -15,6 +15,7 @@ import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Keychain } from '@/lib/crypto';
 import { getMetadata, downloadFile, fileExists, checkLegacyFile, getDownloadStatus, API_BASE_URL } from '@/lib/api';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
+import { useDocumentMeta } from '@/hooks/useDocumentMeta';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
 
@@ -42,6 +43,29 @@ export function DownloadPage() {
   const [canDownloadAgain, setCanDownloadAgain] = useState(true);
   const [downloadsLeft, setDownloadsLeft] = useState<number | null>(null);
   const loadingRef = useRef(false);
+
+  // Compute document meta based on state and metadata
+  const documentMeta = useMemo(() => {
+    if (state === 'not-found') {
+      return { title: 'File Not Found', description: 'This file may have expired or been deleted.' };
+    }
+    if (state === 'error') {
+      return { title: 'Download Error', description: 'An error occurred while downloading the file.' };
+    }
+    if (metadata) {
+      const isMultiFile = metadata.files && metadata.files.length > 1;
+      const fileName = isMultiFile ? `${metadata.files!.length} files` : metadata.name;
+      const fileSize = formatBytes(isMultiFile ? metadata.files!.reduce((sum, f) => sum + f.size, 0) : metadata.size);
+      return {
+        title: `Download ${fileName}`,
+        description: `${fileName} (${fileSize}) - Securely shared via Slingshot Send`,
+      };
+    }
+    return { title: 'Download', description: 'Downloading secure file' };
+  }, [state, metadata]);
+
+  // Update document title and meta description
+  useDocumentMeta(documentMeta);
 
   // Extract secret key from URL hash
   useEffect(() => {

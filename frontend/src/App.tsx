@@ -31,13 +31,16 @@ function App() {
 
         // Update page metadata with config values
         if (data.UI.TITLE) {
-          document.title = `${data.UI.TITLE} - Secure File Sharing`;
+          const fullTitle = `${data.UI.TITLE} - Secure File Sharing`;
+          document.title = fullTitle;
+          document.querySelector('meta[property="og:title"]')?.setAttribute('content', fullTitle);
+          document.querySelector('meta[name="twitter:title"]')?.setAttribute('content', fullTitle);
+          document.querySelector('meta[property="og:site_name"]')?.setAttribute('content', data.UI.TITLE);
         }
         if (data.UI.DESCRIPTION) {
-          const metaDescription = document.querySelector('meta[name="description"]');
-          if (metaDescription) {
-            metaDescription.setAttribute('content', data.UI.DESCRIPTION);
-          }
+          document.querySelector('meta[name="description"]')?.setAttribute('content', data.UI.DESCRIPTION);
+          document.querySelector('meta[property="og:description"]')?.setAttribute('content', data.UI.DESCRIPTION);
+          document.querySelector('meta[name="twitter:description"]')?.setAttribute('content', data.UI.DESCRIPTION);
         }
       } catch (e) {
         console.error('Failed to load config:', e);
