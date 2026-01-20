@@ -51,6 +51,44 @@ const app = new Elysia()
     name: 'bolter-backend',
   }))
 
+  // Health check endpoints (Docker/K8s compatible)
+  .get('/api/health', async ({ set }) => {
+    const health = await storage.ping();
+    const isHealthy = health.redis && health.s3;
+    if (!isHealthy) {
+      set.status = 503;
+    }
+    return {
+      status: isHealthy ? 'healthy' : 'unhealthy',
+      timestamp: new Date().toISOString(),
+      checks: {
+        redis: health.redis ? 'up' : 'down',
+        s3: health.s3 ? 'up' : 'down',
+      },
+    };
+  })
+
+  .get('/api/health/live', () => ({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+  }))
+
+  .get('/api/health/ready', async ({ set }) => {
+    const health = await storage.ping();
+    const isReady = health.redis && health.s3;
+    if (!isReady) {
+      set.status = 503;
+    }
+    return {
+      status: isReady ? 'ready' : 'not_ready',
+      timestamp: new Date().toISOString(),
+      checks: {
+        redis: health.redis ? 'up' : 'down',
+        s3: health.s3 ? 'up' : 'down',
+      },
+    };
+  })
+
   // Client configuration
   .get('/config', () => ({
     LIMITS: {

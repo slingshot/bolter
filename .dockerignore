@@ -1,0 +1,45 @@
+# Dependencies
+node_modules
+*/node_modules
+
+# Build outputs
+frontend/dist
+backend/dist
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Environment files (use docker-compose env vars instead)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+*.md
+!README.md
+
+# Misc
+.serena
+*.tsbuildinfo
+coverage
+.nyc_output
