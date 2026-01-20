@@ -16,7 +16,15 @@ export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:30
 const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
-const CONCURRENT_UPLOADS = 3;
+
+// Adaptive concurrency based on file size
+// With backpressure, memory is bounded to ~(concurrency + 1) * partSize
+// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
+function getConcurrentUploads(fileSize: number): number {
+  const GB = 1024 * 1024 * 1024;
+  if (fileSize > 50 * GB) return 2;   // > 50GB: conservative
+  return 3;                            // default: 3 concurrent uploads
+}
 
 export interface UploadProgress {
   loaded: number;
@@ -431,7 +439,8 @@ export async function uploadFiles(
       uploadInfo,
       updateProgress,
       canceller,
-      onError
+      onError,
+      totalSize
     );
   } else {
     // Single part upload
@@ -464,7 +473,7 @@ export async function uploadFiles(
       metadata: metadataString,
       ...(encrypted && { authKey: await keychain.authKeyB64() }),
       actualSize: uploadResult.actualSize || totalSize,
-      ...(uploadInfo.multipart && { parts: uploadResult.parts }),
+      ...(uploadInfo.multipart && 'parts' in uploadResult && { parts: uploadResult.parts }),
     }),
   });
 
@@ -587,28 +596,91 @@ async function uploadSinglePart(
 }
 
 /**
- * Upload multipart using streaming
+ * Upload multipart using streaming with memory-efficient concurrency control
+ * Uses a semaphore pattern to limit concurrent uploads and prevent memory exhaustion
  */
 async function uploadMultipartStream(
   stream: ReadableStream<Uint8Array>,
   uploadInfo: UploadUrlResponse,
   onProgress: (partNum: number, loaded: number) => void,
   canceller: Canceller,
-  onError?: (error: UploadError) => void
+  onError?: (error: UploadError) => void,
+  totalFileSize?: number
 ): Promise<{ parts: { PartNumber: number; ETag: string }[]; actualSize: number }> {
   const { parts, partSize } = uploadInfo;
   if (!parts || !partSize) throw new Error('Invalid upload info');
 
+  // Adaptive concurrency based on file size
+  const maxConcurrent = getConcurrentUploads(totalFileSize || 0);
+  console.log(`[Upload] Starting multipart upload: ${parts.length} parts, ${partSize / (1024*1024)}MB each, concurrency: ${maxConcurrent}`);
+
   const reader = stream.getReader();
-  const allUploads: Promise<{ PartNumber: number; ETag: string }>[] = [];
-  const uploadPartNumbers: number[] = [];
+  const completedParts: { PartNumber: number; ETag: string }[] = [];
   const partErrors: Record<number, { error: string; size: number }> = {};
+  const failedPartNumbers: number[] = [];
+
+  // Concurrency control state
+  let activeUploads = 0;
+  let totalUploadedSize = 0;
+  let totalPartsQueued = 0;
+  let totalPartsFinished = 0;
+
+  // Promise to signal when all uploads are done
+  let resolveAllDone: () => void;
+  const allDonePromise = new Promise<void>(resolve => { resolveAllDone = resolve; });
+
+  // Upload a single part and manage concurrency
+  const uploadPart = async (partBlob: Blob, partNum: number, partUrl: string): Promise<void> => {
+    try {
+      console.log(`[Upload] Part ${partNum} starting (${(partBlob.size / (1024*1024)).toFixed(1)}MB)`);
+      const result = await uploadPartWithRetry(
+        partBlob,
+        partUrl,
+        partNum,
+        (loaded) => onProgress(partNum, loaded),
+        canceller
+      );
+      completedParts.push(result);
+      console.log(`[Upload] Part ${partNum} complete`);
+    } catch (error: any) {
+      console.error(`[Upload] Part ${partNum} failed:`, error.message);
+      partErrors[partNum] = {
+        error: error.message,
+        size: partBlob.size,
+      };
+      failedPartNumbers.push(partNum);
+    } finally {
+      activeUploads--;
+      totalPartsFinished++;
+      console.log(`[Upload] Progress: ${totalPartsFinished}/${totalPartsQueued} parts finished, ${activeUploads} active`);
+
+      // Check if all done
+      if (totalPartsFinished === totalPartsQueued) {
+        resolveAllDone();
+      }
+
+      // Start next queued upload if any
+      processQueue();
+    }
+  };
+
+  // Queue of pending uploads (not yet started due to concurrency limit)
+  const pendingQueue: Array<{ blob: Blob; partNum: number; url: string }> = [];
+
+  // Process the queue, starting uploads up to maxConcurrent
+  const processQueue = (): void => {
+    while (pendingQueue.length > 0 && activeUploads < maxConcurrent) {
+      const item = pendingQueue.shift()!;
+      activeUploads++;
+      // Fire and forget - completion is tracked via totalPartsFinished
+      uploadPart(item.blob, item.partNum, item.url);
+    }
+  };
 
   let currentPartIndex = 0;
   let currentPartData: Uint8Array[] = [];
   let currentPartSize = 0;
   let leftoverData: Uint8Array | null = null;
-  let totalUploadedSize = 0;
 
   try {
     let streamDone = false;
@@ -654,30 +726,35 @@ async function uploadMultipartStream(
         }
       }
 
-      // Upload if we have data
+      // Queue upload if we have data
       if (currentPartData.length > 0) {
+        // Create blob and immediately clear the array references to free memory
         const partBlob = new Blob(currentPartData);
         totalUploadedSize += partBlob.size;
+        totalPartsQueued++;
 
-        const uploadPromise = uploadPartWithRetry(
-          partBlob,
-          part.url,
-          part.partNumber,
-          (loaded) => onProgress(part.partNumber, loaded),
-          canceller
-        ).catch((error) => {
-          partErrors[part.partNumber] = {
-            error: error.message,
-            size: partBlob.size,
-          };
-          throw error;
-        });
-
-        allUploads.push(uploadPromise);
-        uploadPartNumbers.push(part.partNumber);
-
+        // Clear references immediately - blob now owns the data
         currentPartData = [];
         currentPartSize = 0;
+
+        // Add to queue and try to process
+        pendingQueue.push({ blob: partBlob, partNum: part.partNumber, url: part.url });
+        processQueue();
+
+        // Backpressure: wait if we have too many parts buffered
+        // Allow at most (maxConcurrent + 1) parts in memory at once
+        // This balances memory usage vs upload throughput
+        const maxBuffered = maxConcurrent + 1;
+        if (pendingQueue.length + activeUploads >= maxBuffered) {
+          await new Promise<void>(resolve => {
+            const checkRoom = setInterval(() => {
+              if (pendingQueue.length + activeUploads < maxBuffered) {
+                clearInterval(checkRoom);
+                resolve();
+              }
+            }, 50);
+          });
+        }
       } else if (streamDone) {
         break;
       }
@@ -685,25 +762,17 @@ async function uploadMultipartStream(
       currentPartIndex++;
     }
 
-    // Wait for all uploads
-    const results = await Promise.allSettled(allUploads);
+    // Wait for all uploads to complete
+    if (totalPartsQueued > 0 && totalPartsFinished < totalPartsQueued) {
+      console.log(`[Upload] Waiting for ${totalPartsQueued - totalPartsFinished} remaining uploads...`);
+      await allDonePromise;
+    }
 
     // Check for failures
-    const successfulParts: { PartNumber: number; ETag: string }[] = [];
-    const failedParts: number[] = [];
-
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        successfulParts.push(result.value);
-      } else {
-        failedParts.push(uploadPartNumbers[index]);
-      }
-    });
-
-    if (failedParts.length > 0) {
+    if (failedPartNumbers.length > 0) {
       const error: UploadError = {
-        message: `Failed to upload ${failedParts.length} parts`,
-        failedParts,
+        message: `Failed to upload ${failedPartNumbers.length} parts: ${failedPartNumbers.join(', ')}`,
+        failedParts: failedPartNumbers,
         partErrors,
         retryable: true,
       };
@@ -711,8 +780,10 @@ async function uploadMultipartStream(
       throw new Error(error.message);
     }
 
+    console.log(`[Upload] All ${completedParts.length} parts completed successfully`);
+
     return {
-      parts: successfulParts.sort((a, b) => a.PartNumber - b.PartNumber),
+      parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
       actualSize: totalUploadedSize,
     };
   } finally {
@@ -736,13 +807,19 @@ async function uploadPartWithRetry(
   } catch (error: any) {
     if (canceller.cancelled) throw error;
 
-    if (retryCount < MAX_RETRIES && isRetryableError(error)) {
+    const isRetryable = isRetryableError(error);
+    console.warn(`[Upload] Part ${partNumber} failed (attempt ${retryCount + 1}/${MAX_RETRIES + 1}): ${error.message}`, {
+      retryable: isRetryable,
+      blobSize: blob.size,
+    });
+
+    if (retryCount < MAX_RETRIES && isRetryable) {
       const delay = Math.min(
         RETRY_DELAY_BASE * Math.pow(2, retryCount) + Math.random() * 1000,
         MAX_RETRY_DELAY
       );
 
-      console.log(`Retrying part ${partNumber} after ${delay}ms (attempt ${retryCount + 2}/${MAX_RETRIES + 1})`);
+      console.log(`[Upload] Retrying part ${partNumber} in ${(delay/1000).toFixed(1)}s...`);
 
       await new Promise((resolve) => setTimeout(resolve, delay));
 
@@ -808,15 +885,21 @@ function uploadPart(
 
 /**
  * Check if an error is retryable
+ * Includes browser abort errors (NS_BINDING_ABORTED in Firefox) which often happen
+ * due to memory pressure or connection limits
  */
 function isRetryableError(error: Error): boolean {
-  const msg = error.message || '';
+  const msg = (error.message || '').toLowerCase();
   return (
-    msg.includes('Network error') ||
-    msg.includes('Timeout') ||
-    /HTTP 5\d\d/.test(msg) ||
-    msg.includes('HTTP 429') ||
-    msg.includes('HTTP 408')
+    msg.includes('network error') ||
+    msg.includes('network') ||
+    msg.includes('timeout') ||
+    msg.includes('abort') ||
+    msg.includes('failed to fetch') ||
+    /http 5\d\d/.test(msg) ||
+    msg.includes('http 429') ||
+    msg.includes('http 408') ||
+    msg.includes('http 0') // Often indicates network failure
   );
 }
 
