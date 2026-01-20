@@ -15,7 +15,7 @@ export function UploadProgress() {
   };
 
   return (
-    <div className="mt-6 bg-overlay-subtle border border-border-medium rounded-element p-4">
+    <div className="bg-overlay-subtle border border-border-medium rounded-element p-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Loader2 className="h-5 w-5 animate-spin text-content-primary" />

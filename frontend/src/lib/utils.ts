@@ -55,10 +55,10 @@ export function formatDownloadLimit(limit: number): string {
 }
 
 /**
- * Format speed to human readable string
+ * Format speed to human readable string (rounded to 1 decimal)
  */
 export function formatSpeed(bytesPerSecond: number): string {
-  return `${formatBytes(bytesPerSecond)}/s`;
+  return `${formatBytes(bytesPerSecond, 1)}/s`;
 }
 
 /**

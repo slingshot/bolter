@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   Download,
@@ -7,6 +7,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  Archive,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
@@ -35,6 +36,7 @@ export function DownloadPage() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [keychain, setKeychain] = useState<Keychain | null>(null);
+  const loadingRef = useRef(false);
 
   // Extract secret key from URL hash
   useEffect(() => {
@@ -42,6 +44,10 @@ export function DownloadPage() {
       setState('not-found');
       return;
     }
+
+    // Prevent duplicate requests from StrictMode double-render
+    if (loadingRef.current) return;
+    loadingRef.current = true;
 
     const secretKey = location.hash.slice(1); // Remove the # prefix
 
@@ -256,21 +262,61 @@ export function DownloadPage() {
             )}
 
             {/* File Info */}
-            <div className="w-full bg-overlay-subtle border border-border-medium rounded-element p-3">
-              <div className="flex items-center gap-[10px]">
-                <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded bg-overlay-medium">
-                  <FileIcon className="h-5 w-5 text-content-primary" />
+            {metadata?.files && metadata.files.length > 1 ? (
+              // Multiple files view
+              <div className="w-full space-y-3">
+                {/* Summary */}
+                <div className="bg-overlay-subtle border border-border-medium rounded-element p-3">
+                  <div className="flex items-center gap-[10px]">
+                    <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded bg-overlay-medium">
+                      <Archive className="h-5 w-5 text-content-primary" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-paragraph-sm text-content-primary font-medium">
+                        {metadata.files.length} files
+                      </p>
+                      <p className="text-paragraph-xs text-content-tertiary">
+                        {formatBytes(metadata.files.reduce((sum, f) => sum + f.size, 0))} total &middot; will download as .zip
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                <div className="flex-1 min-w-0">
-                  <p className="truncate text-paragraph-sm text-content-primary font-medium">
-                    {metadata?.name}
-                  </p>
-                  <p className="text-paragraph-xs text-content-tertiary">
-                    {formatBytes(metadata?.size || 0)}
-                  </p>
+
+                {/* Individual files list */}
+                <div className="bg-overlay-subtle border border-border-medium rounded-element p-2 max-h-[200px] overflow-y-auto">
+                  <div className="space-y-1">
+                    {metadata.files.map((file, index) => (
+                      <div key={index} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-overlay-medium">
+                        <FileIcon className="h-4 w-4 text-content-secondary shrink-0" />
+                        <span className="truncate text-paragraph-xs text-content-primary flex-1">
+                          {file.name}
+                        </span>
+                        <span className="text-paragraph-xs text-content-tertiary shrink-0">
+                          {formatBytes(file.size)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
-            </div>
+            ) : (
+              // Single file view
+              <div className="w-full bg-overlay-subtle border border-border-medium rounded-element p-3">
+                <div className="flex items-center gap-[10px]">
+                  <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded bg-overlay-medium">
+                    <FileIcon className="h-5 w-5 text-content-primary" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="truncate text-paragraph-sm text-content-primary font-medium">
+                      {metadata?.name}
+                    </p>
+                    <p className="text-paragraph-xs text-content-tertiary">
+                      {formatBytes(metadata?.size || 0)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Download button or progress */}
             {state === 'downloading' ? (

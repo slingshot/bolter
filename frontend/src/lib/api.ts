@@ -4,6 +4,7 @@
  */
 
 import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
+import { sliceConcatenatedData, createZipFromFiles, generateZipFilename, type FileInfo } from './zip';
 
 // API base URL - defaults to localhost for development
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
@@ -118,8 +119,22 @@ export async function getMetadata(id: string, keychain?: Keychain) {
     headers['Authorization'] = await keychain.authHeader();
   }
 
-  const response = await fetch(`${API_BASE_URL}/metadata/${id}`, { headers });
+  let response = await fetch(`${API_BASE_URL}/metadata/${id}`, { headers });
 
+  // Handle 401 challenge-response: extract nonce and retry
+  if (response.status === 401 && keychain) {
+    const authHeader = response.headers.get('WWW-Authenticate');
+    if (authHeader) {
+      const nonce = authHeader.split(' ')[1];
+      if (nonce) {
+        keychain.nonce = nonce;
+        headers['Authorization'] = await keychain.authHeader();
+        response = await fetch(`${API_BASE_URL}/metadata/${id}`, { headers });
+      }
+    }
+  }
+
+  // Extract nonce for future requests
   const authHeader = response.headers.get('WWW-Authenticate');
   if (authHeader && keychain) {
     const nonce = authHeader.split(' ')[1];
@@ -214,6 +229,9 @@ export async function uploadFiles(
   const startTime = Date.now();
   let lastProgressTime = startTime;
   let lastProgressBytes = 0;
+  let lastDisplayTime = startTime;
+  let smoothedSpeed = 0;
+  let smoothedRemaining = 0;
 
   // Calculate total size
   const plainSize = files.reduce((sum, f) => sum + f.size, 0);
@@ -262,20 +280,26 @@ export async function uploadFiles(
     const now = Date.now();
     const elapsed = (now - lastProgressTime) / 1000;
     const bytesInPeriod = totalLoaded - lastProgressBytes;
-    const speed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
-    const remaining = speed > 0 ? (totalSize - totalLoaded) / speed : 0;
+    const instantSpeed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
 
-    if (elapsed > 1) {
+    // Update speed/time calculation once per second with smoothing
+    const displayElapsed = (now - lastDisplayTime) / 1000;
+    if (displayElapsed >= 1 || lastDisplayTime === startTime) {
+      // Exponential moving average for smooth speed (alpha = 0.3)
+      smoothedSpeed = smoothedSpeed === 0 ? instantSpeed : smoothedSpeed * 0.7 + instantSpeed * 0.3;
+      smoothedRemaining = smoothedSpeed > 0 ? (totalSize - totalLoaded) / smoothedSpeed : 0;
+      lastDisplayTime = now;
       lastProgressTime = now;
       lastProgressBytes = totalLoaded;
     }
 
+    // Always update progress bar, but speed/time stay stable between updates
     onProgress?.({
       loaded: Math.min(totalLoaded, totalSize),
       total: totalSize,
       percentage: Math.min((totalLoaded / totalSize) * 100, 100),
-      speed,
-      remainingTime: remaining,
+      speed: smoothedSpeed,
+      remainingTime: smoothedRemaining,
     });
   };
 
@@ -717,8 +741,22 @@ export async function downloadFile(
     headers['Authorization'] = await keychain.authHeader();
   }
 
-  const urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+  let urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
 
+  // Handle 401 challenge-response: extract nonce and retry
+  if (urlResponse.status === 401 && keychain) {
+    const authHeader = urlResponse.headers.get('WWW-Authenticate');
+    if (authHeader) {
+      const nonce = authHeader.split(' ')[1];
+      if (nonce) {
+        keychain.nonce = nonce;
+        headers['Authorization'] = await keychain.authHeader();
+        urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+      }
+    }
+  }
+
+  // Extract nonce for future requests
   if (keychain) {
     const authHeader = urlResponse.headers.get('WWW-Authenticate');
     if (authHeader) {
@@ -741,7 +779,29 @@ export async function downloadFile(
     downloadHeaders['Authorization'] = await keychain.authHeader();
   }
 
-  const response = await fetch(downloadUrl, { headers: downloadHeaders });
+  let response = await fetch(downloadUrl, { headers: downloadHeaders });
+
+  // Handle 401 challenge-response for direct downloads
+  if (response.status === 401 && keychain && !urlData.useSignedUrl) {
+    const authHeader = response.headers.get('WWW-Authenticate');
+    if (authHeader) {
+      const nonce = authHeader.split(' ')[1];
+      if (nonce) {
+        keychain.nonce = nonce;
+        downloadHeaders['Authorization'] = await keychain.authHeader();
+        response = await fetch(downloadUrl, { headers: downloadHeaders });
+      }
+    }
+  }
+
+  // Extract nonce for future requests
+  if (keychain && !urlData.useSignedUrl) {
+    const authHeader = response.headers.get('WWW-Authenticate');
+    if (authHeader) {
+      const nonce = authHeader.split(' ')[1];
+      if (nonce) keychain.nonce = nonce;
+    }
+  }
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
@@ -799,6 +859,20 @@ export async function downloadFile(
     headers: keychain ? { Authorization: await keychain.authHeader() } : {},
   }).catch(console.warn);
 
+  // Handle multiple files - create zip archive
+  const files = metadata.files as FileInfo[] | undefined;
+
+  if (files && files.length > 1) {
+    // Multiple files: slice data and create zip
+    const fileSlices = sliceConcatenatedData(decryptedData, files);
+    const zipBlob = await createZipFromFiles(fileSlices);
+    return {
+      blob: zipBlob,
+      filename: generateZipFilename(files),
+    };
+  }
+
+  // Single file: return as-is (existing behavior)
   return {
     blob: new Blob([decryptedData]),
     filename: metadata.name || 'download',
