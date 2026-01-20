@@ -114,6 +114,21 @@ export async function fileExists(id: string): Promise<boolean> {
 }
 
 /**
+ * Check if file exists on legacy system
+ * Returns redirect URL if file exists, null otherwise
+ */
+export async function checkLegacyFile(id: string): Promise<string | null> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/download/legacy/${id}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.redirect;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Get file metadata
  */
 export async function getMetadata(id: string, keychain?: Keychain) {

@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Keychain } from '@/lib/crypto';
-import { getMetadata, downloadFile, fileExists, getDownloadStatus, API_BASE_URL } from '@/lib/api';
+import { getMetadata, downloadFile, fileExists, checkLegacyFile, getDownloadStatus, API_BASE_URL } from '@/lib/api';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
@@ -60,6 +60,12 @@ export function DownloadPage() {
         // Check if file exists
         const exists = await fileExists(id);
         if (!exists) {
+          // Check legacy system before showing not found
+          const legacyUrl = await checkLegacyFile(id);
+          if (legacyUrl) {
+            window.location.href = legacyUrl;
+            return;
+          }
           setState('not-found');
           return;
         }

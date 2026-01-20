@@ -280,6 +280,20 @@ export const downloadRoutes = new Elysia()
     return { exists };
   })
 
+  // Check if file exists on legacy system
+  .get('/download/legacy/:id', async ({ params }) => {
+    const { id } = params;
+    try {
+      const response = await fetch(`https://legacy.send.fm/api/exists/${id}`);
+      if (response.status < 400) {
+        return { redirect: `https://legacy.send.fm/download/${id}` };
+      }
+      return { redirect: null };
+    } catch {
+      return { redirect: null };
+    }
+  })
+
   // Delete file (owner only)
   .post('/delete/:id', async ({ params, body, set }) => {
     const { id } = params;
