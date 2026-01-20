@@ -16,5 +16,8 @@
   },
   "devDependencies": {
     "@dotenvx/dotenvx": "^1.51.4"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^1.6.1"
   }
 }

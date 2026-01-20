@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { Routes, Route } from 'react-router-dom';
+import { Analytics } from '@vercel/analytics/react';
 import { Header } from '@/components/Header';
 import { Footer } from '@/components/Footer';
 import { Toaster } from '@/components/Toaster';
@@ -61,6 +62,7 @@ function App() {
       </main>
       <Footer />
       <Toaster />
+      <Analytics />
     </div>
   );
 }
