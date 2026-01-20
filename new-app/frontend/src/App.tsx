@@ -1,6 +1,7 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { Header } from '@/components/Header';
+import { Footer } from '@/components/Footer';
 import { Toaster } from '@/components/Toaster';
 import { HomePage } from '@/pages/Home';
 import { DownloadPage } from '@/pages/Download';
@@ -27,6 +28,17 @@ function App() {
           customTitle: data.UI.TITLE,
           customDescription: data.UI.DESCRIPTION,
         });
+
+        // Update page metadata with config values
+        if (data.UI.TITLE) {
+          document.title = `${data.UI.TITLE} - Secure File Sharing`;
+        }
+        if (data.UI.DESCRIPTION) {
+          const metaDescription = document.querySelector('meta[name="description"]');
+          if (metaDescription) {
+            metaDescription.setAttribute('content', data.UI.DESCRIPTION);
+          }
+        }
       } catch (e) {
         console.error('Failed to load config:', e);
       }
@@ -36,24 +48,15 @@ function App() {
   }, [setConfig]);
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen flex flex-col">
       <Header />
-      <main>
+      <main className="flex-1">
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/download/:id" element={<DownloadPage />} />
         </Routes>
       </main>
-
-      <footer className="border-t py-6 text-center text-sm text-muted-foreground">
-        <div className="container">
-          <p>
-            End-to-end encrypted file sharing.
-            Files are encrypted in your browser before upload.
-          </p>
-        </div>
-      </footer>
-
+      <Footer />
       <Toaster />
     </div>
   );

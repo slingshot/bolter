@@ -1,0 +1,174 @@
+/*
+  This font software is the property of Commercial Type.
+  You may not modify the font software, use it on another website,
+  or install it on a computer.
+
+  License information is available at http://commercialtype.com/eula
+  For more information please visit Commercial Type at http://commercialtype.com
+  or email us at info[at]commercialtype.com
+
+  Copyright (C) 2022 Schwartzco Inc.
+  License: 2203-CJKSFW
+*/
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-SuperItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-SuperItalic-Web.woff') format('woff');
+  font-weight: 900;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Super-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Super-Web.woff') format('woff');
+  font-weight: 900;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-BlackItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-BlackItalic-Web.woff') format('woff');
+  font-weight: 800;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Black-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Black-Web.woff') format('woff');
+  font-weight: 800;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-BoldItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-BoldItalic-Web.woff') format('woff');
+  font-weight: 700;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Bold-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Bold-Web.woff') format('woff');
+  font-weight: 700;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-SemiboldItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-SemiboldItalic-Web.woff') format('woff');
+  font-weight: 600;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Semibold-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Semibold-Web.woff') format('woff');
+  font-weight: 600;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-MediumItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-MediumItalic-Web.woff') format('woff');
+  font-weight: 500;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Medium-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Medium-Web.woff') format('woff');
+  font-weight: 500;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-RegularItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-RegularItalic-Web.woff') format('woff');
+  font-weight: 400;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Regular-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Regular-Web.woff') format('woff');
+  font-weight: 400;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-LightItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-LightItalic-Web.woff') format('woff');
+  font-weight: 300;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Light-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Light-Web.woff') format('woff');
+  font-weight: 300;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-ExtralightItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-ExtralightItalic-Web.woff') format('woff');
+  font-weight: 200;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Extralight-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Extralight-Web.woff') format('woff');
+  font-weight: 200;
+  font-style: normal;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-ThinItalic-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-ThinItalic-Web.woff') format('woff');
+  font-weight: 100;
+  font-style: italic;
+  font-stretch: normal;
+}
+
+@font-face {
+  font-family: 'Graphik Web';
+  src: url('/graphik/Graphik-Thin-Web.woff2') format('woff2'),
+    url('/graphik/Graphik-Thin-Web.woff') format('woff');
+  font-weight: 100;
+  font-style: normal;
+  font-stretch: normal;
+}

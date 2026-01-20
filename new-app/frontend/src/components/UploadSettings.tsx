@@ -1,6 +1,5 @@
-import React from 'react';
-import { Clock, Download, Lock, Unlock } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import React, { useState } from 'react';
+import { Toggle } from '@/components/ui/toggle';
 import {
   Select,
   SelectContent,
@@ -8,7 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { cn, formatTimeLimit, formatDownloadLimit } from '@/lib/utils';
+import { formatTimeLimit, formatDownloadLimit } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
 export function UploadSettings() {
@@ -22,49 +21,55 @@ export function UploadSettings() {
     config,
   } = useAppStore();
 
+  const [requirePassword, setRequirePassword] = useState(false);
+  const [password, setPassword] = useState('');
+
   const expireTimes = config?.expireTimes || [300, 3600, 86400, 604800];
   const downloadCounts = config?.downloadCounts || [1, 2, 3, 4, 5, 20, 50, 100];
 
   return (
-    <div className="mt-6 space-y-4">
+    <div className="flex flex-col gap-3">
       {/* Encryption Toggle */}
-      <div className="flex items-center justify-between rounded-lg border p-4">
-        <div className="flex items-center gap-3">
-          {encrypted ? (
-            <Lock className="h-5 w-5 text-primary" />
-          ) : (
-            <Unlock className="h-5 w-5 text-muted-foreground" />
-          )}
-          <div>
-            <p className="font-medium">End-to-End Encryption</p>
-            <p className="text-sm text-muted-foreground">
-              {encrypted
-                ? 'Files are encrypted before upload'
-                : 'Files will be uploaded without encryption'}
-            </p>
-          </div>
-        </div>
-        <Button
-          variant={encrypted ? 'default' : 'outline'}
-          size="sm"
-          onClick={() => setEncrypted(!encrypted)}
-        >
-          {encrypted ? 'On' : 'Off'}
-        </Button>
+      <div className="flex flex-col gap-3">
+        <Toggle
+          checked={encrypted}
+          onCheckedChange={setEncrypted}
+          label="Encrypt files for enhanced security"
+        />
       </div>
 
+      {/* Divider */}
+      <div className="h-[0.5px] bg-border-medium" />
+
       {/* Time and Download Limits */}
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <Clock className="h-4 w-4" />
-            Expires after
-          </label>
+      <div className="flex items-center gap-2">
+        <Toggle
+          checked={true}
+          onCheckedChange={() => {}}
+          label="Expires after"
+        />
+        <div className="flex flex-1 items-center gap-2">
+          <Select
+            value={String(downloadLimit)}
+            onValueChange={(v) => setDownloadLimit(parseInt(v, 10))}
+          >
+            <SelectTrigger className="flex-1">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {downloadCounts.map((count) => (
+                <SelectItem key={count} value={String(count)}>
+                  {formatDownloadLimit(count)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="text-paragraph-xs text-content-primary font-medium">or</span>
           <Select
             value={String(timeLimit)}
             onValueChange={(v) => setTimeLimit(parseInt(v, 10))}
           >
-            <SelectTrigger>
+            <SelectTrigger className="flex-1">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -76,28 +81,27 @@ export function UploadSettings() {
             </SelectContent>
           </Select>
         </div>
+      </div>
 
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <Download className="h-4 w-4" />
-            Download limit
-          </label>
-          <Select
-            value={String(downloadLimit)}
-            onValueChange={(v) => setDownloadLimit(parseInt(v, 10))}
-          >
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {downloadCounts.map((count) => (
-                <SelectItem key={count} value={String(count)}>
-                  {formatDownloadLimit(count)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+      {/* Divider */}
+      <div className="h-[0.5px] bg-border-medium" />
+
+      {/* Password Protection */}
+      <div className="flex items-center gap-2">
+        <Toggle
+          checked={requirePassword}
+          onCheckedChange={setRequirePassword}
+          label="Require password"
+        />
+        {requirePassword && (
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Enter password"
+            className="flex-1 rounded-input border border-border-subtle bg-fill-input px-[14px] py-[6.5px] text-paragraph-sm text-content-primary placeholder:text-content-tertiary focus:outline-none focus:ring-2 focus:ring-content-primary focus:ring-offset-2 focus:ring-offset-background-page"
+          />
+        )}
       </div>
     </div>
   );

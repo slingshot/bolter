@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Upload, Loader2 } from 'lucide-react';
+import { Upload, Loader2, ChevronUp, ChevronDown, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { DropZone } from '@/components/DropZone';
@@ -13,10 +13,13 @@ import { useAppStore, type UploadedFile } from '@/stores/app';
 import { Keychain } from '@/lib/crypto';
 import { uploadFiles, Canceller } from '@/lib/api';
 import { formatBytes } from '@/lib/utils';
+import { UPLOAD_LIMITS } from '@bolter/shared';
 
 export function HomePage() {
   const navigate = useNavigate();
   const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
+  const [filesExpanded, setFilesExpanded] = useState(true);
+  const [securityExpanded, setSecurityExpanded] = useState(true);
 
   const {
     files,
@@ -122,61 +125,105 @@ export function HomePage() {
   ]);
 
   const totalSize = files.reduce((sum, f) => sum + f.file.size, 0);
-  const maxSize = config?.maxFileSize || 2.5 * 1024 * 1024 * 1024;
+  const maxSize = config?.maxFileSize || UPLOAD_LIMITS.MAX_FILE_SIZE;
   const canUpload = files.length > 0 && totalSize <= maxSize && !isUploading;
 
   return (
-    <div className="container py-8">
-      <div className="mx-auto max-w-2xl">
+    <div className="pt-24 pb-16 px-6">
+      <div className="max-w-main-card mx-auto flex flex-col gap-section">
         {/* Hero */}
-        <div className="mb-8 text-center">
-          <h1 className="text-4xl font-bold tracking-tight">
-            Share files securely
+        <div className="text-left flex flex-col items-center gap-2">
+          <h1 className="text-heading-xs text-content-primary w-full mb-2">
+            Send files privately
           </h1>
-          <p className="mt-3 text-lg text-muted-foreground">
-            End-to-end encrypted file sharing with automatic expiration.
-            No account required.
+          <p className="text-paragraph-xs text-content-secondary max-w-[600px] mx-auto">
+            Slingshot Select lets you share files securely with links that automatically expire. Your files can be end-to-end encrypted, so only you and the people you share with can access them—not us, not AI companies, not anyone else.
           </p>
         </div>
 
-        {/* Upload Card */}
-        <Card>
-          <CardContent className="pt-6">
-            <DropZone />
-            <FileList />
-
-            {files.length > 0 && !isUploading && (
+        {/* Main Card */}
+        <div className="card-glass p-card shadow-card">
+          <div className="relative z-10 flex flex-col gap-5">
+            {!isUploading && (
               <>
-                <UploadSettings />
+                <DropZone />
 
-                <div className="mt-6">
+                {files.length > 0 && (
+                  <div className="bg-overlay-subtle border border-border-medium rounded-element">
+                    <div
+                      className="border-b border-border-medium px-4 py-[14px] flex items-center justify-between cursor-pointer hover:bg-overlay-medium transition-colors"
+                      onClick={() => setFilesExpanded(!filesExpanded)}
+                    >
+                      <p className="text-paragraph-sm text-content-primary font-medium">
+                        {files.length} file{files.length !== 1 ? 's' : ''} · {formatBytes(totalSize)} / {config?.maxFileSize ? formatBytes(config.maxFileSize) : '1TB'}
+                      </p>
+                      {filesExpanded ? (
+                        <ChevronUp className="h-[18px] w-[18px] text-content-primary" />
+                      ) : (
+                        <ChevronDown className="h-[18px] w-[18px] text-content-primary" />
+                      )}
+                    </div>
+                    {filesExpanded && (
+                      <>
+                        <div className="px-4 pt-2 pb-2">
+                          <FileList />
+                        </div>
+                        <div className="px-4 pb-4">
+                          <label htmlFor="file-input" className="block bg-overlay-medium border border-border-strong border-dashed rounded-element flex items-center justify-center h-[38px] cursor-pointer hover:bg-overlay-subtle transition-colors">
+                            <Plus className="h-[18px] w-[18px] text-content-primary mr-2" />
+                            <span className="text-paragraph-xs text-content-primary font-medium">Add files</span>
+                          </label>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {files.length > 0 && (
+                  <div className="bg-overlay-subtle border border-border-medium rounded-element">
+                    <div
+                      className="border-b border-border-medium px-4 py-[14px] flex items-center justify-between cursor-pointer hover:bg-overlay-medium transition-colors"
+                      onClick={() => setSecurityExpanded(!securityExpanded)}
+                    >
+                      <p className="text-paragraph-sm text-content-primary font-medium">Security</p>
+                      {securityExpanded ? (
+                        <ChevronUp className="h-[18px] w-[18px] text-content-primary" />
+                      ) : (
+                        <ChevronDown className="h-[18px] w-[18px] text-content-primary" />
+                      )}
+                    </div>
+                    {securityExpanded && (
+                      <div className="px-4 pt-3 pb-4">
+                        <UploadSettings />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {files.length > 0 && (
                   <Button
                     className="w-full"
-                    size="lg"
                     onClick={handleUpload}
                     disabled={!canUpload}
                   >
-                    <Upload className="mr-2 h-5 w-5" />
-                    Upload {files.length} file{files.length !== 1 ? 's' : ''} ({formatBytes(totalSize)})
+                    Upload
                   </Button>
+                )}
 
-                  {totalSize > maxSize && (
-                    <p className="mt-2 text-center text-sm text-destructive">
-                      Total size exceeds the {formatBytes(maxSize)} limit
-                    </p>
-                  )}
-                </div>
+                {totalSize > maxSize && (
+                  <p className="text-center text-paragraph-xs text-red-600">
+                    Total size exceeds the {formatBytes(maxSize)} limit
+                  </p>
+                )}
               </>
             )}
 
             {isUploading && <UploadProgress />}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
 
         {/* Recent uploads */}
-        <div className="mt-8">
-          <UploadedFilesList />
-        </div>
+        <UploadedFilesList />
       </div>
 
       {/* Share dialog */}

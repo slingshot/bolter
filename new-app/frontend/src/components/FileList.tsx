@@ -30,64 +30,61 @@ export function FileList() {
   const totalSize = files.reduce((sum, f) => sum + f.file.size, 0);
 
   return (
-    <div className="mt-6 space-y-3">
-      <div className="flex items-center justify-between">
-        <h4 className="text-sm font-medium text-muted-foreground">
-          {files.length} file{files.length !== 1 ? 's' : ''} selected
-        </h4>
-        <span className="text-sm text-muted-foreground">{formatBytes(totalSize)}</span>
-      </div>
+    <div className="flex flex-col gap-2">
+      {files.map((item, index) => {
+        const Icon = getFileIcon(item.file.type);
 
-      <div className="max-h-64 space-y-2 overflow-y-auto rounded-lg border bg-card p-2">
-        {files.map((item) => {
-          const Icon = getFileIcon(item.file.type);
-
-          return (
+        return (
+          <div key={item.id}>
             <div
-              key={item.id}
               className={cn(
-                'flex items-center gap-3 rounded-md p-2 transition-colors',
-                item.status === 'error'
-                  ? 'bg-destructive/10'
-                  : 'hover:bg-muted'
+                'flex items-center gap-[10px] py-2',
+                item.status === 'error' && 'opacity-50'
               )}
             >
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted">
-                <Icon className="h-5 w-5 text-muted-foreground" />
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-overlay-medium">
+                <Icon className="h-4 w-4 text-content-secondary" />
               </div>
 
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium">{item.file.name}</p>
-                <p className="text-xs text-muted-foreground">{formatBytes(item.file.size)}</p>
+                <p className="truncate text-paragraph-xs text-content-primary font-medium leading-[1.5]">
+                  {item.file.name}
+                </p>
+                <p className="text-paragraph-xxs text-content-tertiary leading-[1.5]">
+                  {formatBytes(item.file.size)}
+                </p>
               </div>
 
               {item.status === 'uploading' && (
-                <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                <div className="h-1 w-16 overflow-hidden rounded-full bg-overlay-medium">
                   <div
-                    className="h-full bg-primary transition-all"
+                    className="h-full bg-content-primary transition-all"
                     style={{ width: `${item.progress}%` }}
                   />
                 </div>
               )}
 
               {item.status === 'error' && (
-                <span className="text-xs text-destructive">{item.error}</span>
+                <span className="text-paragraph-xxs text-red-600">{item.error}</span>
               )}
 
               {!isUploading && (
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-8 w-8 shrink-0"
+                  className="h-[18px] w-[18px] shrink-0 p-0"
                   onClick={() => removeFile(item.id)}
                 >
-                  <X className="h-4 w-4" />
+                  <X className="h-[18px] w-[18px] text-content-primary" />
                 </Button>
               )}
             </div>
-          );
-        })}
-      </div>
+            {index < files.length - 1 && (
+              <div className="h-[0.5px] bg-border-medium" />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

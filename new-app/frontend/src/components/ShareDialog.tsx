@@ -1,10 +1,9 @@
 import React, { useState } from 'react';
-import { Copy, Check, Link2, Mail, QrCode, Trash2 } from 'lucide-react';
+import { ShieldCheck, Link as LinkIcon } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { cn, formatBytes, formatTimeLimit, copyToClipboard } from '@/lib/utils';
+import { cn, copyToClipboard } from '@/lib/utils';
 import { useAppStore, type UploadedFile } from '@/stores/app';
-import { deleteFile } from '@/lib/api';
 
 interface ShareDialogProps {
   file: UploadedFile;
@@ -13,8 +12,6 @@ interface ShareDialogProps {
 
 export function ShareDialog({ file, onClose }: ShareDialogProps) {
   const [copied, setCopied] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const { removeUploadedFile, addToast } = useAppStore();
 
   const shareUrl = `${file.url}#${file.secretKey}`;
 
@@ -26,97 +23,72 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
     }
   };
 
-  const handleDelete = async () => {
-    setDeleting(true);
-    try {
-      await deleteFile(file.id, file.ownerToken);
-      removeUploadedFile(file.id);
-      addToast({ title: 'File deleted', variant: 'success' });
-      onClose();
-    } catch (e) {
-      addToast({ title: 'Failed to delete file', variant: 'destructive' });
-    } finally {
-      setDeleting(false);
-    }
-  };
-
-  const timeUntilExpiry = Math.max(0, file.expiresAt.getTime() - Date.now()) / 1000;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
-      <Card className="w-full max-w-lg animate-slide-up" onClick={(e) => e.stopPropagation()}>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Link2 className="h-5 w-5" />
-            Share your file
-          </CardTitle>
-          <CardDescription>
-            Copy the link below to share your encrypted file
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {/* File info */}
-          <div className="rounded-lg bg-muted p-3">
-            <p className="font-medium truncate">{file.name}</p>
-            <div className="mt-1 flex items-center gap-3 text-sm text-muted-foreground">
-              <span>{formatBytes(file.size)}</span>
-              <span>•</span>
-              <span>Expires in {formatTimeLimit(timeUntilExpiry)}</span>
-              <span>•</span>
-              <span>{file.downloadLimit - file.downloadCount} downloads left</span>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-backdrop-fade-in"
+      onClick={onClose}
+    >
+      <div
+        className={cn("card-glass w-full max-w-[600px] p-card shadow-card animate-slide-up")}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-col items-center gap-5">
+          {/* Success Icon */}
+          <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-overlay-medium">
+            <ShieldCheck className="h-[22px] w-[22px] text-content-secondary" />
+          </div>
+
+          {/* Title and Description */}
+          <div className="flex flex-col items-center gap-2 text-center">
+            <h2 className="text-heading-xs text-content-primary">
+              Your file is encrypted and ready to send
+            </h2>
+            <p className="text-paragraph-xs text-content-secondary">
+              Copy the link to share your file <span className="font-medium">{file.name}</span>
+            </p>
+          </div>
+
+          {/* QR Code and Link */}
+          <div className="w-full bg-overlay-subtle border border-border-medium rounded-element p-4 flex flex-col gap-4">
+            {/* QR Code */}
+            <div className="bg-overlay-medium rounded-element p-6 flex justify-center">
+              <QRCodeSVG
+                value={shareUrl}
+                size={200}
+                bgColor="transparent"
+                fgColor="#f8f8f8"
+                level="H"
+              />
             </div>
-          </div>
 
-          {/* Share URL */}
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={shareUrl}
-              readOnly
-              className="flex-1 rounded-md border bg-background px-3 py-2 text-sm"
-            />
-            <Button onClick={handleCopy} className="shrink-0">
-              {copied ? (
-                <>
-                  <Check className="mr-2 h-4 w-4" />
-                  Copied
-                </>
-              ) : (
-                <>
-                  <Copy className="mr-2 h-4 w-4" />
-                  Copy
-                </>
-              )}
-            </Button>
-          </div>
+            {/* Share URL Input */}
+            <div className="flex gap-4 items-center">
+              <input
+                type="text"
+                value={shareUrl}
+                readOnly
+                className="flex-1 rounded-input border border-border-subtle bg-fill-input px-[14px] py-[6.5px] text-paragraph-sm text-content-primary"
+              />
+              {/*<img*/}
+              {/*  src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='46' height='45' viewBox='0 0 46 45'%3E%3Crect width='46' height='45' rx='4' fill='%23f8f8f8'/%3E%3C/svg%3E"*/}
+              {/*  alt="QR"*/}
+              {/*  className="h-[45px] w-[46px] rounded-input"*/}
+              {/*/>*/}
+            </div>
 
-          {/* Actions */}
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              className="flex-1"
-              onClick={() => {
-                window.open(
-                  `mailto:?subject=File shared with you&body=Download your file: ${encodeURIComponent(shareUrl)}`,
-                  '_blank'
-                );
-              }}
-            >
-              <Mail className="mr-2 h-4 w-4" />
-              Email
+            {/* Copy Link Button */}
+            <Button onClick={handleCopy} className="w-full">
+              <LinkIcon className="mr-2 h-[18px] w-[18px]" />
+              {copied ? 'Copied!' : 'Copy link'}
             </Button>
-            <Button
-              variant="destructive"
-              className="flex-1"
-              onClick={handleDelete}
-              disabled={deleting}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              {deleting ? 'Deleting...' : 'Delete'}
+
+            {/* Close Button */}
+            <Button variant="ghost" onClick={onClose} className="w-full">
+              Close
             </Button>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }

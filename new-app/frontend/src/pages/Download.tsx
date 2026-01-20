@@ -3,14 +3,12 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   Download,
   Lock,
-  Clock,
   FileIcon,
   AlertCircle,
   CheckCircle2,
   Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Keychain } from '@/lib/crypto';
 import { getMetadata, downloadFile, fileExists } from '@/lib/api';
@@ -103,151 +101,197 @@ export function DownloadPage() {
     }
   };
 
+  // Loading state
   if (state === 'loading') {
     return (
-      <div className="container flex min-h-[60vh] items-center justify-center py-8">
-        <div className="text-center">
-          <Loader2 className="mx-auto h-12 w-12 animate-spin text-primary" />
-          <p className="mt-4 text-muted-foreground">Loading file information...</p>
+      <div className="pt-24 pb-16 px-6">
+        <div className="max-w-main-card mx-auto">
+          <div className="card-glass p-card shadow-card">
+            <div className="relative z-10 flex flex-col items-center gap-5 py-8">
+              <Loader2 className="h-10 w-10 animate-spin text-content-primary" />
+              <p className="text-paragraph-sm text-content-secondary">Loading file information...</p>
+            </div>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Not found state
   if (state === 'not-found') {
     return (
-      <div className="container py-8">
-        <div className="mx-auto max-w-md">
-          <Card>
-            <CardHeader className="text-center">
-              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
-                <AlertCircle className="h-8 w-8 text-muted-foreground" />
+      <div className="pt-24 pb-16 px-6">
+        <div className="max-w-main-card mx-auto">
+          <div className="card-glass p-card shadow-card">
+            <div className="relative z-10 flex flex-col items-center gap-5">
+              {/* Icon */}
+              <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-overlay-medium">
+                <AlertCircle className="h-5 w-5 text-content-primary" />
               </div>
-              <CardTitle>File not found</CardTitle>
-              <CardDescription>
-                This file may have expired or been deleted.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
+
+              {/* Title and Description */}
+              <div className="flex flex-col items-center gap-2 text-center">
+                <h2 className="text-heading-xs text-content-primary">
+                  File not found
+                </h2>
+                <p className="text-paragraph-xs text-content-secondary">
+                  This file may have expired or been deleted.
+                </p>
+              </div>
+
+              {/* Action */}
               <Button className="w-full" onClick={() => navigate('/')}>
                 Upload a new file
               </Button>
-            </CardContent>
-          </Card>
+            </div>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Error state
   if (state === 'error') {
     return (
-      <div className="container py-8">
-        <div className="mx-auto max-w-md">
-          <Card>
-            <CardHeader className="text-center">
-              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-destructive/10">
-                <AlertCircle className="h-8 w-8 text-destructive" />
+      <div className="pt-24 pb-16 px-6">
+        <div className="max-w-main-card mx-auto">
+          <div className="card-glass p-card shadow-card">
+            <div className="relative z-10 flex flex-col items-center gap-5">
+              {/* Icon */}
+              <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-red-500/20">
+                <AlertCircle className="h-5 w-5 text-red-400" />
               </div>
-              <CardTitle>Download failed</CardTitle>
-              <CardDescription>{error || 'An error occurred'}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Button className="w-full" onClick={() => setState('ready')}>
-                Try again
-              </Button>
-              <Button variant="outline" className="w-full" onClick={() => navigate('/')}>
-                Upload a new file
-              </Button>
-            </CardContent>
-          </Card>
+
+              {/* Title and Description */}
+              <div className="flex flex-col items-center gap-2 text-center">
+                <h2 className="text-heading-xs text-content-primary">
+                  Download failed
+                </h2>
+                <p className="text-paragraph-xs text-content-secondary">
+                  {error || 'An error occurred while downloading the file.'}
+                </p>
+              </div>
+
+              {/* Actions */}
+              <div className="w-full flex flex-col gap-3">
+                <Button className="w-full" onClick={() => setState('ready')}>
+                  Try again
+                </Button>
+                <Button variant="outline" className="w-full" onClick={() => navigate('/')}>
+                  Upload a new file
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Complete state
   if (state === 'complete') {
     return (
-      <div className="container py-8">
-        <div className="mx-auto max-w-md">
-          <Card>
-            <CardHeader className="text-center">
-              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-100 dark:bg-green-900/20">
-                <CheckCircle2 className="h-8 w-8 text-green-600 dark:text-green-400" />
+      <div className="pt-24 pb-16 px-6">
+        <div className="max-w-main-card mx-auto">
+          <div className="card-glass p-card shadow-card">
+            <div className="relative z-10 flex flex-col items-center gap-5">
+              {/* Icon */}
+              <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-green-500/20">
+                <CheckCircle2 className="h-5 w-5 text-green-400" />
               </div>
-              <CardTitle>Download complete!</CardTitle>
-              <CardDescription>
-                Your file has been downloaded and decrypted successfully.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Button className="w-full" onClick={handleDownload}>
-                Download again
-              </Button>
-              <Button variant="outline" className="w-full" onClick={() => navigate('/')}>
-                Upload a new file
-              </Button>
-            </CardContent>
-          </Card>
+
+              {/* Title and Description */}
+              <div className="flex flex-col items-center gap-2 text-center">
+                <h2 className="text-heading-xs text-content-primary">
+                  Download complete!
+                </h2>
+                <p className="text-paragraph-xs text-content-secondary">
+                  Your file has been downloaded successfully.
+                </p>
+              </div>
+
+              {/* Actions */}
+              <div className="w-full flex flex-col gap-3">
+                <Button className="w-full" onClick={handleDownload}>
+                  Download again
+                </Button>
+                <Button variant="outline" className="w-full" onClick={() => navigate('/')}>
+                  Upload a new file
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Ready state (default) and Downloading state
   return (
-    <div className="container py-8">
-      <div className="mx-auto max-w-md">
-        <Card>
-          <CardHeader className="text-center">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-primary/10">
-              <FileIcon className="h-8 w-8 text-primary" />
+    <div className="pt-24 pb-16 px-6">
+      <div className="max-w-main-card mx-auto">
+        <div className="card-glass p-card shadow-card">
+          <div className="relative z-10 flex flex-col items-center gap-5">
+            {/* Icon */}
+            <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-overlay-medium">
+              <Download className="h-5 w-5 text-content-primary" />
             </div>
-            <CardTitle className="break-all">{metadata?.name}</CardTitle>
-            <CardDescription>
-              Someone shared a file with you
-            </CardDescription>
-          </CardHeader>
 
-          <CardContent className="space-y-4">
-            {/* File info */}
-            <div className="rounded-lg bg-muted p-4 space-y-2">
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Size</span>
-                <span className="font-medium">{formatBytes(metadata?.size || 0)}</span>
+            {/* Title and Description */}
+            <div className="flex flex-col items-center gap-2 text-center">
+              <h2 className="text-heading-xs text-content-primary">
+                Download files
+              </h2>
+              <p className="text-paragraph-xs text-content-secondary">
+                This file was shared securely via Slingshot Send.
+              </p>
+            </div>
+
+            {/* Encrypted Badge */}
+            {metadata?.encrypted && (
+              <div className="flex items-center gap-2 bg-overlay-subtle border border-border-medium rounded-element px-3 py-2">
+                <Lock className="h-4 w-4 text-content-primary" />
+                <span className="text-paragraph-xs text-content-primary">End-to-end encrypted</span>
               </div>
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Expires in</span>
-                <span className="font-medium flex items-center gap-1">
-                  <Clock className="h-4 w-4" />
-                  {formatTimeLimit(metadata?.ttl || 0)}
-                </span>
-              </div>
-              {metadata?.encrypted && (
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">Security</span>
-                  <span className="font-medium flex items-center gap-1 text-green-600 dark:text-green-400">
-                    <Lock className="h-4 w-4" />
-                    End-to-end encrypted
-                  </span>
+            )}
+
+            {/* File Info */}
+            <div className="w-full bg-overlay-subtle border border-border-medium rounded-element p-3">
+              <div className="flex items-center gap-[10px]">
+                <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded bg-overlay-medium">
+                  <FileIcon className="h-5 w-5 text-content-primary" />
                 </div>
-              )}
+                <div className="flex-1 min-w-0">
+                  <p className="truncate text-paragraph-sm text-content-primary font-medium">
+                    {metadata?.name}
+                  </p>
+                  <p className="text-paragraph-xs text-content-tertiary">
+                    {formatBytes(metadata?.size || 0)}
+                  </p>
+                </div>
+              </div>
             </div>
 
             {/* Download button or progress */}
             {state === 'downloading' ? (
-              <div className="space-y-3">
+              <div className="w-full space-y-3">
                 <Progress value={progress} className="h-2" />
-                <p className="text-center text-sm text-muted-foreground">
-                  Downloading and decrypting... {Math.round(progress)}%
+                <p className="text-center text-paragraph-xs text-content-secondary">
+                  Downloading{metadata?.encrypted ? ' and decrypting' : ''}... {Math.round(progress)}%
                 </p>
               </div>
             ) : (
-              <Button className="w-full" size="lg" onClick={handleDownload}>
-                <Download className="mr-2 h-5 w-5" />
-                Download file
+              <Button className="w-full" onClick={handleDownload}>
+                Download
               </Button>
             )}
-          </CardContent>
-        </Card>
+
+            {/* Expiration Notice */}
+            <p className="text-paragraph-xs text-content-tertiary text-center">
+              Expires after {metadata?.ttl ? formatTimeLimit(metadata.ttl) : '7 days'}.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -4,8 +4,28 @@ import { config } from './config';
 import { storage } from './storage';
 import { uploadRoutes } from './routes/upload';
 import { downloadRoutes } from './routes/download';
+import { logger } from './logger';
 
 const app = new Elysia()
+  // Request logging
+  .onRequest(({ request }) => {
+    const url = new URL(request.url);
+    logger.info({
+      method: request.method,
+      path: url.pathname,
+      query: url.search,
+    }, 'Incoming request');
+  })
+
+  .onAfterResponse(({ request, set }) => {
+    const url = new URL(request.url);
+    logger.info({
+      method: request.method,
+      path: url.pathname,
+      status: set.status || 200,
+    }, 'Request completed');
+  })
+
   // Enable CORS for frontend
   .use(cors({
     origin: config.env === 'development' ? true : config.baseUrl,
@@ -18,6 +38,7 @@ const app = new Elysia()
   // Health check endpoints
   .get('/__heartbeat__', async () => {
     const health = await storage.ping();
+    logger.debug({ health }, 'Health check');
     return {
       status: health.redis && health.s3 ? 'ok' : 'error',
       redis: health.redis,
@@ -56,7 +77,11 @@ const app = new Elysia()
 
   // Error handling
   .onError(({ code, error, set }) => {
-    console.error('Server error:', { code, error: error.message });
+    logger.error({
+      code,
+      error: error.message,
+      stack: error.stack,
+    }, 'Server error');
 
     if (code === 'NOT_FOUND') {
       set.status = 404;
@@ -75,6 +100,14 @@ const app = new Elysia()
   // Start server
   .listen(config.port);
 
+logger.info({
+  port: config.port,
+  env: config.env,
+  s3Endpoint: config.s3Endpoint,
+  s3Bucket: config.s3Bucket,
+  s3PathStyle: config.s3UsePathStyle,
+}, 'Server starting');
+
 console.log(`
   ╔══════════════════════════════════════╗
   ║        Bolter Backend Server         ║
@@ -86,8 +119,10 @@ console.log(`
 
 // Connect to Redis
 storage.redis.connect().then(() => {
+  logger.info('Connected to Redis');
   console.log('Connected to Redis');
 }).catch((err) => {
+  logger.error({ error: err }, 'Failed to connect to Redis');
   console.error('Failed to connect to Redis:', err);
 });
 

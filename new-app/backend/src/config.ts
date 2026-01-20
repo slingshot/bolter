@@ -1,4 +1,10 @@
 // Configuration for Bolter backend
+import {
+  UPLOAD_LIMITS,
+  TIME_LIMITS,
+  DOWNLOAD_LIMITS,
+  UI_DEFAULTS,
+} from '@bolter/shared';
 
 export interface Config {
   // S3 Configuration
@@ -7,10 +13,7 @@ export interface Config {
   s3UsePathStyle: boolean;
 
   // Redis Configuration
-  redisHost: string;
-  redisPort: number;
-  redisPassword: string;
-  redisUser: string;
+  redisUrl: string;
 
   // Server Configuration
   port: number;
@@ -46,10 +49,7 @@ export const config: Config = {
   s3UsePathStyle: process.env.S3_USE_PATH_STYLE_ENDPOINT === 'true',
 
   // Redis
-  redisHost: process.env.REDIS_HOST || 'localhost',
-  redisPort: parseInt(process.env.REDIS_PORT || '6379', 10),
-  redisPassword: process.env.REDIS_PASSWORD || '',
-  redisUser: process.env.REDIS_USER || '',
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 
   // Server
   port: parseInt(process.env.PORT || '3001', 10),
@@ -57,20 +57,20 @@ export const config: Config = {
   env: (process.env.NODE_ENV as Config['env']) || 'development',
 
   // Limits
-  maxFileSize: parseInt(process.env.MAX_FILE_SIZE || String(1024 * 1024 * 1024 * 2.5), 10), // 2.5GB
-  maxFilesPerArchive: parseInt(process.env.MAX_FILES_PER_ARCHIVE || '64', 10),
-  maxExpireSeconds: parseInt(process.env.MAX_EXPIRE_SECONDS || String(86400 * 7), 10), // 7 days
-  maxDownloads: parseInt(process.env.MAX_DOWNLOADS || '100', 10),
+  maxFileSize: parseInt(process.env.MAX_FILE_SIZE || String(UPLOAD_LIMITS.MAX_FILE_SIZE), 10),
+  maxFilesPerArchive: parseInt(process.env.MAX_FILES_PER_ARCHIVE || String(UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE), 10),
+  maxExpireSeconds: parseInt(process.env.MAX_EXPIRE_SECONDS || String(TIME_LIMITS.MAX_EXPIRE_SECONDS), 10),
+  maxDownloads: parseInt(process.env.MAX_DOWNLOADS || String(DOWNLOAD_LIMITS.MAX_DOWNLOADS), 10),
 
   // Defaults
-  defaultExpireSeconds: parseInt(process.env.DEFAULT_EXPIRE_SECONDS || '86400', 10), // 1 day
-  defaultDownloads: parseInt(process.env.DEFAULT_DOWNLOADS || '1', 10),
-  expireTimesSeconds: parseIntArray(process.env.EXPIRE_TIMES_SECONDS, [300, 3600, 86400, 604800]),
-  downloadCounts: parseIntArray(process.env.DOWNLOAD_COUNTS, [1, 2, 3, 4, 5, 20, 50, 100]),
+  defaultExpireSeconds: parseInt(process.env.DEFAULT_EXPIRE_SECONDS || String(TIME_LIMITS.DEFAULT_EXPIRE_SECONDS), 10),
+  defaultDownloads: parseInt(process.env.DEFAULT_DOWNLOADS || String(DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS), 10),
+  expireTimesSeconds: parseIntArray(process.env.EXPIRE_TIMES_SECONDS, [...TIME_LIMITS.EXPIRE_TIMES]),
+  downloadCounts: parseIntArray(process.env.DOWNLOAD_COUNTS, [...DOWNLOAD_LIMITS.DOWNLOAD_COUNTS]),
 
   // UI
-  customTitle: process.env.CUSTOM_TITLE || 'Bolter',
-  customDescription: process.env.CUSTOM_DESCRIPTION || 'Encrypt and send files with a link that automatically expires.',
+  customTitle: process.env.CUSTOM_TITLE || UI_DEFAULTS.TITLE,
+  customDescription: process.env.CUSTOM_DESCRIPTION || UI_DEFAULTS.DESCRIPTION,
 };
 
 export function deriveBaseUrl(request: Request): string {

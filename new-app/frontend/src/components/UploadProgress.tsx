@@ -2,7 +2,7 @@ import React from 'react';
 import { X, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
-import { cn, formatBytes, formatSpeed, formatDuration } from '@/lib/utils';
+import { formatBytes, formatSpeed, formatDuration } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
 export function UploadProgress() {
@@ -15,11 +15,11 @@ export function UploadProgress() {
   };
 
   return (
-    <div className="mt-6 rounded-lg border bg-card p-6">
+    <div className="mt-6 bg-overlay-subtle border border-border-medium rounded-element p-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Loader2 className="h-5 w-5 animate-spin text-primary" />
-          <span className="font-medium">Uploading...</span>
+          <Loader2 className="h-5 w-5 animate-spin text-content-primary" />
+          <span className="text-paragraph-sm font-medium text-content-primary">Uploading...</span>
         </div>
         <Button variant="ghost" size="sm" onClick={handleCancel}>
           <X className="mr-2 h-4 w-4" />
@@ -35,7 +35,7 @@ export function UploadProgress() {
         />
       </div>
 
-      <div className="mt-3 flex items-center justify-between text-sm text-muted-foreground">
+      <div className="mt-3 flex items-center justify-between text-paragraph-xs text-content-secondary">
         <div className="flex items-center gap-4">
           <span>
             {formatBytes(uploadProgress.loaded)} / {formatBytes(uploadProgress.total)}

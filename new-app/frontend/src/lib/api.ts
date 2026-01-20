@@ -130,19 +130,57 @@ export async function getMetadata(id: string, keychain?: Keychain) {
   const data = await response.json();
   let metadata;
 
+  console.log('[getMetadata] Response:', {
+    encrypted: data.encrypted,
+    hasKeychain: !!keychain,
+    metadataLength: data.metadata?.length,
+    metadataPreview: data.metadata?.substring(0, 50),
+  });
+
   if (data.encrypted !== false && keychain) {
-    metadata = await keychain.decryptMetadata(b64ToArray(data.metadata));
-  } else {
-    // Unencrypted metadata
+    // Encrypted metadata - decrypt it
+    console.log('[getMetadata] Decrypting metadata');
     try {
-      metadata = JSON.parse(decodeURIComponent(escape(atob(data.metadata))));
-    } catch {
-      metadata = JSON.parse(atob(data.metadata));
+      metadata = await keychain.decryptMetadata(b64ToArray(data.metadata));
+      console.log('[getMetadata] Decryption successful:', metadata);
+    } catch (e) {
+      console.error('[getMetadata] Decryption failed:', e);
+      throw e;
+    }
+  } else {
+    // Unencrypted metadata - decode from base64
+    console.log('[getMetadata] Decoding unencrypted metadata');
+    try {
+      // Handle URL-safe base64 by converting to standard base64
+      const standardB64 = data.metadata
+        .replace(/-/g, '+')
+        .replace(/_/g, '/');
+      // Add padding if needed
+      const padded = standardB64 + '==='.slice(0, (4 - (standardB64.length % 4)) % 4);
+
+      const decoded = atob(padded);
+      try {
+        // Try UTF-8 decoding first
+        metadata = JSON.parse(decodeURIComponent(escape(decoded)));
+      } catch {
+        // Fallback to direct parse
+        metadata = JSON.parse(decoded);
+      }
+      console.log('[getMetadata] Decode successful:', metadata);
+    } catch (e) {
+      console.error('[getMetadata] Decode failed:', e, 'metadata:', data.metadata);
+      throw e;
     }
   }
 
+  // Extract first file info for convenience (UI expects name/size at root)
+  const firstFile = metadata.files?.[0];
+
   return {
     ...metadata,
+    name: firstFile?.name || metadata.name || 'download',
+    size: firstFile?.size || metadata.size || 0,
+    type: firstFile?.type || metadata.type || 'application/octet-stream',
     ttl: data.ttl,
     encrypted: data.encrypted !== false,
   };
@@ -291,9 +329,13 @@ export async function uploadFiles(
 
   const completeInfo = await completeResponse.json();
 
+  // Always use frontend origin for download URL (backend may return its own URL)
+  // Don't include hash here - ShareDialog will append the secretKey
+  const downloadUrl = `${window.location.origin}/download/${uploadInfo.id}`;
+
   return {
     id: uploadInfo.id,
-    url: completeInfo.url || uploadInfo.completeUrl || `${window.location.origin}/download/${uploadInfo.id}`,
+    url: downloadUrl,
     ownerToken: uploadInfo.owner,
     duration: Date.now() - startTime,
   };

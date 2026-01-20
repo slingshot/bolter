@@ -1,6 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { storage } from '../storage';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
+import { downloadLogger as logger } from '../logger';
 
 export const downloadRoutes = new Elysia({ prefix: '/api' })
   // Get download URL (with optional pre-signed URL for direct download)
@@ -146,11 +147,22 @@ export const downloadRoutes = new Elysia({ prefix: '/api' })
     const { id } = params;
     const authHeader = headers.authorization || null;
 
+    logger.info({ id }, 'Metadata request received');
+
     const metadata = await storage.getMetadata(id);
     if (!metadata) {
+      logger.warn({ id }, 'File not found');
       set.status = 404;
       return { error: 'File not found' };
     }
+
+    logger.debug({
+      id,
+      encrypted: metadata.encrypted,
+      hasMetadata: !!metadata.metadata,
+      metadataLength: metadata.metadata?.length,
+      metadataPreview: metadata.metadata?.substring(0, 100),
+    }, 'File metadata loaded');
 
     // Verify authentication for encrypted files
     if (metadata.encrypted) {
@@ -158,18 +170,29 @@ export const downloadRoutes = new Elysia({ prefix: '/api' })
       set.headers['WWW-Authenticate'] = `send-v1 ${nonce}`;
 
       if (!valid) {
+        logger.warn({ id }, 'Authentication failed');
         set.status = 401;
         return { error: 'Authentication required' };
       }
+      logger.debug({ id }, 'Authentication successful');
     }
 
     const ttl = await storage.getTTL(id);
 
-    return {
+    const response = {
       metadata: metadata.metadata || '',
       ttl,
       encrypted: metadata.encrypted,
     };
+
+    logger.info({
+      id,
+      ttl,
+      encrypted: metadata.encrypted,
+      responseMetadataLength: response.metadata.length,
+    }, 'Returning metadata response');
+
+    return response;
   })
 
   // Check if file exists

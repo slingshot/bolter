@@ -9,11 +9,7 @@ export class RedisStorage {
     if (this.client || this.connecting) return;
     this.connecting = true;
 
-    const url = config.redisPassword
-      ? `redis://${config.redisUser ? config.redisUser + ':' : ''}${config.redisPassword}@${config.redisHost}:${config.redisPort}`
-      : `redis://${config.redisHost}:${config.redisPort}`;
-
-    this.client = createClient({ url });
+    this.client = createClient({ url: config.redisUrl });
 
     this.client.on('error', (err) => {
       console.error('Redis Client Error:', err);

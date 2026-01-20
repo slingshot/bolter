@@ -1,7 +1,8 @@
 import React, { useCallback, useState } from 'react';
-import { Upload, FileIcon } from 'lucide-react';
+import { ArrowUpFromLine } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
+import { UPLOAD_LIMITS, BYTES } from '@bolter/shared';
 
 export function DropZone() {
   const [isDragging, setIsDragging] = useState(false);
@@ -52,16 +53,18 @@ export function DropZone() {
     [addFiles]
   );
 
-  const maxSize = config?.maxFileSize || 2.5 * 1024 * 1024 * 1024;
-  const maxSizeDisplay = Math.round(maxSize / (1024 * 1024 * 1024) * 10) / 10;
+  const maxSize = config?.maxFileSize || UPLOAD_LIMITS.MAX_FILE_SIZE;
+  const maxSizeDisplay = maxSize >= BYTES.TB
+    ? Math.round(maxSize / BYTES.TB * 10) / 10
+    : Math.round(maxSize / BYTES.GB * 10) / 10;
 
   return (
     <div
       className={cn(
-        'relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-12 transition-all duration-200',
+        'relative flex flex-col items-center justify-center rounded-element border-2 border-dashed px-[16px] py-[20px] transition-all duration-200',
         isDragging
-          ? 'border-primary bg-primary/5 scale-[1.02]'
-          : 'border-border hover:border-primary/50 hover:bg-muted/50'
+          ? 'border-border-medium bg-overlay-medium'
+          : 'border-border-subtle bg-overlay-subtle hover:border-border-medium hover:bg-overlay-medium'
       )}
       onDragEnter={handleDragIn}
       onDragLeave={handleDragOut}
@@ -76,33 +79,16 @@ export function DropZone() {
         id="file-input"
       />
 
-      <div
-        className={cn(
-          'flex h-16 w-16 items-center justify-center rounded-full transition-colors',
-          isDragging ? 'bg-primary/20' : 'bg-muted'
-        )}
-      >
-        {isDragging ? (
-          <FileIcon className="h-8 w-8 text-primary animate-pulse" />
-        ) : (
-          <Upload className="h-8 w-8 text-muted-foreground" />
-        )}
-      </div>
+      <ArrowUpFromLine className="h-5 w-5 text-content-primary mb-2" />
 
-      <h3 className="mt-6 text-lg font-semibold">
-        {isDragging ? 'Drop files here' : 'Drag & drop files'}
-      </h3>
-      <p className="mt-2 text-sm text-muted-foreground">
-        or click to browse your files
-      </p>
-
-      <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
-        <span className="rounded bg-muted px-2 py-1">
-          Max {maxSizeDisplay}GB per upload
-        </span>
-        <span className="rounded bg-muted px-2 py-1">
-          End-to-end encrypted
-        </span>
+      <div className="flex flex-col items-center gap-0.5">
+        <p className="text-paragraph-sm text-content-primary font-medium text-center">
+          Drag files or folders here or{' '}
+          <span className="underline decoration-solid cursor-pointer">select files</span>
+        </p>
+        <p className="text-paragraph-xs text-content-secondary">
+          Send up to {maxSizeDisplay}{maxSize >= BYTES.TB ? 'TB' : 'GB'}
+        </p>
       </div>
     </div>
   );
