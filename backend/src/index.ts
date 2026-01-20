@@ -1,3 +1,11 @@
+import * as Sentry from '@sentry/bun';
+
+Sentry.init({
+  dsn: 'https://00f833cbba29efddfb9f8fe04eb9c5a6@glitch.slingshot.fm/6',
+  // Tracing
+  tracesSampleRate: 1.0,
+});
+
 import { Elysia } from 'elysia';
 import { cors } from '@elysiajs/cors';
 import { config } from './config';

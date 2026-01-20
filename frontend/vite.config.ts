@@ -1,5 +1,6 @@
 import { defineConfig, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { sentryVitePlugin } from '@sentry/vite-plugin';
 import path from 'path';
 import { UI_DEFAULTS } from '@bolter/shared';
 
@@ -19,7 +20,16 @@ function htmlConfigPlugin(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), htmlConfigPlugin()],
+  plugins: [
+    react(),
+    htmlConfigPlugin(),
+    sentryVitePlugin({
+      url: 'https://glitch.slingshot.fm',
+      org: process.env.SENTRY_ORG,
+      project: process.env.SENTRY_PROJECT,
+      authToken: process.env.SENTRY_AUTH_TOKEN,
+    }),
+  ],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
