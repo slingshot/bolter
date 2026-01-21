@@ -1,0 +1,41 @@
+# Slingshot Send
+
+> Open source, end-to-end encrypted file sharing
+
+Slingshot Send is an open source, secure file sharing application that enables users to share files with true end-to-end encryption. Files are encrypted client-side before upload, and encryption keys are never sent to the server.
+
+## Key Features
+
+- **End-to-End Encryption**: Files are encrypted in your browser using AES-GCM before upload
+- **Zero-Knowledge**: Encryption keys are embedded in shareable URLs (hash fragment) and never transmitted to the server
+- **Large File Support**: Upload files up to 1TB via multipart uploads
+- **Expiring Links**: Set time-based expiration (1 hour to 30 days) and download limits
+- **No Account Required**: Share files instantly without registration
+- **Direct Downloads**: Files are downloaded directly from cloud storage for speed
+
+## How It Works
+
+1. Select a file to upload
+2. The file is encrypted in your browser using AES-GCM with a randomly generated key
+3. The encrypted file is uploaded directly to cloud storage
+4. You receive a shareable link containing the decryption key in the URL hash
+5. Recipients download and decrypt the file entirely in their browser
+
+## Privacy
+
+- Encryption keys never leave your browser (stored in URL hash fragment)
+- Server only sees encrypted data
+- Metadata is stored with TTL and automatically deleted
+- No tracking, no accounts, no logs of file contents
+
+## Technical Details
+
+- Encryption: AES-256-GCM with HKDF key derivation
+- Frontend: React + TypeScript + Vite
+- Backend: Elysia (Bun) + Redis + S3-compatible storage
+- All cryptographic operations use the Web Crypto API
+
+## Links
+
+- Website: https://send.fm
+- Source: https://github.com/slingshot/bolter

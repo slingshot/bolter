@@ -1,0 +1,8 @@
+# Robots.txt for Slingshot Send
+
+User-agent: *
+Allow: /
+Disallow: /download/
+
+# Sitemaps
+Sitemap: https://send.fm/sitemap.xml
