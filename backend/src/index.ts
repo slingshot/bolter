@@ -98,6 +98,12 @@ const app = new Elysia()
     };
   })
 
+  // Disallow all crawlers for API
+  .get('/robots.txt', ({ set }) => {
+    set.headers['content-type'] = 'text/plain';
+    return 'User-agent: *\nDisallow: /';
+  })
+
   // Client configuration
   .get('/config', () => ({
     LIMITS: {
