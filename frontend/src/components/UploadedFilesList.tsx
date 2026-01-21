@@ -120,7 +120,7 @@ export function UploadedFilesList() {
                       variant="ghost"
                       size="icon"
                       className="h-7 w-7 p-0"
-                      onClick={() => clearUploadedFiles()}
+                      onClick={() => removeUploadedFile(file.id)}
                     >
                       <X className="h-4 w-4 text-content-primary" />
                     </Button>
