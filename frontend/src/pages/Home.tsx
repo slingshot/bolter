@@ -143,7 +143,7 @@ export function HomePage() {
             Send files privately
           </h1>
           <p className="text-paragraph-xs text-content-secondary max-w-[600px] mx-auto">
-            Slingshot Select lets you share files securely with links that automatically expire. Your files can be end-to-end encrypted, so only you and the people you share with can access them—not us, not AI companies, not anyone else.
+            Slingshot Send lets you share files securely with links that automatically expire. Your files can be end-to-end encrypted, so only you and the people you share with can access them—not us, not AI companies, not anyone else.
           </p>
         </div>
 
