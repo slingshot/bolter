@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { Keychain } from '@/lib/crypto';
-import { Canceller, type UploadProgress } from '@/lib/api';
+import { Canceller, deleteFile, type UploadProgress } from '@/lib/api';
 
 export interface FileItem {
   id: string;
@@ -140,6 +140,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
   removeUploadedFile: (id) => {
+    // Find the file to get its owner token for S3 deletion
+    const file = get().uploadedFiles.find((f) => f.id === id);
+    if (file) {
+      // Delete from S3 in the background (don't block UI)
+      deleteFile(id, file.ownerToken).catch((err) => {
+        console.warn('Failed to delete file from server:', err);
+      });
+    }
+
     set((state) => {
       const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
       saveUploadedFiles(newFiles);
@@ -156,6 +165,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
   clearUploadedFiles: () => {
+    // Delete all files from S3 in the background
+    const files = get().uploadedFiles;
+    for (const file of files) {
+      deleteFile(file.id, file.ownerToken).catch((err) => {
+        console.warn('Failed to delete file from server:', err);
+      });
+    }
+
     localStorage.removeItem('uploadedFiles');
     set({ uploadedFiles: [] });
   },
