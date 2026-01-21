@@ -90,8 +90,10 @@ export const uploadRoutes = new Elysia()
       config.maxExpireSeconds
     );
     const prefix = Math.max(Math.floor(expireSeconds / 86400), 1);
+    // Calculate object expiration date for S3 lifecycle
+    const objectExpires = new Date(Date.now() + expireSeconds * 1000);
 
-    logger.debug({ requestId, id, expireSeconds, prefix }, 'Calculated expiration');
+    logger.debug({ requestId, id, expireSeconds, prefix, objectExpires }, 'Calculated expiration');
 
     // Store initial metadata
     logger.debug({ requestId, id }, 'Storing initial metadata in Redis');
@@ -127,7 +129,7 @@ export const uploadRoutes = new Elysia()
       // Create multipart upload
       logger.info({ requestId, id }, 'Creating multipart upload');
       const multipartStartTime = Date.now();
-      const uploadId = await storage.createMultipartUpload(id);
+      const uploadId = await storage.createMultipartUpload(id, objectExpires);
       const multipartDuration = Date.now() - multipartStartTime;
 
       if (!uploadId) {
@@ -216,7 +218,7 @@ export const uploadRoutes = new Elysia()
       // Single part upload
       logger.info({ requestId, id }, 'Generating single upload URL');
       const singleUrlStartTime = Date.now();
-      const uploadUrl = await storage.getSignedUploadUrl(id);
+      const uploadUrl = await storage.getSignedUploadUrl(id, objectExpires);
       const singleUrlDuration = Date.now() - singleUrlStartTime;
 
       logger.info({

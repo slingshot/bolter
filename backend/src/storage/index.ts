@@ -23,9 +23,9 @@ export const storage = {
   redis,
 
   // S3 operations
-  async getSignedUploadUrl(id: string): Promise<string | null> {
+  async getSignedUploadUrl(id: string, objectExpires?: Date): Promise<string | null> {
     try {
-      return await s3Storage.getSignedUploadUrl(id);
+      return await s3Storage.getSignedUploadUrl(id, 3600, objectExpires);
     } catch (e) {
       console.error('Failed to get signed upload URL:', e);
       return null;
@@ -41,9 +41,9 @@ export const storage = {
     }
   },
 
-  async createMultipartUpload(id: string): Promise<string | null> {
+  async createMultipartUpload(id: string, objectExpires?: Date): Promise<string | null> {
     try {
-      return await s3Storage.createMultipartUpload(id);
+      return await s3Storage.createMultipartUpload(id, objectExpires);
     } catch (e) {
       console.error('Failed to create multipart upload:', e);
       return null;

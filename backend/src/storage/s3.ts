@@ -109,13 +109,14 @@ export class S3Storage {
     return url;
   }
 
-  async getSignedUploadUrl(id: string, expiresIn = 3600): Promise<string> {
-    logger.debug({ id, expiresIn }, 'Generating signed upload URL');
+  async getSignedUploadUrl(id: string, expiresIn = 3600, objectExpires?: Date): Promise<string> {
+    logger.debug({ id, expiresIn, objectExpires }, 'Generating signed upload URL');
     const startTime = Date.now();
 
     const command = new PutObjectCommand({
       Bucket: this.bucket,
       Key: id,
+      ...(objectExpires && { Expires: objectExpires }),
     });
 
     logger.debug({
@@ -143,14 +144,15 @@ export class S3Storage {
     }
   }
 
-  async createMultipartUpload(id: string): Promise<string> {
-    logger.info({ id, bucket: this.bucket }, 'Creating multipart upload');
+  async createMultipartUpload(id: string, objectExpires?: Date): Promise<string> {
+    logger.info({ id, bucket: this.bucket, objectExpires }, 'Creating multipart upload');
     const startTime = Date.now();
 
     try {
       const result = await this.s3.send(new CreateMultipartUploadCommand({
         Bucket: this.bucket,
         Key: id,
+        ...(objectExpires && { Expires: objectExpires }),
       }));
       const duration = Date.now() - startTime;
 
