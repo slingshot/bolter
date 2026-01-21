@@ -12,6 +12,7 @@ import { config } from './config';
 import { storage } from './storage';
 import { uploadRoutes } from './routes/upload';
 import { downloadRoutes } from './routes/download';
+import { plausibleRoutes } from './routes/plausible';
 import { logger } from './logger';
 
 const app = new Elysia()
@@ -120,6 +121,7 @@ const app = new Elysia()
   // Mount API routes
   .use(uploadRoutes)
   .use(downloadRoutes)
+  .use(plausibleRoutes)
 
   // Error handling
   .onError(({ code, error, set }) => {

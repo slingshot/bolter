@@ -13,6 +13,7 @@ import { useAppStore, type UploadedFile } from '@/stores/app';
 import { Keychain } from '@/lib/crypto';
 import { uploadFiles, Canceller } from '@/lib/api';
 import { formatBytes } from '@/lib/utils';
+import { trackUpload } from '@/lib/plausible';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 
 export function HomePage() {
@@ -87,6 +88,7 @@ export function HomePage() {
       };
 
       addUploadedFile(uploaded);
+      trackUpload({ fileSize: uploaded.size, encrypted });
       setUploadedFile(uploaded);
       clearFiles();
 

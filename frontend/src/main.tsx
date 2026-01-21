@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import * as Sentry from '@sentry/react';
+import './lib/plausible'; // Initialize Plausible (auto pageviews enabled by default)
 import App from './App';
 import './index.css';
 

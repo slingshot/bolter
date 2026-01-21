@@ -15,6 +15,7 @@ import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Keychain } from '@/lib/crypto';
 import { getMetadata, downloadFile, fileExists, checkLegacyFile, getDownloadStatus, API_BASE_URL } from '@/lib/api';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
+import { trackDownload } from '@/lib/plausible';
 import { useDocumentMeta } from '@/hooks/useDocumentMeta';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
@@ -156,6 +157,7 @@ export function DownloadPage() {
         if (status) {
           setDownloadsLeft(status.dlimit - status.dl);
         }
+        trackDownload({ fileId: id });
         setState('complete');
       }, 1500);
       return;
@@ -184,6 +186,7 @@ export function DownloadPage() {
       if (status) {
         setDownloadsLeft(status.dlimit - status.dl);
       }
+      trackDownload({ fileId: id });
       setState('complete');
     } catch (e: any) {
       console.error('Download failed:', e);
