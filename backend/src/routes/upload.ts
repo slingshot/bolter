@@ -424,6 +424,155 @@ export const uploadRoutes = new Elysia()
     }),
   })
 
+  // Check upload status (for resume)
+  .post('/upload/status/:id', async ({ params, body }) => {
+    const { id } = params;
+    const { ownerToken } = body;
+    const requestId = randomBytes(4).toString('hex');
+
+    logger.info({ requestId, id }, 'Upload status check request received');
+
+    if (!ownerToken) {
+      logger.warn({ requestId, id }, 'Missing owner token');
+      return { valid: false, reason: 'Missing owner token' };
+    }
+
+    try {
+      const metadata = await storage.getMetadata(id);
+
+      if (!metadata) {
+        logger.warn({ requestId, id }, 'Upload not found');
+        return { valid: false, reason: 'Upload not found' };
+      }
+
+      if (metadata.owner !== ownerToken) {
+        logger.warn({ requestId, id }, 'Invalid owner token');
+        return { valid: false, reason: 'Invalid owner token' };
+      }
+
+      // Check if it's still a multipart upload in progress
+      if (!metadata.multipart || !metadata.uploadId) {
+        logger.info({ requestId, id }, 'Upload already completed or not multipart');
+        return { valid: false, reason: 'Upload already completed or not resumable' };
+      }
+
+      logger.info({ requestId, id }, 'Upload is valid for resume');
+      return {
+        valid: true,
+        uploadId: metadata.uploadId,
+        numParts: metadata.numParts,
+      };
+    } catch (e: any) {
+      logger.error({ requestId, id, error: e }, 'Failed to check upload status');
+      return { valid: false, reason: 'Internal error' };
+    }
+  }, {
+    body: t.Object({
+      ownerToken: t.String(),
+    }),
+  })
+
+  // Get fresh presigned URLs for resuming upload
+  .post('/upload/resume/:id', async ({ params, body }) => {
+    const { id } = params;
+    const { ownerToken, completedParts } = body;
+    const requestId = randomBytes(4).toString('hex');
+
+    logger.info({
+      requestId,
+      id,
+      completedPartsCount: completedParts?.length,
+    }, 'Resume upload request received');
+
+    if (!ownerToken) {
+      logger.warn({ requestId, id }, 'Missing owner token');
+      return { error: 'Missing owner token' };
+    }
+
+    try {
+      const metadata = await storage.getMetadata(id);
+
+      if (!metadata) {
+        logger.warn({ requestId, id }, 'Upload not found');
+        return { error: 'Upload not found', status: 404 };
+      }
+
+      if (metadata.owner !== ownerToken) {
+        logger.warn({ requestId, id }, 'Invalid owner token');
+        return { error: 'Invalid owner token', status: 403 };
+      }
+
+      if (!metadata.multipart || !metadata.uploadId) {
+        logger.warn({ requestId, id }, 'Upload not resumable');
+        return { error: 'Upload not resumable', status: 400 };
+      }
+
+      const uploadId = metadata.uploadId;
+      const numParts = parseInt(metadata.numParts || '0', 10);
+      const fileSize = parseInt(metadata.fileSize || '0', 10);
+      const { partSize } = calculateOptimalPartSize(fileSize);
+
+      // Calculate which parts still need to be uploaded
+      const completedSet = new Set(completedParts || []);
+      const remainingParts: number[] = [];
+      for (let i = 1; i <= numParts; i++) {
+        if (!completedSet.has(i)) {
+          remainingParts.push(i);
+        }
+      }
+
+      logger.info({
+        requestId,
+        id,
+        uploadId,
+        numParts,
+        completedCount: completedParts?.length || 0,
+        remainingCount: remainingParts.length,
+      }, 'Generating fresh presigned URLs for resume');
+
+      // Generate fresh presigned URLs for remaining parts
+      const urls: Record<number, string> = {};
+      const BATCH_SIZE = 100;
+
+      for (let batchStart = 0; batchStart < remainingParts.length; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, remainingParts.length);
+        const batchPromises: Promise<void>[] = [];
+
+        for (let i = batchStart; i < batchEnd; i++) {
+          const partNum = remainingParts[i];
+          batchPromises.push(
+            storage.getSignedMultipartUploadUrl(id, uploadId, partNum).then((url) => {
+              urls[partNum] = url;
+            })
+          );
+        }
+
+        await Promise.all(batchPromises);
+      }
+
+      logger.info({
+        requestId,
+        id,
+        urlsGenerated: Object.keys(urls).length,
+      }, 'Resume URLs generated successfully');
+
+      return {
+        urls,
+        uploadId,
+        partSize,
+        totalParts: numParts,
+      };
+    } catch (e: any) {
+      logger.error({ requestId, id, error: e }, 'Failed to generate resume URLs');
+      return { error: 'Failed to generate resume URLs', status: 500 };
+    }
+  }, {
+    body: t.Object({
+      ownerToken: t.String(),
+      completedParts: t.Optional(t.Array(t.Number())),
+    }),
+  })
+
   // Abort multipart upload
   .post('/upload/abort/:id', async ({ params, body }) => {
     const { id } = params;

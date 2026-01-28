@@ -400,3 +400,108 @@ export function calculateEncryptedSize(plaintextSize: number): number {
   const overhead = numRecords * (TAG_LENGTH + 1); // Tag + delimiter per record
   return plaintextSize + overhead;
 }
+
+/**
+ * Encrypted record size (plaintext record + tag + delimiter)
+ */
+export const ENCRYPTED_RECORD_SIZE = ECE_RECORD_SIZE + TAG_LENGTH + 1; // 65,553 bytes
+
+/**
+ * Calculate part-aligned size for resumable uploads
+ * Ensures part boundaries fall on encryption record boundaries
+ */
+export function calculateAlignedPartSize(targetSize: number): number {
+  const recordsPerPart = Math.floor(targetSize / ENCRYPTED_RECORD_SIZE);
+  return recordsPerPart * ENCRYPTED_RECORD_SIZE;
+}
+
+/**
+ * Calculate the record count for a given byte offset
+ * Used to resume encryption from a specific position
+ */
+export function calculateRecordCount(encryptedByteOffset: number): number {
+  return Math.floor(encryptedByteOffset / ENCRYPTED_RECORD_SIZE);
+}
+
+/**
+ * Create encryption transform stream that starts from a specific record count
+ * Used for resuming uploads from a specific part
+ */
+export function createResumableEncryptionStream(
+  keychain: Keychain,
+  startRecordCount: number
+): TransformStream<Uint8Array, Uint8Array> {
+  let recordCount = startRecordCount;
+  let buffer = new Uint8Array(0);
+  let encryptionKey: CryptoKey;
+
+  return new TransformStream({
+    async start() {
+      encryptionKey = await keychain.getEncryptionKey();
+    },
+
+    async transform(chunk, controller) {
+      // Accumulate data into buffer
+      const newBuffer = new Uint8Array(buffer.length + chunk.length);
+      newBuffer.set(buffer);
+      newBuffer.set(chunk, buffer.length);
+      buffer = newBuffer;
+
+      // Process complete records
+      while (buffer.length >= ECE_RECORD_SIZE) {
+        const record = buffer.slice(0, ECE_RECORD_SIZE);
+        buffer = buffer.slice(ECE_RECORD_SIZE);
+
+        const encrypted = await encryptRecordAtCount(encryptionKey, record, recordCount, false);
+        controller.enqueue(encrypted);
+        recordCount++;
+      }
+    },
+
+    async flush(controller) {
+      // Encrypt final record (may be less than ECE_RECORD_SIZE)
+      if (buffer.length > 0) {
+        const encrypted = await encryptRecordAtCount(encryptionKey, buffer, recordCount, true);
+        controller.enqueue(encrypted);
+      }
+    },
+  });
+}
+
+/**
+ * Encrypt a single record at a specific counter position
+ */
+async function encryptRecordAtCount(
+  key: CryptoKey,
+  data: Uint8Array,
+  counter: number,
+  isFinal: boolean
+): Promise<Uint8Array> {
+  // Generate nonce from counter
+  const nonce = new Uint8Array(NONCE_LENGTH);
+  const view = new DataView(nonce.buffer);
+  view.setUint32(0, counter, false);
+  if (isFinal) {
+    nonce[0] |= 0x80; // Set final record flag
+  }
+
+  // Add delimiter byte
+  const paddedData = new Uint8Array(data.length + 1);
+  paddedData.set(data);
+  paddedData[data.length] = isFinal ? 2 : 1; // Delimiter
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: nonce, tagLength: TAG_LENGTH * 8 },
+    key,
+    paddedData
+  );
+
+  return new Uint8Array(encrypted);
+}
+
+/**
+ * Get the raw secret key bytes from a Keychain
+ */
+export function getSecretKeyBytes(keychain: Keychain): Uint8Array {
+  return b64ToArray(keychain.secretKeyB64);
+}

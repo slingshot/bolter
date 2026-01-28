@@ -9,7 +9,9 @@ import { UploadSettings } from '@/components/UploadSettings';
 import { UploadProgress } from '@/components/UploadProgress';
 import { UploadedFilesList } from '@/components/UploadedFilesList';
 import { ShareDialog } from '@/components/ShareDialog';
+import { RecoveryBanner } from '@/components/RecoveryBanner';
 import { useAppStore, type UploadedFile } from '@/stores/app';
+import { useRecoverableSessions } from '@/hooks/useRecoverableSessions';
 import { Keychain } from '@/lib/crypto';
 import { uploadFiles, Canceller } from '@/lib/api';
 import { formatBytes } from '@/lib/utils';
@@ -21,6 +23,15 @@ export function HomePage() {
   const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
   const [filesExpanded, setFilesExpanded] = useState(true);
   const [securityExpanded, setSecurityExpanded] = useState(true);
+
+  // Check for recoverable upload sessions
+  const {
+    sessions: recoverableSessions,
+    loading: loadingRecovery,
+    discardSession,
+    discardAllSessions,
+    refresh: refreshRecovery,
+  } = useRecoverableSessions();
 
   const {
     files,
@@ -148,6 +159,16 @@ export function HomePage() {
             Slingshot Send lets you share files securely with links that automatically expire. Your files can be end-to-end encrypted, so only you and the people you share with can access them—not us, not AI companies, not anyone else.
           </p>
         </div>
+
+        {/* Recovery Banner for interrupted uploads */}
+        {!loadingRecovery && recoverableSessions.length > 0 && !isUploading && (
+          <RecoveryBanner
+            sessions={recoverableSessions}
+            onDiscard={discardSession}
+            onDiscardAll={discardAllSessions}
+            onRefresh={refreshRecovery}
+          />
+        )}
 
         {/* Main Card */}
         <div className="card-glass p-card shadow-card">

@@ -3,8 +3,9 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
+import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream, createResumableEncryptionStream, calculateRecordCount, ENCRYPTED_RECORD_SIZE } from './crypto';
 import { sliceConcatenatedData, createZipFromFiles, createZipFromUploadFiles, createStreamingZip, generateZipFilename, type FileInfo } from './zip';
+import { uploadStorage, createSession as createUploadSession, type UploadSession } from './uploadStorage';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -75,6 +76,13 @@ interface UploadUrlResponse {
   partSize?: number;
   url: string;
   completeUrl?: string;
+}
+
+interface ResumeUrlsResponse {
+  urls: Record<number, string>;
+  uploadId: string;
+  partSize: number;
+  totalParts: number;
 }
 
 export class Canceller {
@@ -398,6 +406,43 @@ export async function uploadFiles(
     throw new Error('Pre-signed URLs not available');
   }
 
+  // Save upload session for resumability (multipart only)
+  let uploadSession: UploadSession | null = null;
+  if (uploadInfo.multipart && uploadInfo.uploadId && uploadInfo.parts) {
+    const fileList = files.map(f => ({
+      name: f.name,
+      size: f.size,
+      type: f.type || 'application/octet-stream',
+      lastModified: f.lastModified,
+    }));
+
+    uploadSession = createUploadSession({
+      id: uploadInfo.id,
+      uploadId: uploadInfo.uploadId,
+      fileName: isMultiFile ? (zipFilename || 'files.zip') : files[0].name,
+      fileSize: plainSize,
+      encryptedSize: totalSize,
+      isZip: isMultiFile,
+      fileList,
+      secretKey: keychain.secretKeyB64,
+      encrypted,
+      partSize: uploadInfo.partSize || 200 * 1024 * 1024,
+      totalParts: uploadInfo.parts.length,
+      ownerToken: uploadInfo.owner,
+      expireDays: Math.ceil((timeLimit || 86400) / 86400),
+      downloadLimit: downloadLimit || 1,
+    });
+
+    await uploadStorage.saveSession(uploadSession);
+    console.log('[Upload] Session saved for resumability:', uploadInfo.id);
+
+    // Store small files for recovery
+    if (!isMultiFile && files[0] && uploadStorage.canStoreFile(files[0].size)) {
+      await uploadStorage.storeSmallFile(uploadInfo.id, files[0]);
+      console.log('[Upload] Small file stored for recovery');
+    }
+  }
+
   // Track progress
   const partProgress: Record<number, number> = {};
   const updateProgress = (partNum: number, loaded: number) => {
@@ -440,7 +485,8 @@ export async function uploadFiles(
       updateProgress,
       canceller,
       onError,
-      totalSize
+      totalSize,
+      uploadSession?.id // Pass session ID for persistence
     );
   } else {
     // Single part upload
@@ -482,7 +528,19 @@ export async function uploadFiles(
     throw new Error(`Failed to complete upload: ${errorText}`);
   }
 
-  const completeInfo = await completeResponse.json();
+  await completeResponse.json();
+
+  // Mark session as completed and clean up
+  if (uploadSession) {
+    try {
+      await uploadStorage.updateSessionStatus(uploadInfo.id, 'completed');
+      // Delete session after successful completion
+      await uploadStorage.deleteSession(uploadInfo.id);
+      console.log('[Upload] Session cleaned up after successful completion');
+    } catch (e) {
+      console.warn('[Upload] Failed to clean up session:', e);
+    }
+  }
 
   // Always use frontend origin for download URL (backend may return its own URL)
   // Don't include hash here - ShareDialog will append the secretKey
@@ -605,7 +663,8 @@ async function uploadMultipartStream(
   onProgress: (partNum: number, loaded: number) => void,
   canceller: Canceller,
   onError?: (error: UploadError) => void,
-  totalFileSize?: number
+  totalFileSize?: number,
+  sessionId?: string // For persistence
 ): Promise<{ parts: { PartNumber: number; ETag: string }[]; actualSize: number }> {
   const { parts, partSize } = uploadInfo;
   if (!parts || !partSize) throw new Error('Invalid upload info');
@@ -642,6 +701,19 @@ async function uploadMultipartStream(
       );
       completedParts.push(result);
       console.log(`[Upload] Part ${partNum} complete`);
+
+      // Persist completed part for resumability
+      if (sessionId) {
+        try {
+          await uploadStorage.markPartComplete(sessionId, {
+            partNumber: result.PartNumber,
+            etag: result.ETag,
+            size: partBlob.size,
+          });
+        } catch (e) {
+          console.warn('[Upload] Failed to persist part completion:', e);
+        }
+      }
     } catch (error: any) {
       console.error(`[Upload] Part ${partNum} failed:`, error.message);
       partErrors[partNum] = {
@@ -941,6 +1013,447 @@ async function fetchWithRetry(
   }
 
   throw lastError || new Error('Fetch failed');
+}
+
+/**
+ * Request fresh presigned URLs for resuming an upload
+ */
+export async function getResumeUrls(
+  id: string,
+  ownerToken: string,
+  completedParts: number[]
+): Promise<ResumeUrlsResponse> {
+  const response = await fetch(`${API_BASE_URL}/upload/resume/${id}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ownerToken,
+      completedParts,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to get resume URLs: ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Check if an upload session is still valid on the server
+ */
+export async function checkUploadStatus(
+  id: string,
+  ownerToken: string
+): Promise<{ valid: boolean; reason?: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/upload/status/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerToken }),
+    });
+
+    if (!response.ok) {
+      return { valid: false, reason: 'Upload not found or expired' };
+    }
+
+    return response.json();
+  } catch (e) {
+    return { valid: false, reason: 'Network error' };
+  }
+}
+
+export interface ResumeOptions {
+  session: UploadSession;
+  file: File | null; // The original file, if available
+  onProgress?: (progress: UploadProgress) => void;
+  onError?: (error: UploadError) => void;
+}
+
+export interface ResumeResult {
+  id: string;
+  url: string;
+  ownerToken: string;
+  duration: number;
+}
+
+/**
+ * Resume an interrupted upload
+ */
+export async function resumeUpload(
+  options: ResumeOptions,
+  canceller: Canceller
+): Promise<ResumeResult> {
+  const { session, file, onProgress, onError } = options;
+  const startTime = Date.now();
+
+  console.log('[Resume] Starting resume for session:', session.id);
+  console.log('[Resume] Completed parts:', session.completedParts.length, '/', session.totalParts);
+
+  // Update session status
+  await uploadStorage.updateSessionStatus(session.id, 'recovering');
+
+  // Check if file source is available
+  let sourceFile: File | null = file;
+
+  // Try to recover stored file if not provided
+  if (!sourceFile && session.fileList.length === 1) {
+    sourceFile = await uploadStorage.recoverStoredFile(
+      session.id,
+      session.fileList[0].name,
+      session.fileList[0].type
+    );
+    if (sourceFile) {
+      console.log('[Resume] Recovered file from IndexedDB');
+    }
+  }
+
+  if (!sourceFile) {
+    throw new Error('FILE_NOT_AVAILABLE');
+  }
+
+  // Verify file matches
+  const firstFileInfo = session.fileList[0];
+  if (
+    sourceFile.name !== firstFileInfo.name ||
+    sourceFile.size !== firstFileInfo.size
+  ) {
+    throw new Error('FILE_MISMATCH');
+  }
+
+  // Get fresh presigned URLs for remaining parts
+  const completedPartNumbers = session.completedParts.map(p => p.partNumber);
+  const resumeData = await getResumeUrls(
+    session.id,
+    session.ownerToken,
+    completedPartNumbers
+  );
+
+  console.log('[Resume] Got fresh URLs for', Object.keys(resumeData.urls).length, 'parts');
+
+  // Recreate keychain from stored secret
+  const keychain = new Keychain(session.secretKey);
+
+  // Calculate where to resume from
+  const bytesAlreadyUploaded = session.completedParts.reduce((sum, p) => sum + p.size, 0);
+
+  // Progress tracking
+  let lastProgressTime = startTime;
+  let lastProgressBytes = bytesAlreadyUploaded;
+  let lastDisplayTime = startTime;
+  let smoothedSpeed = 0;
+  let smoothedRemaining = 0;
+
+  const partProgress: Record<number, number> = {};
+  // Initialize with completed parts
+  for (const part of session.completedParts) {
+    partProgress[part.partNumber] = part.size;
+  }
+
+  const updateProgress = (partNum: number, loaded: number) => {
+    partProgress[partNum] = loaded;
+    const totalLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
+
+    const now = Date.now();
+    const elapsed = (now - lastProgressTime) / 1000;
+    const bytesInPeriod = totalLoaded - lastProgressBytes;
+    const instantSpeed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
+
+    const displayElapsed = (now - lastDisplayTime) / 1000;
+    if (displayElapsed >= 1 || lastDisplayTime === startTime) {
+      smoothedSpeed = smoothedSpeed === 0 ? instantSpeed : smoothedSpeed * 0.7 + instantSpeed * 0.3;
+      smoothedRemaining = smoothedSpeed > 0 ? (session.encryptedSize - totalLoaded) / smoothedSpeed : 0;
+      lastDisplayTime = now;
+      lastProgressTime = now;
+      lastProgressBytes = totalLoaded;
+    }
+
+    onProgress?.({
+      loaded: Math.min(totalLoaded, session.encryptedSize),
+      total: session.encryptedSize,
+      percentage: Math.min((totalLoaded / session.encryptedSize) * 100, 100),
+      speed: smoothedSpeed,
+      remainingTime: smoothedRemaining,
+    });
+  };
+
+  // Calculate starting record count based on bytes already uploaded
+  const startingRecordCount = calculateRecordCount(bytesAlreadyUploaded);
+
+  // Create stream from file, starting from the correct position
+  const bytesToSkip = session.encrypted
+    ? Math.floor(bytesAlreadyUploaded / ENCRYPTED_RECORD_SIZE) * (ENCRYPTED_RECORD_SIZE - 17) // Plaintext bytes
+    : bytesAlreadyUploaded;
+
+  // Slice the file to get remaining content
+  const remainingFile = sourceFile.slice(bytesToSkip);
+  let stream: ReadableStream<Uint8Array> = remainingFile.stream();
+
+  // Apply encryption if needed, starting from correct record
+  if (session.encrypted) {
+    stream = stream.pipeThrough(createResumableEncryptionStream(keychain, startingRecordCount));
+  }
+
+  // Upload remaining parts
+  const completedParts = [...session.completedParts.map(p => ({
+    PartNumber: p.partNumber,
+    ETag: p.etag,
+  }))];
+
+  const partUrls = Object.entries(resumeData.urls).map(([num, url]) => ({
+    partNumber: parseInt(num),
+    url,
+    minSize: 0,
+    maxSize: session.partSize,
+  }));
+
+  // Upload remaining parts using the existing multipart upload logic
+  const uploadResult = await uploadRemainingParts(
+    stream,
+    partUrls,
+    session.partSize,
+    completedParts,
+    updateProgress,
+    canceller,
+    onError,
+    session.id
+  );
+
+  if (canceller.cancelled) {
+    await uploadStorage.updateSessionStatus(session.id, 'paused');
+    throw new Error('Upload cancelled');
+  }
+
+  // Complete the upload
+  const metadataString = session.encrypted
+    ? arrayToB64(await keychain.encryptMetadata({
+        files: session.fileList.map(f => ({
+          name: f.name,
+          size: f.size,
+          type: f.type,
+        })),
+        ...(session.isZip && { zipped: true, zipFilename: session.fileName }),
+      }))
+    : btoa(unescape(encodeURIComponent(JSON.stringify({
+        files: session.fileList.map(f => ({
+          name: f.name,
+          size: f.size,
+          type: f.type,
+        })),
+        ...(session.isZip && { zipped: true, zipFilename: session.fileName }),
+      }))));
+
+  const completeResponse = await fetchWithRetry(`${API_BASE_URL}/upload/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: session.id,
+      metadata: metadataString,
+      ...(session.encrypted && { authKey: await keychain.authKeyB64() }),
+      actualSize: uploadResult.actualSize,
+      parts: uploadResult.parts,
+    }),
+  });
+
+  if (!completeResponse.ok) {
+    const errorText = await completeResponse.text();
+    await uploadStorage.updateSessionStatus(session.id, 'failed', errorText);
+    throw new Error(`Failed to complete upload: ${errorText}`);
+  }
+
+  // Clean up session
+  await uploadStorage.deleteSession(session.id);
+  console.log('[Resume] Upload completed and session cleaned up');
+
+  const downloadUrl = `${window.location.origin}/download/${session.id}`;
+
+  return {
+    id: session.id,
+    url: downloadUrl,
+    ownerToken: session.ownerToken,
+    duration: Date.now() - startTime,
+  };
+}
+
+/**
+ * Upload remaining parts for resume
+ */
+async function uploadRemainingParts(
+  stream: ReadableStream<Uint8Array>,
+  parts: PartInfo[],
+  partSize: number,
+  existingParts: { PartNumber: number; ETag: string }[],
+  onProgress: (partNum: number, loaded: number) => void,
+  canceller: Canceller,
+  onError?: (error: UploadError) => void,
+  sessionId?: string
+): Promise<{ parts: { PartNumber: number; ETag: string }[]; actualSize: number }> {
+  const maxConcurrent = getConcurrentUploads(partSize * parts.length);
+  console.log(`[Resume] Uploading ${parts.length} remaining parts, concurrency: ${maxConcurrent}`);
+
+  const reader = stream.getReader();
+  const completedParts = [...existingParts];
+  const partErrors: Record<number, { error: string; size: number }> = {};
+  const failedPartNumbers: number[] = [];
+
+  let activeUploads = 0;
+  let totalUploadedSize = existingParts.reduce((sum, _) => sum, 0);
+  let totalPartsQueued = 0;
+  let totalPartsFinished = 0;
+
+  let resolveAllDone: () => void;
+  const allDonePromise = new Promise<void>(resolve => { resolveAllDone = resolve; });
+
+  const uploadPartAsync = async (partBlob: Blob, partNum: number, partUrl: string): Promise<void> => {
+    try {
+      console.log(`[Resume] Part ${partNum} starting (${(partBlob.size / (1024*1024)).toFixed(1)}MB)`);
+      const result = await uploadPartWithRetry(
+        partBlob,
+        partUrl,
+        partNum,
+        (loaded) => onProgress(partNum, loaded),
+        canceller
+      );
+      completedParts.push(result);
+      console.log(`[Resume] Part ${partNum} complete`);
+
+      if (sessionId) {
+        try {
+          await uploadStorage.markPartComplete(sessionId, {
+            partNumber: result.PartNumber,
+            etag: result.ETag,
+            size: partBlob.size,
+          });
+        } catch (e) {
+          console.warn('[Resume] Failed to persist part completion:', e);
+        }
+      }
+    } catch (error: any) {
+      console.error(`[Resume] Part ${partNum} failed:`, error.message);
+      partErrors[partNum] = { error: error.message, size: partBlob.size };
+      failedPartNumbers.push(partNum);
+    } finally {
+      activeUploads--;
+      totalPartsFinished++;
+      if (totalPartsFinished === totalPartsQueued) {
+        resolveAllDone();
+      }
+      processQueue();
+    }
+  };
+
+  const pendingQueue: Array<{ blob: Blob; partNum: number; url: string }> = [];
+
+  const processQueue = (): void => {
+    while (pendingQueue.length > 0 && activeUploads < maxConcurrent) {
+      const item = pendingQueue.shift()!;
+      activeUploads++;
+      uploadPartAsync(item.blob, item.partNum, item.url);
+    }
+  };
+
+  let currentPartIndex = 0;
+  let currentPartData: Uint8Array[] = [];
+  let currentPartSize = 0;
+  let leftoverData: Uint8Array | null = null;
+
+  try {
+    let streamDone = false;
+
+    while (currentPartIndex < parts.length) {
+      const part = parts[currentPartIndex];
+
+      if (leftoverData) {
+        currentPartData.push(leftoverData);
+        currentPartSize += leftoverData.length;
+        leftoverData = null;
+      }
+
+      while (currentPartSize < partSize && !streamDone) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          streamDone = true;
+          break;
+        }
+
+        if (canceller.cancelled) {
+          throw new Error('Upload cancelled');
+        }
+
+        const wouldExceed = currentPartSize + value.length > partSize;
+
+        if (wouldExceed && currentPartIndex < parts.length - 1) {
+          const remainingSpace = partSize - currentPartSize;
+          if (remainingSpace > 0) {
+            currentPartData.push(value.slice(0, remainingSpace));
+            currentPartSize += remainingSpace;
+            leftoverData = value.slice(remainingSpace);
+          } else {
+            leftoverData = value;
+          }
+          break;
+        } else {
+          currentPartData.push(value);
+          currentPartSize += value.length;
+        }
+      }
+
+      if (currentPartData.length > 0) {
+        const partBlob = new Blob(currentPartData);
+        totalUploadedSize += partBlob.size;
+        totalPartsQueued++;
+
+        currentPartData = [];
+        currentPartSize = 0;
+
+        pendingQueue.push({ blob: partBlob, partNum: part.partNumber, url: part.url });
+        processQueue();
+
+        const maxBuffered = maxConcurrent + 1;
+        if (pendingQueue.length + activeUploads >= maxBuffered) {
+          await new Promise<void>(resolve => {
+            const checkRoom = setInterval(() => {
+              if (pendingQueue.length + activeUploads < maxBuffered) {
+                clearInterval(checkRoom);
+                resolve();
+              }
+            }, 50);
+          });
+        }
+      } else if (streamDone) {
+        break;
+      }
+
+      currentPartIndex++;
+    }
+
+    if (totalPartsQueued > 0 && totalPartsFinished < totalPartsQueued) {
+      console.log(`[Resume] Waiting for ${totalPartsQueued - totalPartsFinished} remaining uploads...`);
+      await allDonePromise;
+    }
+
+    if (failedPartNumbers.length > 0) {
+      const error: UploadError = {
+        message: `Failed to upload ${failedPartNumbers.length} parts: ${failedPartNumbers.join(', ')}`,
+        failedParts: failedPartNumbers,
+        partErrors,
+        retryable: true,
+      };
+      onError?.(error);
+      throw new Error(error.message);
+    }
+
+    console.log(`[Resume] All ${completedParts.length} parts completed successfully`);
+
+    return {
+      parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
+      actualSize: totalUploadedSize,
+    };
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /**
