@@ -35,6 +35,9 @@ function calculateOptimalPartSize(fileSize: number): { partSize: number; numPart
   return { partSize, numParts };
 }
 
+// Pre-signed URL expiration: 7 days (max allowed by S3/R2)
+const URL_EXPIRATION_SECONDS = 7 * 24 * 60 * 60; // 604800
+
 export const uploadRoutes = new Elysia()
   // Get upload URL(s)
   .post('/upload/url', async ({ body, request }) => {
@@ -122,6 +125,7 @@ export const uploadRoutes = new Elysia()
         fileSize,
         partSize,
         numParts,
+        urlExpirationDays: URL_EXPIRATION_SECONDS / 86400,
         fileSizeGB: Math.round((fileSize / (1024 * 1024 * 1024)) * 100) / 100,
         partSizeMB: Math.round(partSize / (1024 * 1024)),
       }, 'Multipart upload plan calculated');
@@ -154,7 +158,7 @@ export const uploadRoutes = new Elysia()
 
         for (let i = batchStart; i <= batchEnd; i++) {
           batchPromises.push(
-            storage.getSignedMultipartUploadUrl(id, uploadId, i).then((url) => ({
+            storage.getSignedMultipartUploadUrl(id, uploadId, i, URL_EXPIRATION_SECONDS).then((url) => ({
               partNumber: i,
               url,
               minSize: i === numParts ? 0 : partSize,
@@ -218,7 +222,7 @@ export const uploadRoutes = new Elysia()
       // Single part upload
       logger.info({ requestId, id }, 'Generating single upload URL');
       const singleUrlStartTime = Date.now();
-      const uploadUrl = await storage.getSignedUploadUrl(id, objectExpires);
+      const uploadUrl = await storage.getSignedUploadUrl(id, URL_EXPIRATION_SECONDS);
       const singleUrlDuration = Date.now() - singleUrlStartTime;
 
       logger.info({
