@@ -24,6 +24,9 @@ export class S3Storage {
 
     const clientConfig: ConstructorParameters<typeof S3Client>[0] = {
       region: 'auto',
+      // Disable automatic checksums - R2 doesn't fully support SDK v3 flexible checksums
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
     };
 
     if (config.s3Endpoint) {
