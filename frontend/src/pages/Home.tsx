@@ -60,7 +60,6 @@ export function HomePage() {
           timeLimit,
           downloadLimit,
           onProgress: (progress) => {
-            setZippingProgress(null); // Clear zipping when upload starts
             setUploadProgress(progress);
           },
           onZipProgress: (percent) => {
@@ -114,6 +113,7 @@ export function HomePage() {
     } finally {
       setUploading(false);
       setUploadProgress(null);
+      setZippingProgress(null);
       setCanceller(null);
       setKeychain(null);
     }

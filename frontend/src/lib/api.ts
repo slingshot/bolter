@@ -5,6 +5,7 @@
 
 import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
 import { sliceConcatenatedData, createZipFromFiles, createZipFromUploadFiles, createStreamingZip, generateZipFilename, type FileInfo } from './zip';
+import { UPLOAD_LIMITS } from '@bolter/shared';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -392,7 +393,7 @@ export async function uploadFiles(
     throw new Error(`HTTP ${uploadResponse.status}`);
   }
 
-  const uploadInfo: UploadUrlResponse = await uploadResponse.json();
+  let uploadInfo: UploadUrlResponse = await uploadResponse.json();
 
   if (!uploadInfo.useSignedUrl) {
     throw new Error('Pre-signed URLs not available');
@@ -430,11 +431,11 @@ export async function uploadFiles(
     });
   };
 
-  let uploadResult;
+  let uploadResult: { actualSize: number; parts?: { PartNumber: number; ETag: string }[] };
 
   if (uploadInfo.multipart && uploadInfo.parts) {
     // Multipart upload
-    uploadResult = await uploadMultipartStream(
+    const multipartResult = await uploadMultipartStream(
       stream,
       uploadInfo,
       updateProgress,
@@ -442,6 +443,49 @@ export async function uploadFiles(
       onError,
       totalSize
     );
+
+    // Handle fallback: stream produced too little data for multipart
+    if ('fallbackBlob' in multipartResult) {
+      console.log(`[Upload] Falling back to single-part upload (${(multipartResult.fallbackBlob.size / 1024).toFixed(1)}KB)`);
+
+      // Abort the multipart upload
+      if (uploadInfo.uploadId) {
+        await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+      }
+
+      // Request a new single-part upload URL
+      const fallbackResponse = await fetch(`${API_BASE_URL}/upload/url`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileSize: multipartResult.fallbackBlob.size,
+          encrypted,
+          timeLimit,
+          dlimit: downloadLimit,
+        }),
+      });
+
+      if (!fallbackResponse.ok) {
+        throw new Error(`HTTP ${fallbackResponse.status}`);
+      }
+
+      const fallbackInfo: UploadUrlResponse = await fallbackResponse.json();
+      if (!fallbackInfo.useSignedUrl) {
+        throw new Error('Pre-signed URLs not available for fallback');
+      }
+
+      // Use the new file ID and owner from the fallback response
+      uploadInfo = fallbackInfo;
+
+      uploadResult = await uploadSinglePart(
+        multipartResult.fallbackBlob,
+        fallbackInfo.url!,
+        (loaded) => updateProgress(1, loaded),
+        canceller
+      );
+    } else {
+      uploadResult = multipartResult;
+    }
   } else {
     // Single part upload
     const blob = await new Response(stream).blob();
@@ -473,7 +517,7 @@ export async function uploadFiles(
       metadata: metadataString,
       ...(encrypted && { authKey: await keychain.authKeyB64() }),
       actualSize: uploadResult.actualSize || totalSize,
-      ...(uploadInfo.multipart && 'parts' in uploadResult && { parts: uploadResult.parts }),
+      ...(uploadResult.parts && { parts: uploadResult.parts }),
     }),
   });
 
@@ -595,9 +639,17 @@ async function uploadSinglePart(
   });
 }
 
+/** Result from multipart upload - either completed parts or a fallback blob for single-part retry */
+type MultipartStreamResult =
+  | { parts: { PartNumber: number; ETag: string }[]; actualSize: number }
+  | { fallbackBlob: Blob };
+
 /**
  * Upload multipart using streaming with memory-efficient concurrency control
  * Uses a semaphore pattern to limit concurrent uploads and prevent memory exhaustion
+ *
+ * Returns { fallbackBlob } if the stream produces too little data for multipart upload,
+ * signaling the caller to abort multipart and retry as a single-part PutObject upload.
  */
 async function uploadMultipartStream(
   stream: ReadableStream<Uint8Array>,
@@ -606,9 +658,11 @@ async function uploadMultipartStream(
   canceller: Canceller,
   onError?: (error: UploadError) => void,
   totalFileSize?: number
-): Promise<{ parts: { PartNumber: number; ETag: string }[]; actualSize: number }> {
+): Promise<MultipartStreamResult> {
   const { parts, partSize } = uploadInfo;
   if (!parts || !partSize) throw new Error('Invalid upload info');
+
+  const MIN_PART = UPLOAD_LIMITS.MIN_PART_SIZE;
 
   // Adaptive concurrency based on file size
   const maxConcurrent = getConcurrentUploads(totalFileSize || 0);
@@ -630,7 +684,7 @@ async function uploadMultipartStream(
   const allDonePromise = new Promise<void>(resolve => { resolveAllDone = resolve; });
 
   // Upload a single part and manage concurrency
-  const uploadPart = async (partBlob: Blob, partNum: number, partUrl: string): Promise<void> => {
+  const doUploadPart = async (partBlob: Blob, partNum: number, partUrl: string): Promise<void> => {
     try {
       console.log(`[Upload] Part ${partNum} starting (${(partBlob.size / (1024*1024)).toFixed(1)}MB)`);
       const result = await uploadPartWithRetry(
@@ -673,8 +727,24 @@ async function uploadMultipartStream(
       const item = pendingQueue.shift()!;
       activeUploads++;
       // Fire and forget - completion is tracked via totalPartsFinished
-      uploadPart(item.blob, item.partNum, item.url);
+      doUploadPart(item.blob, item.partNum, item.url);
     }
+  };
+
+  // One-part delay buffer: hold the most recent completed part blob
+  // so we can merge a small final part into it
+  let bufferedItem: { blob: Blob; partNum: number; url: string } | null = null;
+
+  const queueOrBuffer = (blob: Blob, partNum: number, url: string) => {
+    if (bufferedItem) {
+      // Queue the previously buffered part — it's not the last
+      totalUploadedSize += bufferedItem.blob.size;
+      totalPartsQueued++;
+      pendingQueue.push(bufferedItem);
+      processQueue();
+    }
+    // Buffer the current part (might be the last)
+    bufferedItem = { blob, partNum, url };
   };
 
   let currentPartIndex = 0;
@@ -726,24 +796,15 @@ async function uploadMultipartStream(
         }
       }
 
-      // Queue upload if we have data
+      // Buffer part if we have data
       if (currentPartData.length > 0) {
-        // Create blob and immediately clear the array references to free memory
         const partBlob = new Blob(currentPartData);
-        totalUploadedSize += partBlob.size;
-        totalPartsQueued++;
-
-        // Clear references immediately - blob now owns the data
         currentPartData = [];
         currentPartSize = 0;
 
-        // Add to queue and try to process
-        pendingQueue.push({ blob: partBlob, partNum: part.partNumber, url: part.url });
-        processQueue();
+        queueOrBuffer(partBlob, part.partNumber, part.url);
 
         // Backpressure: wait if we have too many parts buffered
-        // Allow at most (maxConcurrent + 1) parts in memory at once
-        // This balances memory usage vs upload throughput
         const maxBuffered = maxConcurrent + 1;
         if (pendingQueue.length + activeUploads >= maxBuffered) {
           await new Promise<void>(resolve => {
@@ -760,6 +821,36 @@ async function uploadMultipartStream(
       }
 
       currentPartIndex++;
+    }
+
+    // Stream is done — flush the buffered item
+    if (bufferedItem) {
+      // Check if we only have 1 part total and it's too small for multipart
+      const noPriorParts = totalPartsQueued === 0 && activeUploads === 0;
+
+      if (noPriorParts && bufferedItem.blob.size < MIN_PART) {
+        // Entire stream output is a single tiny blob — fallback to single-part upload
+        console.log(`[Upload] Stream produced only ${(bufferedItem.blob.size / 1024).toFixed(1)}KB — falling back to single-part upload`);
+        return { fallbackBlob: bufferedItem.blob };
+      }
+
+      // Check if final part is too small and we can merge it with a pending part
+      if (bufferedItem.blob.size < MIN_PART && pendingQueue.length > 0) {
+        // Merge with the last pending part
+        const lastPending = pendingQueue[pendingQueue.length - 1];
+        const mergedBlob = new Blob([lastPending.blob, bufferedItem.blob]);
+        console.log(`[Upload] Merging small final part (${(bufferedItem.blob.size / 1024).toFixed(1)}KB) into part ${lastPending.partNum} (${(lastPending.blob.size / (1024*1024)).toFixed(1)}MB → ${(mergedBlob.size / (1024*1024)).toFixed(1)}MB)`);
+        lastPending.blob = mergedBlob;
+        // Don't queue the tiny buffered item separately
+      } else {
+        // Final part is large enough, or no pending parts to merge with — queue it normally
+        totalUploadedSize += bufferedItem.blob.size;
+        totalPartsQueued++;
+        pendingQueue.push(bufferedItem);
+      }
+
+      bufferedItem = null;
+      processQueue();
     }
 
     // Wait for all uploads to complete

@@ -9,6 +9,7 @@ const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
 const DEFAULT_PART_SIZE = UPLOAD_LIMITS.DEFAULT_PART_SIZE;
 const MAX_PARTS = UPLOAD_LIMITS.MAX_PARTS;
 const MAX_PART_SIZE = UPLOAD_LIMITS.MAX_PART_SIZE;
+const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
 
 interface PartInfo {
   partNumber: number;
@@ -30,6 +31,20 @@ function calculateOptimalPartSize(fileSize: number): { partSize: number; numPart
 
     partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
     numParts = Math.ceil(fileSize / partSize);
+  }
+
+  // Ensure the last part won't be smaller than MIN_PART_SIZE (5MB)
+  // This prevents R2 EntityTooSmall errors when compressed/encrypted size
+  // lands just above a multiple of partSize
+  if (numParts > 1) {
+    const lastPartSize = fileSize - (numParts - 1) * partSize;
+    if (lastPartSize > 0 && lastPartSize < MIN_PART_SIZE) {
+      numParts = numParts - 1;
+      partSize = Math.ceil(fileSize / numParts);
+      // Align to MB boundary
+      partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+      numParts = Math.ceil(fileSize / partSize);
+    }
   }
 
   return { partSize, numParts };
