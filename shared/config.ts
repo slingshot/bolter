@@ -14,6 +14,7 @@ export const UPLOAD_LIMITS = {
   MULTIPART_THRESHOLD: 100 * BYTES.MB, // Use multipart for files > 100MB
   DEFAULT_PART_SIZE: 200 * BYTES.MB, // 200MB per part (increased for 1TB support)
   MAX_PART_SIZE: 5 * BYTES.GB, // 5GB per part (R2/S3 limit)
+  MIN_PART_SIZE: 5 * BYTES.MB, // 5MB minimum part size (R2/S3 requirement)
   MAX_PARTS: 10000, // Cloudflare R2 limit
   MAX_FILES_PER_ARCHIVE: 64,
 } as const;
