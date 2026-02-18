@@ -3,6 +3,7 @@ import { ArrowUpFromLine } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 import { UPLOAD_LIMITS, BYTES } from '@bolter/shared';
+import { captureError } from '@/lib/sentry';
 
 // Recursively read all files from a directory entry
 async function readDirectoryEntries(
@@ -153,6 +154,7 @@ export function DropZone() {
         }
       } catch (error) {
         console.error('Error processing dropped items:', error);
+        captureError(error, { operation: 'dropzone.process' });
         // Fallback to basic file handling
         const files = Array.from(e.dataTransfer.files).filter(
           (f) => f.size > 0

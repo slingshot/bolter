@@ -8,6 +8,7 @@ import { HomePage } from '@/pages/Home';
 import { DownloadPage } from '@/pages/Download';
 import { useAppStore } from '@/stores/app';
 import { getConfig } from '@/lib/api';
+import { captureError } from '@/lib/sentry';
 
 function App() {
   const { setConfig, config } = useAppStore();
@@ -45,6 +46,7 @@ function App() {
         }
       } catch (e) {
         console.error('Failed to load config:', e);
+        captureError(e, { operation: 'config.load' });
       }
     }
 

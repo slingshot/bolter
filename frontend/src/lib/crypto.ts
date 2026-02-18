@@ -3,6 +3,8 @@
  * Uses Web Crypto API for AES-GCM encryption and HKDF key derivation
  */
 
+import { captureError } from './sentry';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -342,6 +344,10 @@ export function createDecryptionStream(keychain: Keychain): TransformStream<Uint
           }
         } catch (e) {
           console.error('Failed to decrypt final record:', e);
+          captureError(e, {
+            operation: 'crypto.decryptRecord',
+            extra: { recordCount, bufferLength: buffer.length },
+          });
         }
       }
     },

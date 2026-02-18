@@ -15,6 +15,7 @@ import { uploadFiles, Canceller } from '@/lib/api';
 import { formatBytes } from '@/lib/utils';
 import { trackUpload } from '@/lib/plausible';
 import { UPLOAD_LIMITS } from '@bolter/shared';
+import { captureError, addBreadcrumb } from '@/lib/sentry';
 
 export function HomePage() {
   const navigate = useNavigate();
@@ -51,6 +52,15 @@ export function HomePage() {
     setCanceller(canceller);
     setKeychain(keychain);
     setZippingProgress(null);
+
+    addBreadcrumb('Upload started', {
+      category: 'upload',
+      data: {
+        fileCount: files.length,
+        totalSize: files.reduce((sum, f) => sum + f.file.size, 0),
+        encrypted,
+      },
+    });
 
     try {
       const result = await uploadFiles(
@@ -103,6 +113,16 @@ export function HomePage() {
           variant: 'default',
         });
       } else {
+        captureError(e, {
+          operation: 'upload',
+          extra: {
+            fileCount: files.length,
+            totalSize: files.reduce((sum, f) => sum + f.file.size, 0),
+            encrypted,
+            timeLimit,
+            downloadLimit,
+          },
+        });
         setUploadError(e.message);
         addToast({
           title: 'Upload failed',

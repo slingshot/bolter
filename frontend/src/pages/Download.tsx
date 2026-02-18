@@ -17,6 +17,7 @@ import { getMetadata, downloadFile, fileExists, checkLegacyFile, getDownloadStat
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
 import { trackDownload } from '@/lib/plausible';
 import { useDocumentMeta } from '@/hooks/useDocumentMeta';
+import { captureError, addBreadcrumb } from '@/lib/sentry';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
 
@@ -121,6 +122,10 @@ export function DownloadPage() {
         if (e.message.includes('404') || e.message.includes('401')) {
           setState('not-found');
         } else {
+          captureError(e, {
+            operation: 'download.metadata',
+            extra: { fileId: id, hasSecretKey: !!secretKey },
+          });
           setError(e.message);
           setState('error');
         }
@@ -164,6 +169,14 @@ export function DownloadPage() {
     }
 
     // JavaScript-based download for encrypted files or multiple files (needs decryption/ZIP)
+    addBreadcrumb('Download started', {
+      category: 'download',
+      data: {
+        fileId: id,
+        encrypted: metadata?.encrypted,
+        size: metadata?.size,
+      },
+    });
     setState('downloading');
     setProgress(0);
 
@@ -190,6 +203,14 @@ export function DownloadPage() {
       setState('complete');
     } catch (e: any) {
       console.error('Download failed:', e);
+      captureError(e, {
+        operation: 'download',
+        extra: {
+          fileId: id,
+          encrypted: metadata?.encrypted,
+          size: metadata?.size,
+        },
+      });
       setError(e.message);
       setState('error');
     }
