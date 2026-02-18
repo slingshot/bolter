@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { Keychain } from '@/lib/crypto';
 import { Canceller, deleteFile, type UploadProgress } from '@/lib/api';
+import { captureError } from '@/lib/sentry';
 
 export interface FileItem {
   id: string;
@@ -146,6 +147,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Delete from S3 in the background (don't block UI)
       deleteFile(id, file.ownerToken).catch((err) => {
         console.warn('Failed to delete file from server:', err);
+        captureError(err, { operation: 'file.delete', extra: { fileId: id }, level: 'warning' });
       });
     }
 
@@ -170,6 +172,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     for (const file of files) {
       deleteFile(file.id, file.ownerToken).catch((err) => {
         console.warn('Failed to delete file from server:', err);
+        captureError(err, { operation: 'file.delete', extra: { fileId: file.id }, level: 'warning' });
       });
     }
 

@@ -6,6 +6,7 @@
 import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncryptionStream } from './crypto';
 import { sliceConcatenatedData, createZipFromFiles, createZipFromUploadFiles, createStreamingZip, generateZipFilename, type FileInfo } from './zip';
 import { UPLOAD_LIMITS } from '@bolter/shared';
+import { captureError, addBreadcrumb } from './sentry';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -191,6 +192,10 @@ export async function getMetadata(id: string, keychain?: Keychain) {
       console.log('[getMetadata] Decryption successful:', metadata);
     } catch (e) {
       console.error('[getMetadata] Decryption failed:', e);
+      captureError(e, {
+        operation: 'metadata.decrypt',
+        extra: { fileId: id, metadataLength: data.metadata?.length },
+      });
       throw e;
     }
   } else {
@@ -215,6 +220,10 @@ export async function getMetadata(id: string, keychain?: Keychain) {
       console.log('[getMetadata] Decode successful:', metadata);
     } catch (e) {
       console.error('[getMetadata] Decode failed:', e, 'metadata:', data.metadata);
+      captureError(e, {
+        operation: 'metadata.decode',
+        extra: { fileId: id, metadataLength: data.metadata?.length },
+      });
       throw e;
     }
   }
@@ -698,6 +707,11 @@ async function uploadMultipartStream(
       console.log(`[Upload] Part ${partNum} complete`);
     } catch (error: any) {
       console.error(`[Upload] Part ${partNum} failed:`, error.message);
+      captureError(error, {
+        operation: 'upload.part',
+        extra: { partNumber: partNum, partSize: partBlob.size },
+        level: 'warning',
+      });
       partErrors[partNum] = {
         error: error.message,
         size: partBlob.size,
@@ -1006,6 +1020,11 @@ async function abortMultipartUpload(id: string, uploadId: string): Promise<void>
     });
   } catch (e) {
     console.warn('Failed to abort multipart upload:', e);
+    captureError(e, {
+      operation: 'upload.abort',
+      extra: { fileId: id, uploadId },
+      level: 'warning',
+    });
   }
 }
 
@@ -1031,7 +1050,13 @@ async function fetchWithRetry(
     }
   }
 
-  throw lastError || new Error('Fetch failed');
+  const err = lastError || new Error('Fetch failed');
+  captureError(err, {
+    operation: 'fetch.retry',
+    extra: { url, retries },
+    level: 'warning',
+  });
+  throw err;
 }
 
 /**
@@ -1042,6 +1067,11 @@ export async function downloadFile(
   keychain: Keychain | null,
   onProgress?: (loaded: number, total: number) => void
 ): Promise<{ blob: Blob; filename: string }> {
+  addBreadcrumb('downloadFile called', {
+    category: 'download',
+    data: { fileId: id, encrypted: !!keychain },
+  });
+
   // Get metadata first
   const metadata = await getMetadata(id, keychain || undefined);
 
@@ -1167,7 +1197,14 @@ export async function downloadFile(
   await fetch(`${API_BASE_URL}/download/complete/${id}`, {
     method: 'POST',
     headers: keychain ? { Authorization: await keychain.authHeader() } : {},
-  }).catch(console.warn);
+  }).catch((e) => {
+    console.warn('Failed to report download complete:', e);
+    captureError(e, {
+      operation: 'download.complete',
+      extra: { fileId: id },
+      level: 'warning',
+    });
+  });
 
   // Handle multiple files
   const files = metadata.files as FileInfo[] | undefined;
