@@ -3,7 +3,7 @@
  */
 
 import JSZip from 'jszip';
-import { downloadZip } from 'client-zip';
+import { downloadZip, predictLength } from 'client-zip';
 
 export interface FileInfo {
   name: string;
@@ -157,8 +157,11 @@ export function createStreamingZip(
   const response = downloadZip(entries);
   const stream = response.body!;
 
-  // Estimate zip size (STORE compression = input size + ~100 bytes per file for headers)
-  const estimatedSize = totalSize + files.length * 100 + 22; // 22 bytes for end of central directory
+  // Use client-zip's predictLength for exact ZIP size calculation
+  // This uses the same internal logic as downloadZip, accounting for all ZIP
+  // structure overhead (headers, central directory, Zip64 extensions, etc.)
+  const metadata = renamedFiles.map(({ name, input }) => ({ name, size: input.size }));
+  const estimatedSize = Number(predictLength(metadata));
 
   const filename = generateZipFilename(files.map(f => ({ name: f.name, size: f.size, type: f.type })));
 
