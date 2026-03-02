@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto';
 import { storage, type CompletedPart } from '../storage';
 import { config, deriveBaseUrl } from '../config';
 import { uploadLogger as logger } from '../logger';
+import { captureError } from '../lib/sentry';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 
 const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
@@ -92,6 +93,10 @@ export const uploadRoutes = new Elysia()
     }, 'Pre-signed URL test completed');
 
     if (!testUploadUrl) {
+      captureError(new Error('Pre-signed URL test failed'), {
+        operation: 'upload.presign-test',
+        extra: { requestId, fileSize, fileSizeMB: Math.round(fileSize / (1024 * 1024) * 100) / 100 },
+      });
       logger.error({ requestId }, 'Pre-signed URL test failed, falling back to direct upload');
       return { useSignedUrl: false };
     }
@@ -152,6 +157,10 @@ export const uploadRoutes = new Elysia()
       const multipartDuration = Date.now() - multipartStartTime;
 
       if (!uploadId) {
+        captureError(new Error('Failed to create multipart upload'), {
+          operation: 'upload.multipart-create',
+          extra: { requestId, id, fileSize, numParts, partSize },
+        });
         logger.error({ requestId, id, multipartDuration }, 'Failed to create multipart upload');
         return { useSignedUrl: false };
       }
@@ -363,6 +372,18 @@ export const uploadRoutes = new Elysia()
           completeDuration,
         }, 'Multipart upload completed successfully');
       } catch (e: any) {
+        captureError(e, {
+          operation: 'upload.multipart-complete',
+          extra: {
+            requestId,
+            id,
+            uploadId,
+            partsReceived: parts.length,
+            partsAllocated: expectedParts,
+            errorCode: e.code,
+            errorName: e.name,
+          },
+        });
         logger.error({
           requestId,
           id,
@@ -462,6 +483,11 @@ export const uploadRoutes = new Elysia()
       logger.info({ requestId, id, uploadId }, 'Upload aborted successfully');
       return { success: true };
     } catch (e) {
+      captureError(e, {
+        operation: 'upload.abort',
+        extra: { requestId, id, uploadId },
+        level: 'warning',
+      });
       logger.error({ requestId, id, uploadId, error: e }, 'Failed to abort multipart upload');
       return { error: 'Failed to abort upload' };
     }

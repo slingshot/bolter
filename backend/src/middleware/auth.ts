@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { storage } from '../storage';
+import { captureError } from '../lib/sentry';
 
 export interface AuthContext {
   authenticated: boolean;
@@ -70,6 +71,11 @@ export async function verifyAuth(
     const valid = timingSafeEqual(providedBuffer, expectedBuffer);
     return { valid, nonce: newNonce };
   } catch (e) {
+    captureError(e, {
+      operation: 'auth.verify',
+      extra: { id, hasAuthHeader: !!authHeader },
+      level: 'warning',
+    });
     console.error('Auth verification error:', e);
     return { valid: false, nonce: newNonce };
   }

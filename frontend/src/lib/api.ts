@@ -532,7 +532,19 @@ export async function uploadFiles(
 
   if (!completeResponse.ok) {
     const errorText = await completeResponse.text();
-    throw new Error(`Failed to complete upload: ${errorText}`);
+    const err = new Error(`Failed to complete upload: ${errorText}`);
+    captureError(err, {
+      operation: 'upload.complete',
+      extra: {
+        fileId: uploadInfo.id,
+        httpStatus: completeResponse.status,
+        encrypted,
+        multipart: uploadInfo.multipart,
+        totalSize,
+        responsePreview: errorText.substring(0, 200),
+      },
+    });
+    throw err;
   }
 
   const completeInfo = await completeResponse.json();
@@ -634,13 +646,28 @@ async function uploadSinglePart(
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve({ actualSize: blob.size });
       } else {
-        reject(new Error(`HTTP ${xhr.status}`));
+        const err = new Error(`HTTP ${xhr.status}`);
+        captureError(err, {
+          operation: 'upload.single',
+          extra: {
+            httpStatus: xhr.status,
+            statusText: xhr.statusText,
+            blobSize: blob.size,
+            responsePreview: xhr.responseText?.substring(0, 200),
+          },
+        });
+        reject(err);
       }
     });
 
     xhr.addEventListener('error', () => {
       canceller.removeXhr(xhr);
-      reject(new Error('Network error'));
+      const err = new Error('Network error');
+      captureError(err, {
+        operation: 'upload.single.network',
+        extra: { blobSize: blob.size },
+      });
+      reject(err);
     });
 
     xhr.open('PUT', url);
@@ -709,7 +736,16 @@ async function uploadMultipartStream(
       console.error(`[Upload] Part ${partNum} failed:`, error.message);
       captureError(error, {
         operation: 'upload.part',
-        extra: { partNumber: partNum, partSize: partBlob.size },
+        extra: {
+          partNumber: partNum,
+          partSize: partBlob.size,
+          totalParts: parts.length,
+          uploadId: uploadInfo.uploadId,
+          totalFileSize: totalFileSize,
+          completedSoFar: completedParts.length,
+          failedSoFar: failedPartNumbers.length,
+          activeUploads,
+        },
         level: 'warning',
       });
       partErrors[partNum] = {
@@ -934,6 +970,17 @@ async function uploadPartWithRetry(
       return uploadPartWithRetry(blob, url, partNumber, onProgress, canceller, retryCount + 1);
     }
 
+    captureError(error, {
+      operation: 'upload.part.exhausted',
+      extra: {
+        partNumber,
+        partSize: blob.size,
+        retriesAttempted: retryCount,
+        maxRetries: MAX_RETRIES,
+        isRetryable: isRetryableError(error),
+        errorMessage: error.message,
+      },
+    });
     throw error;
   }
 }
@@ -968,7 +1015,19 @@ function uploadPart(
         let errorDetails = `HTTP ${xhr.status}`;
         if (xhr.statusText) errorDetails += ` (${xhr.statusText})`;
         if (xhr.responseText) errorDetails += `: ${xhr.responseText.substring(0, 200)}`;
-        reject(new Error(errorDetails));
+        const err = new Error(errorDetails);
+        captureError(err, {
+          operation: 'upload.part.http',
+          extra: {
+            partNumber,
+            httpStatus: xhr.status,
+            statusText: xhr.statusText,
+            blobSize: blob.size,
+            responsePreview: xhr.responseText?.substring(0, 200),
+          },
+          level: 'warning',
+        });
+        reject(err);
       }
     });
 
@@ -1053,7 +1112,11 @@ async function fetchWithRetry(
   const err = lastError || new Error('Fetch failed');
   captureError(err, {
     operation: 'fetch.retry',
-    extra: { url, retries },
+    extra: {
+      urlPath: new URL(url).pathname,
+      retries,
+      lastErrorMessage: err.message,
+    },
     level: 'warning',
   });
   throw err;
@@ -1106,7 +1169,12 @@ export async function downloadFile(
   }
 
   if (!urlResponse.ok) {
-    throw new Error(`HTTP ${urlResponse.status}`);
+    const err = new Error(`HTTP ${urlResponse.status}`);
+    captureError(err, {
+      operation: 'download.url-fetch',
+      extra: { fileId: id, httpStatus: urlResponse.status, encrypted: !!keychain },
+    });
+    throw err;
   }
 
   const urlData = await urlResponse.json();
@@ -1144,7 +1212,18 @@ export async function downloadFile(
   }
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    const err = new Error(`HTTP ${response.status}`);
+    captureError(err, {
+      operation: 'download.fetch',
+      extra: {
+        fileId: id,
+        httpStatus: response.status,
+        encrypted: !!keychain,
+        contentLength: parseInt(response.headers.get('Content-Length') || '0', 10),
+        usedSignedUrl: urlData.useSignedUrl,
+      },
+    });
+    throw err;
   }
 
   // Stream with progress

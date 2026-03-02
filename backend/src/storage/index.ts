@@ -1,5 +1,6 @@
 import { s3Storage } from './s3';
 import { redis } from './redis';
+import { captureError } from '../lib/sentry';
 import type { CompletedPart } from '@aws-sdk/client-s3';
 
 export interface FileMetadata {
@@ -27,6 +28,7 @@ export const storage = {
     try {
       return await s3Storage.getSignedUploadUrl(id, 3600, objectExpires);
     } catch (e) {
+      captureError(e, { operation: 's3.sign-upload', extra: { id } });
       console.error('Failed to get signed upload URL:', e);
       return null;
     }
@@ -36,6 +38,7 @@ export const storage = {
     try {
       return await s3Storage.getSignedDownloadUrl(id, filename);
     } catch (e) {
+      captureError(e, { operation: 's3.sign-download', extra: { id, filename } });
       console.error('Failed to get signed download URL:', e);
       return null;
     }
@@ -45,6 +48,7 @@ export const storage = {
     try {
       return await s3Storage.createMultipartUpload(id, objectExpires);
     } catch (e) {
+      captureError(e, { operation: 's3.create-multipart', extra: { id } });
       console.error('Failed to create multipart upload:', e);
       return null;
     }
@@ -80,7 +84,9 @@ export const storage = {
 
   async del(id: string): Promise<void> {
     await Promise.all([
-      s3Storage.del(id).catch(() => {}),
+      s3Storage.del(id).catch((e) => {
+        captureError(e, { operation: 's3.delete', extra: { id }, level: 'warning' });
+      }),
       redis.del(id),
     ]);
   },

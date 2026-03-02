@@ -121,6 +121,8 @@ export function HomePage() {
             encrypted,
             timeLimit,
             downloadLimit,
+            fileNames: files.map(f => f.file.name).join(', ').substring(0, 200),
+            largestFile: Math.max(...files.map(f => f.file.size)),
           },
         });
         setUploadError(e.message);

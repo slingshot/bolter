@@ -1,5 +1,6 @@
 import { createClient, type RedisClientType } from 'redis';
 import { config } from '../config';
+import { captureError } from '../lib/sentry';
 
 export class RedisStorage {
   private client: RedisClientType | null = null;
@@ -12,6 +13,7 @@ export class RedisStorage {
     this.client = createClient({ url: config.redisUrl });
 
     this.client.on('error', (err) => {
+      captureError(err, { operation: 'redis.connection', level: 'error' });
       console.error('Redis Client Error:', err);
     });
 

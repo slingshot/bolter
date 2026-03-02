@@ -2,6 +2,7 @@ import { Elysia, t } from 'elysia';
 import { storage } from '../storage';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
 import { downloadLogger as logger } from '../logger';
+import { captureError } from '../lib/sentry';
 
 export const downloadRoutes = new Elysia()
   // Direct download for unencrypted single files (redirects to S3)
@@ -46,6 +47,10 @@ export const downloadRoutes = new Elysia()
           filename = decoded.files?.[0]?.name || decoded.name || 'download';
         }
       } catch (e) {
+        captureError(e, {
+          operation: 'download.metadata-decode',
+          extra: { id, metadataLength: metadata.metadata?.length },
+        });
         logger.warn({ id, error: e }, 'Failed to decode metadata for direct download');
       }
     }
@@ -74,6 +79,10 @@ export const downloadRoutes = new Elysia()
     // Get signed URL with filename for Content-Disposition
     const signedUrl = await storage.getSignedDownloadUrl(id, filename);
     if (!signedUrl) {
+      captureError(new Error('Failed to generate signed download URL'), {
+        operation: 'download.sign-url',
+        extra: { id, filename },
+      });
       set.status = 500;
       return { error: 'Failed to generate download URL' };
     }
@@ -107,6 +116,11 @@ export const downloadRoutes = new Elysia()
     // Get pre-signed download URL
     const signedUrl = await storage.getSignedDownloadUrl(id);
     if (!signedUrl) {
+      captureError(new Error('Failed to generate signed download URL'), {
+        operation: 'download.sign-url',
+        extra: { id, encrypted: metadata.encrypted },
+        level: 'warning',
+      });
       return {
         useSignedUrl: false,
         dl: metadata.dl,
@@ -213,7 +227,14 @@ export const downloadRoutes = new Elysia()
     // Check if download limit reached
     if (newDl >= metadata.dlimit) {
       console.log('Download limit reached, deleting file:', { id, dl: newDl, dlimit: metadata.dlimit });
-      await storage.del(id);
+      try {
+        await storage.del(id);
+      } catch (e) {
+        captureError(e, {
+          operation: 'download.delete-on-limit',
+          extra: { id, dl: newDl, dlimit: metadata.dlimit },
+        });
+      }
       return { deleted: true, dl: newDl, dlimit: metadata.dlimit };
     }
 

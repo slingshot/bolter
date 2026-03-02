@@ -124,7 +124,12 @@ export function DownloadPage() {
         } else {
           captureError(e, {
             operation: 'download.metadata',
-            extra: { fileId: id, hasSecretKey: !!secretKey },
+            extra: {
+              fileId: id,
+              hasSecretKey: !!secretKey,
+              errorMessage: e.message,
+              httpStatus: e.message.match(/HTTP (\d+)/)?.[1],
+            },
           });
           setError(e.message);
           setState('error');
@@ -209,6 +214,10 @@ export function DownloadPage() {
           fileId: id,
           encrypted: metadata?.encrypted,
           size: metadata?.size,
+          fileCount: metadata?.files?.length,
+          zipped: metadata?.zipped,
+          ttl: metadata?.ttl,
+          errorMessage: e.message,
         },
       });
       setError(e.message);

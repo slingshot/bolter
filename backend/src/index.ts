@@ -14,6 +14,7 @@ import { uploadRoutes } from './routes/upload';
 import { downloadRoutes } from './routes/download';
 import { plausibleRoutes } from './routes/plausible';
 import { logger } from './logger';
+import { captureError } from './lib/sentry';
 
 const app = new Elysia()
   // Request logging
@@ -130,7 +131,9 @@ const app = new Elysia()
   .use(plausibleRoutes)
 
   // Error handling
-  .onError(({ code, error, set }) => {
+  .onError(({ code, error, set, request }) => {
+    const url = new URL(request.url);
+
     logger.error({
       code,
       error: error.message,
@@ -146,6 +149,19 @@ const app = new Elysia()
       set.status = 400;
       return { error: 'Invalid request', details: error.message };
     }
+
+    captureError(error, {
+      operation: 'server.unhandled',
+      tags: {
+        errorCode: code,
+        method: request.method,
+        path: url.pathname,
+      },
+      extra: {
+        query: url.search,
+        statusCode: 500,
+      },
+    });
 
     set.status = 500;
     return { error: 'Internal server error' };
@@ -176,6 +192,7 @@ storage.redis.connect().then(() => {
   logger.info('Connected to Redis');
   console.log('Connected to Redis');
 }).catch((err) => {
+  captureError(err, { operation: 'redis.connect' });
   logger.error({ error: err }, 'Failed to connect to Redis');
   console.error('Failed to connect to Redis:', err);
 });
