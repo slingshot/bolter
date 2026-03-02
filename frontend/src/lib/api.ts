@@ -699,6 +699,8 @@ async function uploadMultipartStream(
   if (!parts || !partSize) throw new Error('Invalid upload info');
 
   const MIN_PART = UPLOAD_LIMITS.MIN_PART_SIZE;
+  // Safety cap: S3 max single-part size (5GB) — prevents unbounded memory if stream far exceeds estimate
+  const MAX_PART_SIZE = 5 * 1024 * 1024 * 1024;
 
   // Adaptive concurrency based on file size
   const maxConcurrent = getConcurrentUploads(totalFileSize || 0);
@@ -714,6 +716,9 @@ async function uploadMultipartStream(
   let totalUploadedSize = 0;
   let totalPartsQueued = 0;
   let totalPartsFinished = 0;
+
+  // Track actual uploaded part sizes for pre-completion consistency check
+  const uploadedPartSizes: Record<number, number> = {};
 
   // Promise to signal when all uploads are done
   let resolveAllDone: () => void;
@@ -731,6 +736,7 @@ async function uploadMultipartStream(
         canceller
       );
       completedParts.push(result);
+      uploadedPartSizes[partNum] = partBlob.size;
       console.log(`[Upload] Part ${partNum} complete`);
     } catch (error: any) {
       console.error(`[Upload] Part ${partNum} failed:`, error.message);
@@ -787,7 +793,23 @@ async function uploadMultipartStream(
 
   const queueOrBuffer = (blob: Blob, partNum: number, url: string) => {
     if (bufferedItem) {
-      // Queue the previously buffered part — it's not the last
+      // Queue the previously buffered part — it's not the last (non-trailing)
+      // Validate: all non-trailing parts must be exactly partSize for R2 compliance
+      if (bufferedItem.blob.size !== partSize) {
+        const diagnostic = {
+          partNumber: bufferedItem.partNum,
+          actualSize: bufferedItem.blob.size,
+          expectedSize: partSize,
+          uploadId: uploadInfo.uploadId,
+          totalParts: parts.length,
+          totalFileSize,
+        };
+        console.error(`[Upload] Non-trailing part ${bufferedItem.partNum} size mismatch: ${bufferedItem.blob.size} !== ${partSize}`, diagnostic);
+        captureError(new Error(`Non-trailing part size mismatch: part ${bufferedItem.partNum} is ${bufferedItem.blob.size} bytes, expected ${partSize}`), {
+          operation: 'upload.part-size-validation',
+          extra: diagnostic,
+        });
+      }
       totalUploadedSize += bufferedItem.blob.size;
       totalPartsQueued++;
       pendingQueue.push(bufferedItem);
@@ -816,7 +838,15 @@ async function uploadMultipartStream(
       }
 
       // Read data for this part
-      while (currentPartSize < partSize && !streamDone) {
+      // For the last allocated part, drain ALL remaining stream data (trailing part absorbs excess)
+      const isLastAllocatedPart = currentPartIndex >= parts.length - 1;
+      while (!streamDone && (isLastAllocatedPart || currentPartSize < partSize)) {
+        // Safety cap: prevent unbounded memory on the trailing part
+        if (isLastAllocatedPart && currentPartSize >= MAX_PART_SIZE) {
+          console.error(`[Upload] Trailing part exceeded MAX_PART_SIZE (${MAX_PART_SIZE}), stopping read`);
+          break;
+        }
+
         const { done, value } = await reader.read();
 
         if (done) {
@@ -830,7 +860,7 @@ async function uploadMultipartStream(
 
         const wouldExceed = currentPartSize + value.length > partSize;
 
-        if (wouldExceed && currentPartIndex < parts.length - 1) {
+        if (wouldExceed && !isLastAllocatedPart) {
           const remainingSpace = partSize - currentPartSize;
           if (remainingSpace > 0) {
             currentPartData.push(value.slice(0, remainingSpace));
@@ -873,6 +903,24 @@ async function uploadMultipartStream(
       currentPartIndex++;
     }
 
+    // Assert stream was fully consumed — with the trailing part drain fix,
+    // this should always be true. If not, there's a logic bug causing data loss.
+    if (!streamDone) {
+      const diagnostic = {
+        currentPartIndex,
+        totalParts: parts.length,
+        partSize,
+        totalFileSize,
+        uploadId: uploadInfo.uploadId,
+      };
+      console.error('[Upload] CRITICAL: Stream not fully consumed after read loop!', diagnostic);
+      captureError(new Error('Stream not fully consumed: potential data loss in multipart upload'), {
+        operation: 'upload.stream-exhaustion',
+        extra: diagnostic,
+      });
+      throw new Error('Upload failed: stream was not fully consumed. Please try again.');
+    }
+
     // Stream is done — flush the buffered item
     if (bufferedItem) {
       // Check if we only have 1 part total and it's too small for multipart
@@ -888,6 +936,7 @@ async function uploadMultipartStream(
       if (bufferedItem.blob.size < MIN_PART && pendingQueue.length > 0) {
         // Merge with the last pending part
         const lastPending = pendingQueue[pendingQueue.length - 1];
+        totalUploadedSize += bufferedItem.blob.size;
         const mergedBlob = new Blob([lastPending.blob, bufferedItem.blob]);
         console.log(`[Upload] Merging small final part (${(bufferedItem.blob.size / 1024).toFixed(1)}KB) into part ${lastPending.partNum} (${(lastPending.blob.size / (1024*1024)).toFixed(1)}MB → ${(mergedBlob.size / (1024*1024)).toFixed(1)}MB)`);
         lastPending.blob = mergedBlob;
@@ -922,6 +971,57 @@ async function uploadMultipartStream(
     }
 
     console.log(`[Upload] All ${completedParts.length} parts completed successfully`);
+
+    // Pre-completion consistency check: verify all non-trailing parts have identical sizes
+    // This is the key diagnostic for R2's "All non-trailing parts must have the same length" error
+    const sortedPartNums = Object.keys(uploadedPartSizes).map(Number).sort((a, b) => a - b);
+    if (sortedPartNums.length > 1) {
+      const maxPartNum = Math.max(...sortedPartNums);
+      const nonTrailingSizes = sortedPartNums
+        .filter(pn => pn !== maxPartNum)
+        .map(pn => ({ partNumber: pn, size: uploadedPartSizes[pn] }));
+
+      const expectedNonTrailingSize = nonTrailingSizes[0]?.size;
+      const inconsistentParts = nonTrailingSizes.filter(p => p.size !== expectedNonTrailingSize);
+
+      if (inconsistentParts.length > 0) {
+        const diagnostic = {
+          expectedSize: expectedNonTrailingSize,
+          inconsistentParts,
+          allPartSizes: uploadedPartSizes,
+          uploadId: uploadInfo.uploadId,
+          partSize,
+          totalFileSize,
+          totalParts: sortedPartNums.length,
+        };
+        console.error('[Upload] CRITICAL: Non-trailing part size inconsistency detected!', diagnostic);
+        captureError(new Error(`Non-trailing part size inconsistency: expected ${expectedNonTrailingSize}, found ${inconsistentParts.map(p => `part ${p.partNumber}=${p.size}`).join(', ')}`), {
+          operation: 'upload.part-size-consistency',
+          extra: diagnostic,
+        });
+      }
+    }
+
+    // Size mismatch telemetry: compare actual bytes consumed to the estimated total
+    // The upload still works (trailing part absorbed excess), but mismatches help tune estimates
+    if (totalFileSize !== undefined && totalUploadedSize !== totalFileSize) {
+      const delta = totalUploadedSize - totalFileSize;
+      const diagnostic = {
+        estimatedSize: totalFileSize,
+        actualSize: totalUploadedSize,
+        delta,
+        deltaPercent: ((delta / totalFileSize) * 100).toFixed(4),
+        uploadId: uploadInfo.uploadId,
+        totalParts: completedParts.length,
+        partSize,
+      };
+      console.warn(`[Upload] Size mismatch: estimated ${totalFileSize}, actual ${totalUploadedSize} (delta: ${delta > 0 ? '+' : ''}${delta})`, diagnostic);
+      addBreadcrumb(`Size estimate mismatch: delta ${delta > 0 ? '+' : ''}${delta} bytes (${diagnostic.deltaPercent}%)`, {
+        category: 'upload',
+        data: diagnostic,
+        level: 'warning',
+      });
+    }
 
     return {
       parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
