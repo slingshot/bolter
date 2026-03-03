@@ -11,7 +11,7 @@ import { UploadedFilesList } from '@/components/UploadedFilesList';
 import { ShareDialog } from '@/components/ShareDialog';
 import { useAppStore, type UploadedFile } from '@/stores/app';
 import { Keychain } from '@/lib/crypto';
-import { uploadFiles, Canceller } from '@/lib/api';
+import { uploadFiles, Canceller, FileReadError } from '@/lib/api';
 import { formatBytes } from '@/lib/utils';
 import { trackUpload } from '@/lib/plausible';
 import { UPLOAD_LIMITS } from '@bolter/shared';
@@ -111,6 +111,22 @@ export function HomePage() {
         addToast({
           title: 'Upload cancelled',
           variant: 'default',
+        });
+      } else if (e instanceof FileReadError) {
+        captureError(e.cause || e, {
+          operation: 'upload.file-read',
+          extra: {
+            fileCount: files.length,
+            totalSize: files.reduce((sum, f) => sum + f.file.size, 0),
+            encrypted,
+            errorMessage: e.message,
+          },
+        });
+        setUploadError(e.message);
+        addToast({
+          title: 'File not accessible',
+          description: e.message,
+          variant: 'destructive',
         });
       } else {
         captureError(e, {

@@ -4,6 +4,7 @@
 
 import JSZip from 'jszip';
 import { downloadZip, predictLength } from 'client-zip';
+import { FileReadError } from './errors';
 
 export interface FileInfo {
   name: string;
@@ -24,17 +25,26 @@ async function readFileWithProgress(
   file: File,
   onProgress: (bytesRead: number) => void
 ): Promise<Uint8Array> {
-  const reader = file.stream().getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = file.stream().getReader();
+  } catch (e) {
+    throw new FileReadError(file.name, e);
+  }
   const chunks: Uint8Array[] = [];
   let totalRead = 0;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    chunks.push(value);
-    totalRead += value.length;
-    onProgress(totalRead);
+      chunks.push(value);
+      totalRead += value.length;
+      onProgress(totalRead);
+    }
+  } catch (e) {
+    throw new FileReadError(file.name, e);
   }
 
   // Combine chunks
@@ -144,14 +154,22 @@ export function createStreamingZip(
 
   // Create file entries with progress tracking
   // Each entry wraps the file stream with progress reporting
-  const entries = renamedFiles.map(({ name, input }) => ({
-    name,
-    lastModified: new Date(input.lastModified),
-    input: createProgressStream(input.stream(), input.size, (bytes) => {
-      bytesProcessed += bytes;
-      onProgress?.(bytesProcessed, totalSize);
-    }),
-  }));
+  const entries = renamedFiles.map(({ name, input }) => {
+    let fileStream: ReadableStream<Uint8Array>;
+    try {
+      fileStream = input.stream();
+    } catch (e) {
+      throw new FileReadError(input.name, e);
+    }
+    return {
+      name,
+      lastModified: new Date(input.lastModified),
+      input: createProgressStream(fileStream, input.size, (bytes) => {
+        bytesProcessed += bytes;
+        onProgress?.(bytesProcessed, totalSize);
+      }),
+    };
+  });
 
   // Use client-zip to create the streaming zip
   const response = downloadZip(entries);

@@ -7,6 +7,9 @@ import { Keychain, arrayToB64, b64ToArray, calculateEncryptedSize, createEncrypt
 import { sliceConcatenatedData, createZipFromFiles, createZipFromUploadFiles, createStreamingZip, generateZipFilename, type FileInfo } from './zip';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { captureError, addBreadcrumb } from './sentry';
+import { FileReadError } from './errors';
+
+export { FileReadError } from './errors';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -583,17 +586,25 @@ function createFileStream(
             return;
           }
           currentFile = result.value;
-          currentReader = currentFile.stream().getReader();
+          try {
+            currentReader = currentFile.stream().getReader();
+          } catch (e) {
+            throw new FileReadError(currentFile.name, e);
+          }
         }
 
-        const { done, value } = await currentReader.read();
-        if (done) {
-          currentReader = null;
-          continue;
-        }
+        try {
+          const { done, value } = await currentReader.read();
+          if (done) {
+            currentReader = null;
+            continue;
+          }
 
-        controller.enqueue(value);
-        return;
+          controller.enqueue(value);
+          return;
+        } catch (e) {
+          throw new FileReadError(currentFile!.name, e);
+        }
       }
     },
   });
