@@ -20,11 +20,27 @@
         "lint": "bunx biome lint .",
         "lint:fix": "bunx biome lint --write .",
         "format": "bunx biome format --write .",
-        "check": "bunx biome check --write ."
+        "check": "bunx biome check --write .",
+        "commit": "cz",
+        "prepare": "lefthook install"
     },
+    "config": {
+        "commitizen": {
+            "path": "cz-conventional-changelog"
+        }
+    },
+    "trustedDependencies": [
+        "lefthook"
+    ],
     "devDependencies": {
         "@biomejs/biome": "^2.4.5",
-        "@dotenvx/dotenvx": "^1.51.4"
+        "@commitlint/cli": "^20.4.2",
+        "@commitlint/config-conventional": "^20.4.2",
+        "@commitlint/types": "^20.4.0",
+        "@dotenvx/dotenvx": "^1.51.4",
+        "commitizen": "^4.3.1",
+        "cz-conventional-changelog": "^3.3.0",
+        "lefthook": "^2.1.2"
     },
     "dependencies": {
         "@vercel/analytics": "^1.6.1"
