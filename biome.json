@@ -1,0 +1,69 @@
+{
+    "$schema": "https://biomejs.dev/schemas/2.4.5/schema.json",
+    "assist": {
+        "actions": {
+            "source": {
+                "organizeImports": "on"
+            }
+        }
+    },
+    "formatter": {
+        "enabled": true,
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineWidth": 100
+    },
+    "linter": {
+        "enabled": true,
+        "rules": {
+            "recommended": true,
+            "correctness": {
+                "noUnusedVariables": "warn",
+                "noUndeclaredVariables": "error"
+            },
+            "style": {
+                "useBlockStatements": "error",
+                "useCollapsedElseIf": "error",
+                "useConst": "error",
+                "useDefaultParameterLast": "error",
+                "useExponentiationOperator": "error",
+                "useFragmentSyntax": "error",
+                "useSelfClosingElements": "error",
+                "useSingleVarDeclarator": "error",
+                "useTemplate": "error",
+                "noParameterAssign": "error",
+                "noNegationElse": "error",
+                "noDefaultExport": "off"
+            },
+            "suspicious": {
+                "noDoubleEquals": "error",
+                "noEmptyBlockStatements": "error",
+                "noFallthroughSwitchClause": "error",
+                "noSelfCompare": "error",
+                "useAwait": "error",
+                "useDefaultSwitchClauseLast": "error"
+            }
+        }
+    },
+    "javascript": {
+        "formatter": {
+            "quoteStyle": "single",
+            "trailingCommas": "all",
+            "semicolons": "always",
+            "arrowParentheses": "always",
+            "bracketSameLine": false,
+            "bracketSpacing": true,
+            "jsxQuoteStyle": "double"
+        }
+    },
+    "json": {
+        "formatter": {
+            "trailingCommas": "none",
+            "indentStyle": "space",
+            "indentWidth": 4
+        }
+    },
+    "files": {
+        "includes": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.json"]
+    }
+}

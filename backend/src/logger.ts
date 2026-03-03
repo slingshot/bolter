@@ -2,17 +2,18 @@ import pino from 'pino';
 import { config } from './config';
 
 export const logger = pino({
-  level: config.env === 'development' ? 'debug' : 'info',
-  transport: config.env === 'development'
-    ? {
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          translateTime: 'SYS:HH:MM:ss',
-          ignore: 'pid,hostname',
-        },
-      }
-    : undefined,
+    level: config.env === 'development' ? 'debug' : 'info',
+    transport:
+        config.env === 'development'
+            ? {
+                  target: 'pino-pretty',
+                  options: {
+                      colorize: true,
+                      translateTime: 'SYS:HH:MM:ss',
+                      ignore: 'pid,hostname',
+                  },
+              }
+            : undefined,
 });
 
 // Child loggers for different modules

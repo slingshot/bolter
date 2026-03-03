@@ -3,89 +3,96 @@ import { config } from '../config';
 import { captureError } from '../lib/sentry';
 
 export class RedisStorage {
-  private client: RedisClientType | null = null;
-  private connecting = false;
+    private client: RedisClientType | null = null;
+    private connecting = false;
 
-  async connect(): Promise<void> {
-    if (this.client || this.connecting) return;
-    this.connecting = true;
+    async connect(): Promise<void> {
+        if (this.client || this.connecting) {
+            return;
+        }
+        this.connecting = true;
 
-    this.client = createClient({ url: config.redisUrl });
+        this.client = createClient({ url: config.redisUrl });
 
-    this.client.on('error', (err) => {
-      captureError(err, { operation: 'redis.connection', level: 'error' });
-      console.error('Redis Client Error:', err);
-    });
+        this.client.on('error', (err) => {
+            captureError(err, { operation: 'redis.connection', level: 'error' });
+            console.error('Redis Client Error:', err);
+        });
 
-    await this.client.connect();
-    this.connecting = false;
-  }
-
-  private async getClient(): Promise<RedisClientType> {
-    if (!this.client) {
-      await this.connect();
+        await this.client.connect();
+        this.connecting = false;
     }
-    return this.client!;
-  }
 
-  async ping(): Promise<boolean> {
-    try {
-      const client = await this.getClient();
-      await client.ping();
-      return true;
-    } catch {
-      return false;
+    private async getClient(): Promise<RedisClientType> {
+        if (!this.client) {
+            await this.connect();
+        }
+        if (!this.client) {
+            throw new Error('Redis client failed to initialize');
+        }
+        return this.client;
     }
-  }
 
-  async hSet(key: string, field: string, value: string): Promise<void> {
-    const client = await this.getClient();
-    await client.hSet(key, field, value);
-  }
+    async ping(): Promise<boolean> {
+        try {
+            const client = await this.getClient();
+            await client.ping();
+            return true;
+        } catch {
+            return false;
+        }
+    }
 
-  async hGet(key: string, field: string): Promise<string | null> {
-    const client = await this.getClient();
-    const result = await client.hGet(key, field);
-    return result ?? null;
-  }
+    async hSet(key: string, field: string, value: string): Promise<void> {
+        const client = await this.getClient();
+        await client.hSet(key, field, value);
+    }
 
-  async hGetAll(key: string): Promise<Record<string, string> | null> {
-    const client = await this.getClient();
-    const result = await client.hGetAll(key);
-    if (Object.keys(result).length === 0) return null;
-    return result;
-  }
+    async hGet(key: string, field: string): Promise<string | null> {
+        const client = await this.getClient();
+        const result = await client.hGet(key, field);
+        return result ?? null;
+    }
 
-  async hDel(key: string, ...fields: string[]): Promise<void> {
-    const client = await this.getClient();
-    await client.hDel(key, fields);
-  }
+    async hGetAll(key: string): Promise<Record<string, string> | null> {
+        const client = await this.getClient();
+        const result = await client.hGetAll(key);
+        if (Object.keys(result).length === 0) {
+            return null;
+        }
+        return result;
+    }
 
-  async expire(key: string, seconds: number): Promise<void> {
-    const client = await this.getClient();
-    await client.expire(key, seconds);
-  }
+    async hDel(key: string, ...fields: string[]): Promise<void> {
+        const client = await this.getClient();
+        await client.hDel(key, fields);
+    }
 
-  async del(key: string): Promise<void> {
-    const client = await this.getClient();
-    await client.del(key);
-  }
+    async expire(key: string, seconds: number): Promise<void> {
+        const client = await this.getClient();
+        await client.expire(key, seconds);
+    }
 
-  async exists(key: string): Promise<boolean> {
-    const client = await this.getClient();
-    const result = await client.exists(key);
-    return result === 1;
-  }
+    async del(key: string): Promise<void> {
+        const client = await this.getClient();
+        await client.del(key);
+    }
 
-  async ttl(key: string): Promise<number> {
-    const client = await this.getClient();
-    return client.ttl(key);
-  }
+    async exists(key: string): Promise<boolean> {
+        const client = await this.getClient();
+        const result = await client.exists(key);
+        return result === 1;
+    }
 
-  async hIncrBy(key: string, field: string, increment: number): Promise<number> {
-    const client = await this.getClient();
-    return client.hIncrBy(key, field, increment);
-  }
+    async ttl(key: string): Promise<number> {
+        const client = await this.getClient();
+        return client.ttl(key);
+    }
+
+    async hIncrBy(key: string, field: string, increment: number): Promise<number> {
+        const client = await this.getClient();
+        return client.hIncrBy(key, field, increment);
+    }
 }
 
 export const redis = new RedisStorage();
