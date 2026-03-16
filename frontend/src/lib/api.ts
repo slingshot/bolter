@@ -59,6 +59,16 @@ function updateObservedSpeed(speed: number): void {
     }
 }
 
+function waitForOnline(): Promise<void> {
+    if (navigator.onLine) {
+        return Promise.resolve();
+    }
+    console.log('[Upload] Offline — waiting for connection...');
+    return new Promise((resolve) => {
+        window.addEventListener('online', () => resolve(), { once: true });
+    });
+}
+
 function getPreferredPartSize(): number | undefined {
     const speed = getObservedSpeed();
     if (speed === 0) {
@@ -1217,6 +1227,7 @@ async function uploadPartWithRetry(
         );
 
         if (retryCount < MAX_RETRIES && isRetryable) {
+            await waitForOnline();
             const delay = Math.min(
                 RETRY_DELAY_BASE * 2 ** retryCount + Math.random() * 1000,
                 MAX_RETRY_DELAY,
@@ -1279,6 +1290,16 @@ function uploadPart(
             }, STALL_TIMEOUT);
         };
 
+        // Pause stall timer when offline
+        const handleOffline = () => {
+            clearTimeout(stallTimer);
+        };
+        const handleOnline = () => {
+            resetStallTimer();
+        };
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('online', handleOnline);
+
         xhr.upload.addEventListener('progress', (e) => {
             resetStallTimer();
             if (e.lengthComputable) {
@@ -1290,6 +1311,8 @@ function uploadPart(
 
         xhr.addEventListener('loadend', () => {
             clearTimeout(stallTimer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
             canceller.removeXhr(xhr);
 
             if (xhr.status >= 200 && xhr.status < 300) {
@@ -1321,6 +1344,8 @@ function uploadPart(
 
         xhr.addEventListener('error', () => {
             clearTimeout(stallTimer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
             canceller.removeXhr(xhr);
             reject(new Error('Network error'));
         });
