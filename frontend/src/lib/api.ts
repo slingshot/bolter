@@ -3,7 +3,7 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { UPLOAD_LIMITS } from '@bolter/shared';
+import { PART_SIZE_TIERS, UPLOAD_LIMITS } from '@bolter/shared';
 import {
     arrayToB64,
     b64ToArray,
@@ -35,6 +35,43 @@ const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
+
+// Speed persistence via localStorage
+const SPEED_STORAGE_KEY = 'bolter:uploadSpeed';
+
+function getObservedSpeed(): number {
+    try {
+        const stored = localStorage.getItem(SPEED_STORAGE_KEY);
+        return stored ? Number(stored) : 0;
+    } catch {
+        return 0;
+    }
+}
+
+function updateObservedSpeed(speed: number): void {
+    try {
+        const current = getObservedSpeed();
+        // Exponential moving average (alpha = 0.3)
+        const smoothed = current === 0 ? speed : current * 0.7 + speed * 0.3;
+        localStorage.setItem(SPEED_STORAGE_KEY, smoothed.toString());
+    } catch {
+        // Ignore storage errors
+    }
+}
+
+function getPreferredPartSize(): number | undefined {
+    const speed = getObservedSpeed();
+    if (speed === 0) {
+        return undefined; // No data yet, use server default
+    }
+
+    for (const tier of PART_SIZE_TIERS) {
+        if (speed >= tier.minSpeed) {
+            return tier.partSize;
+        }
+    }
+    return PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize;
+}
 
 // Adaptive concurrency based on file size
 // With backpressure, memory is bounded to ~(concurrency + 1) * partSize
@@ -436,6 +473,7 @@ export async function uploadFiles(
             encrypted,
             timeLimit,
             dlimit: downloadLimit,
+            preferredPartSize: getPreferredPartSize(),
         }),
     });
 
@@ -776,6 +814,9 @@ async function uploadMultipartStream(
     // Track actual uploaded part sizes for pre-completion consistency check
     const uploadedPartSizes: Record<number, number> = {};
 
+    // Track per-part start times for speed measurement
+    const partStartTimes: Record<number, number> = {};
+
     // Promise to signal when all uploads are done
     let resolveAllDone: () => void;
     const allDonePromise = new Promise<void>((resolve) => {
@@ -792,6 +833,7 @@ async function uploadMultipartStream(
             console.log(
                 `[Upload] Part ${partNum} starting (${(partBlob.size / (1024 * 1024)).toFixed(1)}MB)`,
             );
+            partStartTimes[partNum] = Date.now();
             const result = await uploadPartWithRetry(
                 partBlob,
                 partUrl,
@@ -799,6 +841,10 @@ async function uploadMultipartStream(
                 (loaded) => onProgress(partNum, loaded),
                 canceller,
             );
+            const elapsed = (Date.now() - partStartTimes[partNum]) / 1000;
+            if (elapsed > 0) {
+                updateObservedSpeed(partBlob.size / elapsed);
+            }
             completedParts.push(result);
             uploadedPartSizes[partNum] = partBlob.size;
             console.log(`[Upload] Part ${partNum} complete`);

@@ -34,6 +34,15 @@ export const DOWNLOAD_LIMITS = {
     DOWNLOAD_COUNTS: [1, 2, 3, 4, 5, 20, 50, 100],
 } as const;
 
+// Part size tiers based on observed upload speed
+// Slower connections use smaller parts to reduce wasted bandwidth on retries
+export const PART_SIZE_TIERS = [
+    { minSpeed: 50 * BYTES.MB, partSize: 200 * BYTES.MB }, // ≥50 MB/s
+    { minSpeed: 10 * BYTES.MB, partSize: 100 * BYTES.MB }, // 10-50 MB/s
+    { minSpeed: 2 * BYTES.MB, partSize: 50 * BYTES.MB }, // 2-10 MB/s
+    { minSpeed: 0, partSize: 25 * BYTES.MB }, // <2 MB/s
+] as const;
+
 // UI defaults
 export const UI_DEFAULTS = {
     TITLE: 'Slingshot Send',

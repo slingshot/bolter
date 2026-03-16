@@ -19,8 +19,19 @@ interface PartInfo {
     maxSize: number;
 }
 
-function calculateOptimalPartSize(fileSize: number): { partSize: number; numParts: number } {
+function calculateOptimalPartSize(
+    fileSize: number,
+    preferredPartSize?: number,
+): { partSize: number; numParts: number } {
     let partSize = DEFAULT_PART_SIZE;
+
+    // Use client-preferred part size if provided and within valid bounds
+    if (preferredPartSize) {
+        if (preferredPartSize >= MIN_PART_SIZE && preferredPartSize <= MAX_PART_SIZE) {
+            partSize = preferredPartSize;
+        }
+    }
+
     let numParts = Math.ceil(fileSize / partSize);
 
     if (numParts > MAX_PARTS) {
@@ -59,7 +70,7 @@ export const uploadRoutes = new Elysia()
     .post(
         '/upload/url',
         async ({ body, request }) => {
-            const { fileSize, encrypted, timeLimit, dlimit } = body;
+            const { fileSize, encrypted, timeLimit, dlimit, preferredPartSize } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info(
@@ -161,7 +172,10 @@ export const uploadRoutes = new Elysia()
             );
 
             if (useMultipart) {
-                const { partSize, numParts } = calculateOptimalPartSize(fileSize);
+                const { partSize, numParts } = calculateOptimalPartSize(
+                    fileSize,
+                    preferredPartSize,
+                );
 
                 logger.info(
                     {
@@ -339,6 +353,7 @@ export const uploadRoutes = new Elysia()
                 encrypted: t.Optional(t.Boolean()),
                 timeLimit: t.Optional(t.Number()),
                 dlimit: t.Optional(t.Number()),
+                preferredPartSize: t.Optional(t.Number()),
             }),
         },
     )
