@@ -100,6 +100,9 @@ export interface UploadProgress {
     percentage: number;
     speed: number; // bytes per second
     remainingTime: number; // seconds
+    retryCount: number;
+    isOffline: boolean;
+    connectionQuality: 'good' | 'fair' | 'slow' | 'stalled' | 'offline';
 }
 
 export interface UploadResult {
@@ -396,6 +399,8 @@ export async function uploadFiles(
     let lastDisplayTime = startTime;
     let smoothedSpeed = 0;
     let smoothedRemaining = 0;
+    let totalRetryCount = 0;
+    let lastPartProgressTime = Date.now();
 
     // Determine upload strategy for multi-file uploads
     const isMultiFile = files.length > 1;
@@ -508,6 +513,11 @@ export async function uploadFiles(
         const bytesInPeriod = totalLoaded - lastProgressBytes;
         const instantSpeed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
 
+        // Track last time we saw actual bytes moving
+        if (bytesInPeriod > 0) {
+            lastPartProgressTime = now;
+        }
+
         // Update speed/time calculation once per second with smoothing
         const displayElapsed = (now - lastDisplayTime) / 1000;
         if (displayElapsed >= 1 || lastDisplayTime === startTime) {
@@ -520,6 +530,21 @@ export async function uploadFiles(
             lastProgressBytes = totalLoaded;
         }
 
+        // Compute connection quality
+        const isOffline = !navigator.onLine;
+        let connectionQuality: UploadProgress['connectionQuality'];
+        if (isOffline) {
+            connectionQuality = 'offline';
+        } else if (smoothedSpeed === 0 || now - lastPartProgressTime > 10000) {
+            connectionQuality = 'stalled';
+        } else if (smoothedSpeed < 1 * 1024 * 1024) {
+            connectionQuality = 'slow';
+        } else if (smoothedSpeed < 10 * 1024 * 1024) {
+            connectionQuality = 'fair';
+        } else {
+            connectionQuality = 'good';
+        }
+
         // Always update progress bar, but speed/time stay stable between updates
         onProgress?.({
             loaded: Math.min(totalLoaded, totalSize),
@@ -527,6 +552,9 @@ export async function uploadFiles(
             percentage: Math.min((totalLoaded / totalSize) * 100, 100),
             speed: smoothedSpeed,
             remainingTime: smoothedRemaining,
+            retryCount: totalRetryCount,
+            isOffline,
+            connectionQuality,
         });
     };
 
@@ -541,6 +569,13 @@ export async function uploadFiles(
             canceller,
             onError,
             totalSize,
+            () => {
+                totalRetryCount++;
+                // Trigger a progress update so the UI reflects the new retry count.
+                // Re-emit part 1's current tracked bytes (or 0 if not started yet).
+                const part1Bytes = partProgress[1] ?? 0;
+                updateProgress(1, part1Bytes);
+            },
         );
 
         // Handle fallback: stream produced too little data for multipart
@@ -794,6 +829,7 @@ async function uploadMultipartStream(
     canceller: Canceller,
     onError?: (error: UploadError) => void,
     totalFileSize?: number,
+    onRetry?: () => void,
 ): Promise<MultipartStreamResult> {
     const { parts, partSize } = uploadInfo;
     if (!parts || !partSize) {
@@ -850,6 +886,8 @@ async function uploadMultipartStream(
                 partNum,
                 (loaded) => onProgress(partNum, loaded),
                 canceller,
+                0,
+                onRetry,
             );
             const elapsed = (Date.now() - partStartTimes[partNum]) / 1000;
             if (elapsed > 0) {
@@ -1208,6 +1246,7 @@ async function uploadPartWithRetry(
     onProgress: (loaded: number) => void,
     canceller: Canceller,
     retryCount = 0,
+    onRetry?: () => void,
 ): Promise<{ PartNumber: number; ETag: string }> {
     try {
         return await uploadPart(blob, url, partNumber, onProgress, canceller);
@@ -1235,6 +1274,8 @@ async function uploadPartWithRetry(
 
             console.log(`[Upload] Retrying part ${partNumber} in ${(delay / 1000).toFixed(1)}s...`);
 
+            onRetry?.();
+
             await new Promise((resolve) => setTimeout(resolve, delay));
 
             if (canceller.cancelled) {
@@ -1249,6 +1290,7 @@ async function uploadPartWithRetry(
                 onProgress,
                 canceller,
                 retryCount + 1,
+                onRetry,
             );
         }
 
