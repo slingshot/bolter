@@ -17,6 +17,7 @@ export interface FileMetadata {
     uploadId?: string;
     multipart?: boolean;
     numParts?: number;
+    partSize?: number;
 }
 
 export const storage = {
@@ -54,8 +55,13 @@ export const storage = {
         }
     },
 
-    getSignedMultipartUploadUrl(id: string, uploadId: string, partNumber: number): Promise<string> {
-        return s3Storage.getSignedMultipartUploadUrl(id, uploadId, partNumber);
+    getSignedMultipartUploadUrl(
+        id: string,
+        uploadId: string,
+        partNumber: number,
+        expiresIn?: number,
+    ): Promise<string> {
+        return s3Storage.getSignedMultipartUploadUrl(id, uploadId, partNumber, expiresIn);
     },
 
     completeMultipartUpload(id: string, uploadId: string, parts: CompletedPart[]): Promise<void> {
@@ -112,6 +118,7 @@ export const storage = {
             uploadId: data.uploadId,
             multipart: data.multipart === 'true',
             numParts: data.numParts ? parseInt(data.numParts, 10) : undefined,
+            partSize: data.partSize ? parseInt(data.partSize, 10) : undefined,
         };
     },
 

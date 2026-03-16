@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { type Canceller, deleteFile, type UploadProgress } from '@/lib/api';
 import type { Keychain } from '@/lib/crypto';
 import { captureError } from '@/lib/sentry';
+import type { PersistedUpload } from '@/lib/upload-state';
 
 export interface FileItem {
     id: string;
@@ -63,6 +64,10 @@ export interface AppState {
     removeUploadedFile: (id: string) => void;
     updateUploadedFile: (id: string, updates: Partial<UploadedFile>) => void;
     clearUploadedFiles: () => void;
+
+    // Resumable upload
+    resumableUpload: PersistedUpload | null;
+    setResumableUpload: (upload: PersistedUpload | null) => void;
 
     // Config
     config: {
@@ -194,6 +199,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         localStorage.removeItem('uploadedFiles');
         set({ uploadedFiles: [] });
     },
+
+    // Resumable upload
+    resumableUpload: null,
+    setResumableUpload: (resumableUpload) => set({ resumableUpload }),
 
     // Config
     config: null,
