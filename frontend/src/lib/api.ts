@@ -34,6 +34,7 @@ export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:30
 const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
+const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Adaptive concurrency based on file size
 // With backpressure, memory is bounded to ~(concurrency + 1) * partSize
@@ -1223,13 +1224,26 @@ function uploadPart(
         const xhr = new XMLHttpRequest();
         canceller.addXhr(xhr);
 
+        let stallTimer: ReturnType<typeof setTimeout>;
+        const resetStallTimer = () => {
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+                xhr.abort();
+                reject(new Error('Upload stalled'));
+            }, STALL_TIMEOUT);
+        };
+
         xhr.upload.addEventListener('progress', (e) => {
+            resetStallTimer();
             if (e.lengthComputable) {
                 onProgress(e.loaded);
             }
         });
 
+        xhr.addEventListener('loadstart', resetStallTimer);
+
         xhr.addEventListener('loadend', () => {
+            clearTimeout(stallTimer);
             canceller.removeXhr(xhr);
 
             if (xhr.status >= 200 && xhr.status < 300) {
@@ -1260,17 +1274,12 @@ function uploadPart(
         });
 
         xhr.addEventListener('error', () => {
+            clearTimeout(stallTimer);
             canceller.removeXhr(xhr);
             reject(new Error('Network error'));
         });
 
-        xhr.addEventListener('timeout', () => {
-            canceller.removeXhr(xhr);
-            reject(new Error('Timeout'));
-        });
-
         xhr.open('PUT', url);
-        xhr.timeout = 120000; // 2 minute timeout
         xhr.send(blob);
     });
 }
@@ -1287,6 +1296,7 @@ function isRetryableError(error: Error): boolean {
         msg.includes('network') ||
         msg.includes('timeout') ||
         msg.includes('abort') ||
+        msg.includes('stalled') ||
         msg.includes('failed to fetch') ||
         /http 5\d\d/.test(msg) ||
         msg.includes('http 429') ||
