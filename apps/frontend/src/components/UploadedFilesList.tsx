@@ -1,5 +1,5 @@
 import { Download, File, Link2, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { getFileInfo } from '@/lib/api';
 import { formatBytes, formatTimeLimit } from '@/lib/utils';
@@ -15,24 +15,31 @@ export function UploadedFilesList() {
     // Filter out expired files
     const validFiles = uploadedFiles.filter((f) => f.expiresAt.getTime() > Date.now());
 
-    // Poll for download count updates
-    useEffect(() => {
-        const pollFileInfo = async () => {
-            for (const file of validFiles) {
-                const info = await getFileInfo(file.id, file.ownerToken);
-                if (info === null) {
-                    // File no longer exists - remove from list
-                    removeUploadedFile(file.id);
-                } else if (info.dl >= info.dlimit) {
-                    // Download limit reached - remove from list
-                    removeUploadedFile(file.id);
-                } else if (info.dl !== file.downloadCount) {
-                    // Update download count
-                    updateUploadedFile(file.id, { downloadCount: info.dl });
-                }
-            }
-        };
+    // Stable ref to current valid file IDs so the poll callback doesn't
+    // depend on the array reference (which changes every render)
+    const validFilesRef = useRef(uploadedFiles);
+    validFilesRef.current = uploadedFiles;
 
+    // Poll for download count updates
+    const pollFileInfo = useCallback(async () => {
+        const files = validFilesRef.current.filter((f) => f.expiresAt.getTime() > Date.now());
+        for (const file of files) {
+            const info = await getFileInfo(file.id, file.ownerToken);
+            if (info.status === 'not_found') {
+                // File confirmed deleted on the server — safe to remove
+                removeUploadedFile(file.id);
+            } else if (info.status === 'ok' && info.dl >= info.dlimit) {
+                // Download limit reached - remove from list
+                removeUploadedFile(file.id);
+            } else if (info.status === 'ok' && info.dl !== file.downloadCount) {
+                // Update download count
+                updateUploadedFile(file.id, { downloadCount: info.dl });
+            }
+            // status === 'error' → network issue, skip (don't remove)
+        }
+    }, [removeUploadedFile, updateUploadedFile]);
+
+    useEffect(() => {
         // Poll immediately on mount
         pollFileInfo();
 
@@ -44,12 +51,7 @@ export function UploadedFilesList() {
                 clearInterval(pollIntervalRef.current);
             }
         };
-    }, [
-        validFiles.length, // Update download count
-        updateUploadedFile, // Download limit reached - remove from list
-        removeUploadedFile,
-        validFiles,
-    ]); // Re-run when file count changes
+    }, [pollFileInfo]);
 
     if (validFiles.length === 0) {
         return null;

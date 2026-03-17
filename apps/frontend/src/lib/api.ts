@@ -428,26 +428,29 @@ export async function deleteFile(id: string, ownerToken: string): Promise<boolea
 /**
  * Get file info (download count, limit, TTL) - requires owner token
  */
-export async function getFileInfo(
-    id: string,
-    ownerToken: string,
-): Promise<{
-    dl: number;
-    dlimit: number;
-    ttl: number;
-} | null> {
+export type FileInfoResult =
+    | { status: 'ok'; dl: number; dlimit: number; ttl: number }
+    | { status: 'not_found' }
+    | { status: 'error' };
+
+export async function getFileInfo(id: string, ownerToken: string): Promise<FileInfoResult> {
     try {
         const response = await fetch(`${API_BASE_URL}/info/${id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ owner_token: ownerToken }),
         });
-        if (!response.ok) {
-            return null;
+        if (response.status === 404) {
+            return { status: 'not_found' };
         }
-        return response.json();
+        if (!response.ok) {
+            return { status: 'error' };
+        }
+        const data = await response.json();
+        return { status: 'ok', ...data };
     } catch {
-        return null;
+        // Network error — don't assume file is deleted
+        return { status: 'error' };
     }
 }
 
@@ -676,9 +679,18 @@ export async function uploadFiles(
         const totalLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
 
         const now = Date.now();
+
+        // When totalLoaded drops (part retry reset), re-baseline so
+        // the next progress event doesn't produce a huge speed spike.
+        if (totalLoaded < lastProgressBytes) {
+            lastProgressBytes = totalLoaded;
+            lastProgressTime = now;
+        }
+
         const elapsed = (now - lastProgressTime) / 1000;
         const bytesInPeriod = totalLoaded - lastProgressBytes;
-        const instantSpeed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
+        // Clamp to zero: progress resets during retries can cause negative deltas
+        const instantSpeed = elapsed > 0 ? Math.max(0, bytesInPeriod / elapsed) : 0;
 
         if (bytesInPeriod > 0) {
             lastPartProgressTime = now;
@@ -985,6 +997,14 @@ export async function resumeUpload(
         const totalLoaded = alreadyUploaded + partLoaded;
 
         const now = Date.now();
+
+        // When partLoaded drops (part retry reset), re-baseline so
+        // the next progress event doesn't produce a huge speed spike.
+        if (partLoaded < lastProgressBytes) {
+            lastProgressBytes = partLoaded;
+            lastProgressTime = now;
+        }
+
         const elapsed = (now - lastProgressTime) / 1000;
         // Use partLoaded (not totalLoaded) for speed calculation to avoid
         // the alreadyUploaded offset skewing the delta between updates
