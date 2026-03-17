@@ -695,32 +695,40 @@ export const uploadRoutes = new Elysia()
     )
 
     // Speed test endpoint — accepts and discards a blob for preflight measurement
-    .put('/upload/speedtest', async ({ request }) => {
-        const startTime = Date.now();
-        let totalBytes = 0;
+    .post(
+        '/upload/speedtest',
+        async ({ request }) => {
+            const startTime = Date.now();
+            let totalBytes = 0;
 
-        const body = request.body;
-        if (body) {
-            const reader = (body as ReadableStream).getReader();
-            // biome-ignore lint/correctness/noConstantCondition: intentional drain loop
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
-                }
-                if (value) {
-                    totalBytes += value.length;
+            const body = request.body;
+            if (body) {
+                const reader = (body as ReadableStream).getReader();
+                // biome-ignore lint/correctness/noConstantCondition: intentional drain loop
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    if (value) {
+                        totalBytes += value.length;
+                    }
                 }
             }
-        }
 
-        const elapsed = (Date.now() - startTime) / 1000;
-        const speedMbps =
-            elapsed > 0 ? Math.round((totalBytes / (1024 * 1024) / elapsed) * 10) / 10 : 0;
-        logger.info(
-            { totalBytes, elapsedMs: Date.now() - startTime, speedMbps },
-            'Speed test completed',
-        );
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speedMbps =
+                elapsed > 0 ? Math.round((totalBytes / (1024 * 1024) / elapsed) * 10) / 10 : 0;
+            logger.info(
+                { totalBytes, elapsedMs: Date.now() - startTime, speedMbps },
+                'Speed test completed',
+            );
 
-        return { ok: true, speedMbps };
-    });
+            return { ok: true, speedMbps };
+        },
+        {
+            // Skip Elysia body parsing — we stream the raw body ourselves
+            // biome-ignore lint/suspicious/noEmptyBlockStatements: intentional no-op parser
+            parse: () => {},
+        },
+    );

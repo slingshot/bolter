@@ -87,17 +87,28 @@ async function measureUploadSpeed(): Promise<number> {
             xhr.addEventListener('loadend', () => {
                 clearTimeout(timeout);
                 const elapsed = (Date.now() - startTime) / 1000;
-                // Use total blob size on success, tracked bytes on abort
-                const bytes = xhr.status >= 200 && xhr.status < 300 ? blob.size : uploadedBytes;
-                resolve(elapsed > 0 ? bytes / elapsed : 0);
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(elapsed > 0 ? blob.size / elapsed : 0);
+                } else if (xhr.status !== 0) {
+                    // Non-zero status = server responded with error
+                    console.warn(
+                        `[Upload] Speed test failed: HTTP ${xhr.status} ${xhr.statusText}`,
+                    );
+                    resolve(0);
+                } else {
+                    // status 0 = aborted by timeout (expected), use tracked bytes
+                    resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
+                }
             });
 
             xhr.addEventListener('error', () => {
                 clearTimeout(timeout);
+                console.warn(`[Upload] Speed test network error (status=${xhr.status})`);
                 resolve(0);
             });
 
-            xhr.open('PUT', `${API_BASE_URL}/upload/speedtest`);
+            xhr.open('POST', `${API_BASE_URL}/upload/speedtest`);
+            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
             xhr.send(blob);
         });
     } catch {
