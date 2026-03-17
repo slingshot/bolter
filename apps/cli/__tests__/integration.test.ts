@@ -2,7 +2,6 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Server } from 'bun';
 import { checkExists, getServerConfig } from '../lib/api';
 import { b64ToArray, Keychain } from '../lib/crypto';
 import { downloadFile } from '../lib/download-engine';
@@ -13,7 +12,8 @@ import { parseBolterUrl } from '../lib/url';
 // Mock server
 // ---------------------------------------------------------------------------
 
-let server: Server;
+// biome-ignore lint: Bun Server generic
+let server: any;
 let serverUrl: string;
 const fileStore = new Map<string, { data: Uint8Array; metadata: any }>();
 
@@ -113,7 +113,7 @@ beforeAll(() => {
                 if (!stored) {
                     return new Response('Not found', { status: 404 });
                 }
-                return new Response(stored.data);
+                return new Response(stored.data as unknown as BodyInit);
             }
 
             // POST /download/complete/:id
@@ -311,8 +311,9 @@ describe('encrypted upload + download', () => {
         expect(stored).toBeTruthy();
 
         // The raw bytes on the "server" must not match the plaintext
-        expect(sha256hex(stored?.data)).not.toBe(sha256hex(plaintext));
-        expect(stored?.data.length).toBeGreaterThan(plaintext.length);
+        const storedData = stored!.data;
+        expect(sha256hex(storedData)).not.toBe(sha256hex(plaintext));
+        expect(storedData.length).toBeGreaterThan(plaintext.length);
     });
 
     test('encrypted metadata is not readable without key', async () => {
