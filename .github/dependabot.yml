@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      frontend:
+        patterns:
+          - "@radix-ui/*"
+          - "@sentry/react"
+          - "@sentry/vite-plugin"
+          - "@vitejs/*"
+          - "react"
+          - "react-dom"
+          - "react-router-dom"
+          - "tailwindcss"
+          - "vite"
+          - "lucide-react"
+          - "zustand"
+      backend:
+        patterns:
+          - "@aws-sdk/*"
+          - "@elysiajs/*"
+          - "elysia"
+          - "redis"
+          - "pino"
+          - "pino-pretty"
+          - "convict"
+      sentry:
+        patterns:
+          - "@sentry/*"
+      dev-tooling:
+        patterns:
+          - "@biomejs/*"
+          - "@commitlint/*"
+          - "commitizen"
+          - "lefthook"
+          - "turbo"
+          - "typescript"
