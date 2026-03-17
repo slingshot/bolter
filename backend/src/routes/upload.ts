@@ -694,34 +694,57 @@ export const uploadRoutes = new Elysia()
         },
     )
 
-    // Speed test — returns a pre-signed S3 URL for the client to upload to directly.
-    // The client uploads a junk blob to S3, measures speed, then we delete the object.
+    // Speed test — creates a multipart upload with 5 pre-signed part URLs.
+    // The client uploads 5x100MB parts concurrently to measure real throughput.
     .post('/upload/speedtest', async () => {
+        const SPEEDTEST_NUM_PARTS = 5;
         const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
-        const url = await storage.getSignedUploadUrl(testId, 60);
-        if (!url) {
-            return { error: 'Failed to generate speed test URL' };
+
+        try {
+            const uploadId = await storage.createMultipartUpload(testId);
+            if (!uploadId) {
+                return { error: 'Failed to create speed test upload' };
+            }
+
+            const parts = await Promise.all(
+                Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
+                    storage
+                        .getSignedMultipartUploadUrl(testId, uploadId, i + 1, 60)
+                        .then((url) => ({ partNumber: i + 1, url })),
+                ),
+            );
+
+            logger.info(
+                { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS },
+                'Speed test URLs generated',
+            );
+            return { testId, uploadId, parts };
+        } catch (e) {
+            logger.warn({ testId, error: e }, 'Speed test setup failed');
+            return { error: 'Speed test setup failed' };
         }
-        logger.info({ testId }, 'Speed test URL generated');
-        return { url, testId };
     })
 
     // Clean up speed test object after the test completes
     .post(
         '/upload/speedtest/cleanup',
         async ({ body }) => {
-            const { testId } = body;
+            const { testId, uploadId } = body;
             try {
-                await storage.del(testId);
-                logger.info({ testId }, 'Speed test object deleted');
+                // Abort the multipart upload (cleans up parts from S3)
+                if (uploadId) {
+                    await storage.abortMultipartUpload(testId, uploadId);
+                }
+                logger.info({ testId }, 'Speed test cleaned up');
             } catch (e) {
-                logger.warn({ testId, error: e }, 'Failed to delete speed test object');
+                logger.warn({ testId, error: e }, 'Failed to clean up speed test');
             }
             return { ok: true };
         },
         {
             body: t.Object({
                 testId: t.String(),
+                uploadId: t.Optional(t.String()),
             }),
         },
     );

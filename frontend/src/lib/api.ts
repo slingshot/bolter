@@ -44,8 +44,9 @@ const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Preflight speed test configuration
-const PREFLIGHT_SIZE = 500 * 1024 * 1024; // 500MB test payload
-const PREFLIGHT_TIMEOUT = 10_000; // Run for up to 10 seconds
+const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
+const SPEEDTEST_PARTS = 5; // 5 concurrent parts
+const SPEEDTEST_TIMEOUT = 10_000; // Run for up to 10 seconds
 
 function waitForOnline(): Promise<void> {
     if (navigator.onLine) {
@@ -58,70 +59,92 @@ function waitForOnline(): Promise<void> {
 }
 
 /**
- * Measure upload speed with a preflight test.
- * Gets a pre-signed S3 URL from the backend, uploads a blob directly to S3
- * for up to 10 seconds, then cleans up the test object.
+ * Measure upload speed with a multipart preflight test.
+ * Uploads 5x100MB parts concurrently to S3 for up to 10 seconds,
+ * measuring aggregate throughput. This mirrors the actual upload
+ * path and concurrency to give a realistic speed reading.
  * Returns measured speed in bytes/second, or 0 on failure.
  */
 async function measureUploadSpeed(): Promise<number> {
     let testId: string | null = null;
+    let uploadId: string | null = null;
     try {
-        // Get a pre-signed S3 URL for the speed test
+        // Get pre-signed S3 URLs for a multipart speed test
         const res = await fetch(`${API_BASE_URL}/upload/speedtest`, { method: 'POST' });
         if (!res.ok) {
             console.warn(`[Upload] Speed test setup failed: HTTP ${res.status}`);
             return 0;
         }
-        const { url, testId: id } = await res.json();
-        testId = id;
-        if (!url) {
-            console.warn('[Upload] Speed test: no URL returned');
+        const data = await res.json();
+        testId = data.testId;
+        uploadId = data.uploadId;
+        if (!data.parts || data.parts.length === 0) {
+            console.warn('[Upload] Speed test: no part URLs returned');
             return 0;
         }
 
-        // Upload a zero-filled blob directly to S3 (no body limit)
-        const blob = new Blob([new ArrayBuffer(PREFLIGHT_SIZE)]);
-        let uploadedBytes = 0;
+        const blob = new Blob([new ArrayBuffer(SPEEDTEST_PART_SIZE)]);
+        const partBytes: number[] = new Array(data.parts.length).fill(0);
+        const xhrs: XMLHttpRequest[] = [];
         const startTime = Date.now();
+        let settled = false;
 
         const speed = await new Promise<number>((resolve) => {
-            const xhr = new XMLHttpRequest();
+            const finish = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                const totalBytes = partBytes.reduce((a, b) => a + b, 0);
+                const elapsed = (Date.now() - startTime) / 1000;
+                resolve(elapsed > 0 ? totalBytes / elapsed : 0);
+            };
+
+            // Abort all XHRs after timeout
             const timeout = setTimeout(() => {
-                xhr.abort();
-                const elapsed = (Date.now() - startTime) / 1000;
-                resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
-            }, PREFLIGHT_TIMEOUT);
-
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    uploadedBytes = e.loaded;
+                for (const xhr of xhrs) {
+                    if (xhr.readyState !== XMLHttpRequest.DONE) {
+                        xhr.abort();
+                    }
                 }
-            });
+                finish();
+            }, SPEEDTEST_TIMEOUT);
 
-            xhr.addEventListener('loadend', () => {
-                clearTimeout(timeout);
-                const elapsed = (Date.now() - startTime) / 1000;
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    resolve(elapsed > 0 ? blob.size / elapsed : 0);
-                } else if (xhr.status !== 0) {
-                    console.warn(
-                        `[Upload] Speed test upload failed: HTTP ${xhr.status} ${xhr.statusText}`,
-                    );
-                    resolve(0);
-                } else {
-                    // status 0 = aborted by our timeout, use tracked bytes
-                    resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
-                }
-            });
+            let completedCount = 0;
 
-            xhr.addEventListener('error', () => {
-                clearTimeout(timeout);
-                console.warn(`[Upload] Speed test network error (status=${xhr.status})`);
-                resolve(0);
-            });
+            for (let i = 0; i < data.parts.length; i++) {
+                const xhr = new XMLHttpRequest();
+                xhrs.push(xhr);
 
-            xhr.open('PUT', url);
-            xhr.send(blob);
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        partBytes[i] = e.loaded;
+                    }
+                });
+
+                xhr.addEventListener('loadend', () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        partBytes[i] = SPEEDTEST_PART_SIZE;
+                    }
+                    completedCount++;
+                    // All parts done before timeout
+                    if (completedCount === data.parts.length) {
+                        clearTimeout(timeout);
+                        finish();
+                    }
+                });
+
+                xhr.addEventListener('error', () => {
+                    completedCount++;
+                    if (completedCount === data.parts.length) {
+                        clearTimeout(timeout);
+                        finish();
+                    }
+                });
+
+                xhr.open('PUT', data.parts[i].url);
+                xhr.send(blob);
+            }
         });
 
         return speed;
@@ -129,12 +152,12 @@ async function measureUploadSpeed(): Promise<number> {
         console.warn('[Upload] Speed test exception:', e);
         return 0;
     } finally {
-        // Clean up the test object from S3
+        // Clean up the test multipart upload from S3
         if (testId) {
             fetch(`${API_BASE_URL}/upload/speedtest/cleanup`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ testId }),
+                body: JSON.stringify({ testId, uploadId }),
             }).catch(() => {
                 // Best-effort cleanup
             });
@@ -157,13 +180,13 @@ function getPreferredPartSize(speed: number): number | undefined {
 
 // Adaptive concurrency based on file size
 // With backpressure, memory is bounded to ~(concurrency + 1) * partSize
-// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
+// e.g., concurrency 5 with 200MB parts = max ~1.2GB buffered
 function getConcurrentUploads(fileSize: number): number {
     const GB = 1024 * 1024 * 1024;
     if (fileSize > 50 * GB) {
-        return 2; // > 50GB: conservative
+        return 3; // > 50GB: conservative
     }
-    return 3; // default: 3 concurrent uploads
+    return 5; // default: 5 concurrent uploads
 }
 
 export interface UploadProgress {
