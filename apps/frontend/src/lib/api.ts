@@ -420,7 +420,7 @@ export class Canceller {
  * Get API configuration
  */
 export async function getConfig() {
-    const response = await fetch(`${API_BASE_URL}/config`);
+    const response = await fetchWithRetry(`${API_BASE_URL}/config`, {}, 3);
     if (!response.ok) {
         throw new Error('Failed to fetch config');
     }
@@ -431,7 +431,7 @@ export async function getConfig() {
  * Check if file exists
  */
 export async function fileExists(id: string): Promise<boolean> {
-    const response = await fetch(`${API_BASE_URL}/exists/${id}`);
+    const response = await fetchWithRetry(`${API_BASE_URL}/exists/${id}`, {}, 3);
     if (!response.ok) {
         return false;
     }
