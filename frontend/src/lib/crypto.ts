@@ -236,8 +236,9 @@ export class Keychain {
  */
 export function createEncryptionStream(
     keychain: Keychain,
+    initialCounter = 0,
 ): TransformStream<Uint8Array, Uint8Array> {
-    let recordCount = 0;
+    let recordCount = initialCounter;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
 

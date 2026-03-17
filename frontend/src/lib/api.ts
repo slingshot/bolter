@@ -3,16 +3,23 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { UPLOAD_LIMITS } from '@bolter/shared';
+import { PART_SIZE_TIERS, UPLOAD_LIMITS } from '@bolter/shared';
 import {
     arrayToB64,
     b64ToArray,
     calculateEncryptedSize,
     createEncryptionStream,
-    type Keychain,
+    ECE_RECORD_SIZE,
+    Keychain,
 } from './crypto';
 import { FileReadError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
+import {
+    deleteUploadState,
+    type PersistedUpload,
+    saveUploadState,
+    updateCompletedPart,
+} from './upload-state';
 import {
     createStreamingZip,
     createZipFromFiles,
@@ -34,16 +41,151 @@ export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:30
 const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
+const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
+
+// Preflight speed test configuration
+const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
+const SPEEDTEST_TIMEOUT = 10_000; // Run for up to 10 seconds
+
+function waitForOnline(): Promise<void> {
+    if (navigator.onLine) {
+        return Promise.resolve();
+    }
+    console.log('[Upload] Offline — waiting for connection...');
+    return new Promise((resolve) => {
+        window.addEventListener('online', () => resolve(), { once: true });
+    });
+}
+
+/**
+ * Measure upload speed with a multipart preflight test.
+ * Uploads 5x100MB parts concurrently to S3 for up to 10 seconds,
+ * measuring aggregate throughput. This mirrors the actual upload
+ * path and concurrency to give a realistic speed reading.
+ * Returns measured speed in bytes/second, or 0 on failure.
+ */
+async function measureUploadSpeed(): Promise<number> {
+    let testId: string | null = null;
+    let uploadId: string | null = null;
+    try {
+        // Get pre-signed S3 URLs for a multipart speed test
+        const res = await fetch(`${API_BASE_URL}/upload/speedtest`, { method: 'POST' });
+        if (!res.ok) {
+            console.warn(`[Upload] Speed test setup failed: HTTP ${res.status}`);
+            return 0;
+        }
+        const data = await res.json();
+        testId = data.testId;
+        uploadId = data.uploadId;
+        if (!data.parts || data.parts.length === 0) {
+            console.warn('[Upload] Speed test: no part URLs returned');
+            return 0;
+        }
+
+        const blob = new Blob([new ArrayBuffer(SPEEDTEST_PART_SIZE)]);
+        const partBytes: number[] = new Array(data.parts.length).fill(0);
+        const xhrs: XMLHttpRequest[] = [];
+        const startTime = Date.now();
+        let settled = false;
+
+        const speed = await new Promise<number>((resolve) => {
+            const finish = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                const totalBytes = partBytes.reduce((a, b) => a + b, 0);
+                const elapsed = (Date.now() - startTime) / 1000;
+                resolve(elapsed > 0 ? totalBytes / elapsed : 0);
+            };
+
+            // Abort all XHRs after timeout
+            const timeout = setTimeout(() => {
+                for (const xhr of xhrs) {
+                    if (xhr.readyState !== XMLHttpRequest.DONE) {
+                        xhr.abort();
+                    }
+                }
+                finish();
+            }, SPEEDTEST_TIMEOUT);
+
+            let completedCount = 0;
+
+            for (let i = 0; i < data.parts.length; i++) {
+                const xhr = new XMLHttpRequest();
+                xhrs.push(xhr);
+
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        partBytes[i] = e.loaded;
+                    }
+                });
+
+                xhr.addEventListener('loadend', () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        partBytes[i] = SPEEDTEST_PART_SIZE;
+                    }
+                    completedCount++;
+                    // All parts done before timeout
+                    if (completedCount === data.parts.length) {
+                        clearTimeout(timeout);
+                        finish();
+                    }
+                });
+
+                xhr.addEventListener('error', () => {
+                    completedCount++;
+                    if (completedCount === data.parts.length) {
+                        clearTimeout(timeout);
+                        finish();
+                    }
+                });
+
+                xhr.open('PUT', data.parts[i].url);
+                xhr.send(blob);
+            }
+        });
+
+        return speed;
+    } catch (e) {
+        console.warn('[Upload] Speed test exception:', e);
+        return 0;
+    } finally {
+        // Clean up the test multipart upload from S3
+        if (testId) {
+            fetch(`${API_BASE_URL}/upload/speedtest/cleanup`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ testId, uploadId }),
+            }).catch(() => {
+                // Best-effort cleanup
+            });
+        }
+    }
+}
+
+function getPreferredPartSize(speed: number): number | undefined {
+    if (speed === 0) {
+        return undefined;
+    }
+
+    for (const tier of PART_SIZE_TIERS) {
+        if (speed >= tier.minSpeed) {
+            return tier.partSize;
+        }
+    }
+    return PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize;
+}
 
 // Adaptive concurrency based on file size
 // With backpressure, memory is bounded to ~(concurrency + 1) * partSize
-// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
+// e.g., concurrency 5 with 200MB parts = max ~1.2GB buffered
 function getConcurrentUploads(fileSize: number): number {
     const GB = 1024 * 1024 * 1024;
     if (fileSize > 50 * GB) {
-        return 2; // > 50GB: conservative
+        return 3; // > 50GB: conservative
     }
-    return 3; // default: 3 concurrent uploads
+    return 5; // default: 5 concurrent uploads
 }
 
 export interface UploadProgress {
@@ -52,6 +194,9 @@ export interface UploadProgress {
     percentage: number;
     speed: number; // bytes per second
     remainingTime: number; // seconds
+    retryCount: number;
+    isOffline: boolean;
+    connectionQuality: 'good' | 'fair' | 'slow' | 'stalled' | 'offline';
 }
 
 export interface UploadResult {
@@ -68,6 +213,7 @@ export interface UploadOptions {
     downloadLimit?: number;
     onProgress?: (progress: UploadProgress) => void;
     onZipProgress?: (percent: number) => void;
+    onSpeedTest?: (phase: 'started' | 'done', speedMbps?: number) => void;
     onError?: (error: UploadError) => void;
 }
 
@@ -339,6 +485,7 @@ export async function uploadFiles(
         downloadLimit,
         onProgress,
         onZipProgress,
+        onSpeedTest,
         onError,
     } = options;
 
@@ -348,6 +495,8 @@ export async function uploadFiles(
     let lastDisplayTime = startTime;
     let smoothedSpeed = 0;
     let smoothedRemaining = 0;
+    let totalRetryCount = 0;
+    let lastPartProgressTime = Date.now();
 
     // Determine upload strategy for multi-file uploads
     const isMultiFile = files.length > 1;
@@ -426,6 +575,21 @@ export async function uploadFiles(
         stream = createFileStream(files, keychain, encrypted);
     }
 
+    // Run preflight speed test for multipart uploads to determine optimal part size.
+    // Single-part uploads (<100MB) don't need this since there's no part sizing decision.
+    let preferredPartSize: number | undefined;
+    if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+        onSpeedTest?.('started');
+        console.log('[Upload] Running preflight speed test...');
+        const measuredSpeed = await measureUploadSpeed();
+        const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
+        preferredPartSize = getPreferredPartSize(measuredSpeed);
+        console.log(
+            `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+        );
+        onSpeedTest?.('done', speedMbps);
+    }
+
     // Request upload URLs
     const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
         method: 'POST',
@@ -435,6 +599,7 @@ export async function uploadFiles(
             encrypted,
             timeLimit,
             dlimit: downloadLimit,
+            preferredPartSize,
         }),
     });
 
@@ -450,6 +615,38 @@ export async function uploadFiles(
 
     // Track progress
     const partProgress: Record<number, number> = {};
+
+    // Emit a progress snapshot to the UI
+    const emitProgress = () => {
+        const totalLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
+        const isOffline = !navigator.onLine;
+        const now = Date.now();
+
+        let connectionQuality: UploadProgress['connectionQuality'];
+        if (isOffline) {
+            connectionQuality = 'offline';
+        } else if (smoothedSpeed === 0 || now - lastPartProgressTime > 10000) {
+            connectionQuality = 'stalled';
+        } else if (smoothedSpeed < 1 * 1024 * 1024) {
+            connectionQuality = 'slow';
+        } else if (smoothedSpeed < 10 * 1024 * 1024) {
+            connectionQuality = 'fair';
+        } else {
+            connectionQuality = 'good';
+        }
+
+        onProgress?.({
+            loaded: Math.min(totalLoaded, totalSize),
+            total: totalSize,
+            percentage: Math.min((totalLoaded / totalSize) * 100, 100),
+            speed: smoothedSpeed,
+            remainingTime: smoothedRemaining,
+            retryCount: totalRetryCount,
+            isOffline,
+            connectionQuality,
+        });
+    };
+
     const updateProgress = (partNum: number, loaded: number) => {
         partProgress[partNum] = loaded;
         const totalLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
@@ -459,10 +656,12 @@ export async function uploadFiles(
         const bytesInPeriod = totalLoaded - lastProgressBytes;
         const instantSpeed = elapsed > 0 ? bytesInPeriod / elapsed : 0;
 
-        // Update speed/time calculation once per second with smoothing
+        if (bytesInPeriod > 0) {
+            lastPartProgressTime = now;
+        }
+
         const displayElapsed = (now - lastDisplayTime) / 1000;
         if (displayElapsed >= 1 || lastDisplayTime === startTime) {
-            // Exponential moving average for smooth speed (alpha = 0.3)
             smoothedSpeed =
                 smoothedSpeed === 0 ? instantSpeed : smoothedSpeed * 0.7 + instantSpeed * 0.3;
             smoothedRemaining = smoothedSpeed > 0 ? (totalSize - totalLoaded) / smoothedSpeed : 0;
@@ -471,135 +670,432 @@ export async function uploadFiles(
             lastProgressBytes = totalLoaded;
         }
 
-        // Always update progress bar, but speed/time stay stable between updates
+        emitProgress();
+    };
+
+    // Re-evaluate connection quality on connectivity changes and periodically
+    // so offline/stalled states show immediately even when no bytes are flowing
+    const statusPollInterval = setInterval(emitProgress, 1000);
+    const onConnectivityChange = () => emitProgress();
+    window.addEventListener('online', onConnectivityChange);
+    window.addEventListener('offline', onConnectivityChange);
+    const cleanupStatusPoll = () => {
+        clearInterval(statusPollInterval);
+        window.removeEventListener('online', onConnectivityChange);
+        window.removeEventListener('offline', onConnectivityChange);
+    };
+
+    let uploadResult: { actualSize: number; parts?: { PartNumber: number; ETag: string }[] };
+
+    try {
+        if (uploadInfo.multipart && uploadInfo.parts) {
+            // Only persist resumability state for single-file uploads.
+            // Multi-file uploads create a streaming zip that can't be
+            // reconstructed from the original files on resume.
+            const canResume = !isMultiFile;
+            if (canResume) {
+                // Calculate plaintext bytes per encrypted part
+                // Each ECE record: plaintext ECE_RECORD_SIZE → encrypted ECE_RECORD_SIZE + 17 (tag + delimiter)
+                const encryptedRecordSize = ECE_RECORD_SIZE + 17;
+                const plaintextPartSize = encrypted
+                    ? Math.floor((uploadInfo.partSize || 0) / encryptedRecordSize) * ECE_RECORD_SIZE
+                    : uploadInfo.partSize || 0;
+                const persistState: PersistedUpload = {
+                    fileId: uploadInfo.id,
+                    uploadId: uploadInfo.uploadId || '',
+                    ownerToken: uploadInfo.owner,
+                    fileName: files[0].name,
+                    fileSize: files[0].size,
+                    fileLastModified: files[0].lastModified,
+                    encrypted,
+                    partSize: uploadInfo.partSize || 0,
+                    plaintextPartSize,
+                    completedParts: [],
+                    totalParts: uploadInfo.parts.length,
+                    secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
+                    timeLimit: timeLimit || 86400,
+                    downloadLimit: downloadLimit || 1,
+                    createdAt: Date.now(),
+                };
+                saveUploadState(persistState).catch((e) =>
+                    console.warn('[Upload] Failed to persist upload state:', e),
+                );
+            }
+
+            // Multipart upload
+            const multipartResult = await uploadMultipartStream(
+                stream,
+                uploadInfo,
+                updateProgress,
+                canceller,
+                onError,
+                totalSize,
+                () => {
+                    totalRetryCount++;
+                    // Trigger a progress update so the UI reflects the new retry count.
+                    // Re-emit part 1's current tracked bytes (or 0 if not started yet).
+                    const part1Bytes = partProgress[1] ?? 0;
+                    updateProgress(1, part1Bytes);
+                },
+                canResume ? uploadInfo.id : undefined,
+            );
+
+            // Handle fallback: stream produced too little data for multipart
+            if ('fallbackBlob' in multipartResult) {
+                console.log(
+                    `[Upload] Falling back to single-part upload (${(multipartResult.fallbackBlob.size / 1024).toFixed(1)}KB)`,
+                );
+
+                // Abort the multipart upload
+                if (uploadInfo.uploadId) {
+                    await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+                }
+
+                // Request a new single-part upload URL
+                const fallbackResponse = await fetch(`${API_BASE_URL}/upload/url`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fileSize: multipartResult.fallbackBlob.size,
+                        encrypted,
+                        timeLimit,
+                        dlimit: downloadLimit,
+                    }),
+                });
+
+                if (!fallbackResponse.ok) {
+                    throw new Error(`HTTP ${fallbackResponse.status}`);
+                }
+
+                const fallbackInfo: UploadUrlResponse = await fallbackResponse.json();
+                if (!fallbackInfo.useSignedUrl) {
+                    throw new Error('Pre-signed URLs not available for fallback');
+                }
+
+                // Use the new file ID and owner from the fallback response
+                uploadInfo = fallbackInfo;
+
+                uploadResult = await uploadSinglePart(
+                    multipartResult.fallbackBlob,
+                    fallbackInfo.url,
+                    (loaded) => updateProgress(1, loaded),
+                    canceller,
+                );
+            } else {
+                uploadResult = multipartResult;
+            }
+        } else {
+            // Single part upload
+            const blob = await new Response(stream).blob();
+            uploadResult = await uploadSinglePart(
+                blob,
+                uploadInfo.url,
+                (loaded) => updateProgress(1, loaded),
+                canceller,
+            );
+        }
+
+        if (canceller.cancelled) {
+            if (uploadInfo.multipart && uploadInfo.uploadId) {
+                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+                deleteUploadState(uploadInfo.id).catch(() => {
+                    // Intentionally ignored — best-effort cleanup
+                });
+            }
+            throw new Error('Upload cancelled');
+        }
+
+        // Complete the upload
+        const metadataString = encrypted
+            ? arrayToB64(await keychain.encryptMetadata(metadata))
+            : btoa(unescape(encodeURIComponent(JSON.stringify(metadata))));
+
+        const completeResponse = await fetchWithRetry(`${API_BASE_URL}/upload/complete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: uploadInfo.id,
+                metadata: metadataString,
+                ...(encrypted && { authKey: await keychain.authKeyB64() }),
+                actualSize: uploadResult.actualSize || totalSize,
+                ...(uploadResult.parts && { parts: uploadResult.parts }),
+            }),
+        });
+
+        if (!completeResponse.ok) {
+            const errorText = await completeResponse.text();
+            const err = new Error(`Failed to complete upload: ${errorText}`);
+            captureError(err, {
+                operation: 'upload.complete',
+                extra: {
+                    fileId: uploadInfo.id,
+                    httpStatus: completeResponse.status,
+                    encrypted,
+                    multipart: uploadInfo.multipart,
+                    totalSize,
+                    responsePreview: errorText.substring(0, 200),
+                },
+            });
+            throw err;
+        }
+
+        const _completeInfo = await completeResponse.json();
+
+        // Clean up persisted upload state
+        if (uploadInfo.multipart) {
+            deleteUploadState(uploadInfo.id).catch(() => {
+                // Intentionally ignored — best-effort cleanup
+            });
+        }
+
+        // Always use frontend origin for download URL (backend may return its own URL)
+        // Don't include hash here - ShareDialog will append the secretKey
+        const downloadUrl = `${window.location.origin}/download/${uploadInfo.id}`;
+
+        return {
+            id: uploadInfo.id,
+            url: downloadUrl,
+            ownerToken: uploadInfo.owner,
+            duration: Date.now() - startTime,
+        };
+    } finally {
+        cleanupStatusPoll();
+        // If cancelled, always clean up persisted state — the user
+        // intentionally cancelled, so don't offer resume on next visit
+        if (canceller.cancelled && uploadInfo.multipart) {
+            deleteUploadState(uploadInfo.id).catch(() => {
+                // Intentionally ignored — best-effort cleanup
+            });
+        }
+    }
+}
+
+/**
+ * Resume an interrupted multipart upload using persisted state from IndexedDB
+ */
+export async function resumeUpload(
+    file: File,
+    state: PersistedUpload,
+    onProgress?: (progress: UploadProgress) => void,
+    onError?: (error: UploadError) => void,
+    canceller?: Canceller,
+): Promise<UploadResult> {
+    const startTime = Date.now();
+    const cancel = canceller || new Canceller();
+
+    // Reconstruct keychain if encrypted
+    let keychain: Keychain | null = null;
+    if (state.encrypted && state.secretKeyB64) {
+        keychain = new Keychain(state.secretKeyB64);
+    }
+
+    // Find contiguous prefix of completed parts (concurrent uploads may leave gaps)
+    // Only the contiguous prefix can be safely skipped — parts after a gap need re-uploading
+    const sortedCompleted = [...state.completedParts].sort((a, b) => a.PartNumber - b.PartNumber);
+    let contiguousCount = 0;
+    for (const p of sortedCompleted) {
+        if (p.PartNumber === contiguousCount + 1) {
+            contiguousCount++;
+        } else {
+            break;
+        }
+    }
+    const trulyCompletedParts = sortedCompleted.slice(0, contiguousCount);
+
+    // Use plaintext part size for file offset (encrypted part size includes ECE overhead)
+    const plaintextPartSize = state.plaintextPartSize || state.partSize;
+    const skipBytes = contiguousCount * plaintextPartSize;
+
+    // Request new pre-signed URLs for remaining parts
+    const resumeResponse = await fetch(`${API_BASE_URL}/upload/multipart/${state.fileId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            uploadId: state.uploadId,
+            completedPartNumbers: trulyCompletedParts.map((p) => p.PartNumber),
+        }),
+    });
+
+    if (!resumeResponse.ok) {
+        // Upload expired or invalid — clean up and throw
+        await deleteUploadState(state.fileId);
+        throw new Error('Upload session expired. Please start a new upload.');
+    }
+
+    const resumeInfo: {
+        parts: Array<{ partNumber: number; url: string; minSize: number; maxSize: number }>;
+        partSize: number;
+        numParts: number;
+    } = await resumeResponse.json();
+
+    // Create a stream from the file, skipping already-uploaded data
+    const remainingBlob = file.slice(skipBytes);
+    let stream: ReadableStream<Uint8Array> = remainingBlob.stream();
+
+    // If encrypted, wrap with encryption stream starting at the correct counter
+    if (state.encrypted && keychain) {
+        // Each plaintext part contains ceil(plaintextPartSize / ECE_RECORD_SIZE) records
+        const recordsPerPart = Math.ceil(plaintextPartSize / ECE_RECORD_SIZE);
+        const initialCounter = contiguousCount * recordsPerPart;
+        stream = stream.pipeThrough(createEncryptionStream(keychain, initialCounter));
+    }
+
+    // Track progress
+    let smoothedSpeed = 0;
+    let smoothedRemaining = 0;
+    let lastProgressTime = startTime;
+    let lastProgressBytes = 0;
+    let lastDisplayTime = startTime;
+    let totalRetryCount = 0;
+    let lastPartProgressTime = Date.now();
+    const partProgress: Record<number, number> = {};
+
+    // Account for already-completed data in progress
+    // Use encrypted part size for progress since that's what's actually uploaded
+    const alreadyUploaded = contiguousCount * state.partSize;
+    const totalSize = state.totalParts * state.partSize;
+
+    const updateProgress = (partNum: number, loaded: number) => {
+        partProgress[partNum] = loaded;
+        const partLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
+        const totalLoaded = alreadyUploaded + partLoaded;
+
+        const now = Date.now();
+        const elapsed = (now - lastProgressTime) / 1000;
+        // Use partLoaded (not totalLoaded) for speed calculation to avoid
+        // the alreadyUploaded offset skewing the delta between updates
+        const bytesInPeriod = partLoaded - lastProgressBytes;
+        const instantSpeed = elapsed > 0 ? Math.max(0, bytesInPeriod / elapsed) : 0;
+
+        if (bytesInPeriod > 0) {
+            lastPartProgressTime = now;
+        }
+
+        const displayElapsed = (now - lastDisplayTime) / 1000;
+        if (displayElapsed >= 1 || lastDisplayTime === startTime) {
+            smoothedSpeed =
+                smoothedSpeed === 0 ? instantSpeed : smoothedSpeed * 0.7 + instantSpeed * 0.3;
+            smoothedRemaining = smoothedSpeed > 0 ? (totalSize - totalLoaded) / smoothedSpeed : 0;
+            lastDisplayTime = now;
+            lastProgressTime = now;
+            lastProgressBytes = partLoaded;
+        }
+
+        const isOffline = !navigator.onLine;
+        let connectionQuality: UploadProgress['connectionQuality'];
+        if (isOffline) {
+            connectionQuality = 'offline';
+        } else if (smoothedSpeed === 0 || now - lastPartProgressTime > 10000) {
+            connectionQuality = 'stalled';
+        } else if (smoothedSpeed < 1 * 1024 * 1024) {
+            connectionQuality = 'slow';
+        } else if (smoothedSpeed < 10 * 1024 * 1024) {
+            connectionQuality = 'fair';
+        } else {
+            connectionQuality = 'good';
+        }
+
         onProgress?.({
             loaded: Math.min(totalLoaded, totalSize),
             total: totalSize,
             percentage: Math.min((totalLoaded / totalSize) * 100, 100),
             speed: smoothedSpeed,
             remainingTime: smoothedRemaining,
+            retryCount: totalRetryCount,
+            isOffline,
+            connectionQuality,
         });
     };
 
-    let uploadResult: { actualSize: number; parts?: { PartNumber: number; ETag: string }[] };
+    // Upload remaining parts using existing multipart machinery
+    const uploadInfoForResume: UploadUrlResponse = {
+        useSignedUrl: true,
+        multipart: true,
+        id: state.fileId,
+        owner: state.ownerToken,
+        uploadId: state.uploadId,
+        parts: resumeInfo.parts,
+        partSize: resumeInfo.partSize,
+        url: '',
+    };
 
-    if (uploadInfo.multipart && uploadInfo.parts) {
-        // Multipart upload
-        const multipartResult = await uploadMultipartStream(
-            stream,
-            uploadInfo,
-            updateProgress,
-            canceller,
-            onError,
-            totalSize,
-        );
+    const multipartResult = await uploadMultipartStream(
+        stream,
+        uploadInfoForResume,
+        updateProgress,
+        cancel,
+        onError,
+        totalSize,
+        () => {
+            totalRetryCount++;
+        },
+        state.fileId,
+    );
 
-        // Handle fallback: stream produced too little data for multipart
-        if ('fallbackBlob' in multipartResult) {
-            console.log(
-                `[Upload] Falling back to single-part upload (${(multipartResult.fallbackBlob.size / 1024).toFixed(1)}KB)`,
-            );
-
-            // Abort the multipart upload
-            if (uploadInfo.uploadId) {
-                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
-            }
-
-            // Request a new single-part upload URL
-            const fallbackResponse = await fetch(`${API_BASE_URL}/upload/url`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    fileSize: multipartResult.fallbackBlob.size,
-                    encrypted,
-                    timeLimit,
-                    dlimit: downloadLimit,
-                }),
-            });
-
-            if (!fallbackResponse.ok) {
-                throw new Error(`HTTP ${fallbackResponse.status}`);
-            }
-
-            const fallbackInfo: UploadUrlResponse = await fallbackResponse.json();
-            if (!fallbackInfo.useSignedUrl) {
-                throw new Error('Pre-signed URLs not available for fallback');
-            }
-
-            // Use the new file ID and owner from the fallback response
-            uploadInfo = fallbackInfo;
-
-            uploadResult = await uploadSinglePart(
-                multipartResult.fallbackBlob,
-                fallbackInfo.url,
-                (loaded) => updateProgress(1, loaded),
-                canceller,
-            );
-        } else {
-            uploadResult = multipartResult;
-        }
-    } else {
-        // Single part upload
-        const blob = await new Response(stream).blob();
-        uploadResult = await uploadSinglePart(
-            blob,
-            uploadInfo.url,
-            (loaded) => updateProgress(1, loaded),
-            canceller,
-        );
+    if ('fallbackBlob' in multipartResult) {
+        throw new Error('Resume failed: unexpected fallback');
     }
 
-    if (canceller.cancelled) {
-        if (uploadInfo.multipart && uploadInfo.uploadId) {
-            await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
-        }
+    if (cancel.cancelled) {
         throw new Error('Upload cancelled');
     }
 
+    // Combine completed parts (contiguous prefix + newly uploaded)
+    // Deduplicate by PartNumber, preferring newly uploaded ETags over persisted ones
+    const partMap = new Map<number, { PartNumber: number; ETag: string }>();
+    for (const p of trulyCompletedParts) {
+        partMap.set(p.PartNumber, p);
+    }
+    for (const p of multipartResult.parts || []) {
+        partMap.set(p.PartNumber, p);
+    }
+    const allParts = [...partMap.values()].sort((a, b) => a.PartNumber - b.PartNumber);
+
     // Complete the upload
-    const metadataString = encrypted
-        ? arrayToB64(await keychain.encryptMetadata(metadata))
-        : btoa(unescape(encodeURIComponent(JSON.stringify(metadata))));
+    let metadataString: string;
+    if (state.encrypted && keychain) {
+        const metadata = {
+            files: [
+                { name: file.name, size: file.size, type: file.type || 'application/octet-stream' },
+            ],
+        };
+        metadataString = arrayToB64(await keychain.encryptMetadata(metadata));
+    } else {
+        const metadata = {
+            files: [
+                { name: file.name, size: file.size, type: file.type || 'application/octet-stream' },
+            ],
+        };
+        metadataString = btoa(unescape(encodeURIComponent(JSON.stringify(metadata))));
+    }
 
     const completeResponse = await fetchWithRetry(`${API_BASE_URL}/upload/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            id: uploadInfo.id,
+            id: state.fileId,
             metadata: metadataString,
-            ...(encrypted && { authKey: await keychain.authKeyB64() }),
-            actualSize: uploadResult.actualSize || totalSize,
-            ...(uploadResult.parts && { parts: uploadResult.parts }),
+            ...(state.encrypted && keychain && { authKey: await keychain.authKeyB64() }),
+            actualSize: totalSize,
+            parts: allParts,
         }),
     });
 
     if (!completeResponse.ok) {
-        const errorText = await completeResponse.text();
-        const err = new Error(`Failed to complete upload: ${errorText}`);
-        captureError(err, {
-            operation: 'upload.complete',
-            extra: {
-                fileId: uploadInfo.id,
-                httpStatus: completeResponse.status,
-                encrypted,
-                multipart: uploadInfo.multipart,
-                totalSize,
-                responsePreview: errorText.substring(0, 200),
-            },
-        });
-        throw err;
+        throw new Error(`Failed to complete resumed upload: ${await completeResponse.text()}`);
     }
 
-    const _completeInfo = await completeResponse.json();
+    await completeResponse.json();
 
-    // Always use frontend origin for download URL (backend may return its own URL)
-    // Don't include hash here - ShareDialog will append the secretKey
-    const downloadUrl = `${window.location.origin}/download/${uploadInfo.id}`;
+    // Clean up persisted state
+    await deleteUploadState(state.fileId);
+
+    const downloadUrl = `${window.location.origin}/download/${state.fileId}`;
 
     return {
-        id: uploadInfo.id,
+        id: state.fileId,
         url: downloadUrl,
-        ownerToken: uploadInfo.owner,
+        ownerToken: state.ownerToken,
         duration: Date.now() - startTime,
     };
 }
@@ -745,6 +1241,8 @@ async function uploadMultipartStream(
     canceller: Canceller,
     onError?: (error: UploadError) => void,
     totalFileSize?: number,
+    onRetry?: () => void,
+    fileId?: string,
 ): Promise<MultipartStreamResult> {
     const { parts, partSize } = uploadInfo;
     if (!parts || !partSize) {
@@ -797,9 +1295,16 @@ async function uploadMultipartStream(
                 partNum,
                 (loaded) => onProgress(partNum, loaded),
                 canceller,
+                0,
+                onRetry,
             );
             completedParts.push(result);
             uploadedPartSizes[partNum] = partBlob.size;
+            if (fileId) {
+                updateCompletedPart(fileId, result).catch((e) =>
+                    console.warn('[Upload] Failed to persist completed part:', e),
+                );
+            }
             console.log(`[Upload] Part ${partNum} complete`);
         } catch (error: unknown) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1151,6 +1656,7 @@ async function uploadPartWithRetry(
     onProgress: (loaded: number) => void,
     canceller: Canceller,
     retryCount = 0,
+    onRetry?: () => void,
 ): Promise<{ PartNumber: number; ETag: string }> {
     try {
         return await uploadPart(blob, url, partNumber, onProgress, canceller);
@@ -1170,12 +1676,15 @@ async function uploadPartWithRetry(
         );
 
         if (retryCount < MAX_RETRIES && isRetryable) {
+            await waitForOnline();
             const delay = Math.min(
                 RETRY_DELAY_BASE * 2 ** retryCount + Math.random() * 1000,
                 MAX_RETRY_DELAY,
             );
 
             console.log(`[Upload] Retrying part ${partNumber} in ${(delay / 1000).toFixed(1)}s...`);
+
+            onRetry?.();
 
             await new Promise((resolve) => setTimeout(resolve, delay));
 
@@ -1191,6 +1700,7 @@ async function uploadPartWithRetry(
                 onProgress,
                 canceller,
                 retryCount + 1,
+                onRetry,
             );
         }
 
@@ -1223,19 +1733,50 @@ function uploadPart(
         const xhr = new XMLHttpRequest();
         canceller.addXhr(xhr);
 
+        let stallTimer: ReturnType<typeof setTimeout>;
+        let stalledAbort = false;
+        const resetStallTimer = () => {
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+                stalledAbort = true;
+                window.removeEventListener('offline', handleOffline);
+                window.removeEventListener('online', handleOnline);
+                xhr.abort();
+                reject(new Error('Upload stalled'));
+            }, STALL_TIMEOUT);
+        };
+
+        // Pause stall timer when offline
+        const handleOffline = () => {
+            clearTimeout(stallTimer);
+        };
+        const handleOnline = () => {
+            resetStallTimer();
+        };
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('online', handleOnline);
+
         xhr.upload.addEventListener('progress', (e) => {
+            resetStallTimer();
             if (e.lengthComputable) {
                 onProgress(e.loaded);
             }
         });
 
+        xhr.addEventListener('loadstart', resetStallTimer);
+
         xhr.addEventListener('loadend', () => {
+            clearTimeout(stallTimer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
             canceller.removeXhr(xhr);
 
             if (xhr.status >= 200 && xhr.status < 300) {
                 const etag = xhr.getResponseHeader('ETag') || '';
                 resolve({ PartNumber: partNumber, ETag: etag });
-            } else {
+            } else if (!stalledAbort) {
+                // Skip error reporting if this was an intentional stall abort
+                // (the stall timer already rejected with 'Upload stalled')
                 let errorDetails = `HTTP ${xhr.status}`;
                 if (xhr.statusText) {
                     errorDetails += ` (${xhr.statusText})`;
@@ -1260,17 +1801,14 @@ function uploadPart(
         });
 
         xhr.addEventListener('error', () => {
+            clearTimeout(stallTimer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
             canceller.removeXhr(xhr);
             reject(new Error('Network error'));
         });
 
-        xhr.addEventListener('timeout', () => {
-            canceller.removeXhr(xhr);
-            reject(new Error('Timeout'));
-        });
-
         xhr.open('PUT', url);
-        xhr.timeout = 120000; // 2 minute timeout
         xhr.send(blob);
     });
 }
@@ -1287,6 +1825,7 @@ function isRetryableError(error: Error): boolean {
         msg.includes('network') ||
         msg.includes('timeout') ||
         msg.includes('abort') ||
+        msg.includes('stalled') ||
         msg.includes('failed to fetch') ||
         /http 5\d\d/.test(msg) ||
         msg.includes('http 429') ||
@@ -1349,18 +1888,36 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
 /**
  * Download a file
  */
+export type DownloadPhase = 'downloading' | 'decrypting' | 'finalizing';
+
 export async function downloadFile(
     id: string,
     keychain: Keychain | null,
     onProgress?: (loaded: number, total: number) => void,
+    onPhase?: (phase: DownloadPhase) => void,
 ): Promise<{ blob: Blob; filename: string }> {
+    const dlStart = Date.now();
+    const dlLog = (msg: string, data?: Record<string, unknown>) =>
+        console.log(`[Download] ${msg}`, data ? data : '');
+
+    dlLog('Starting', { fileId: id, encrypted: !!keychain });
     addBreadcrumb('downloadFile called', {
         category: 'download',
         data: { fileId: id, encrypted: !!keychain },
     });
 
     // Get metadata first
+    dlLog('Fetching metadata...');
+    const metaStart = Date.now();
     const metadata = await getMetadata(id, keychain || undefined);
+    dlLog('Metadata received', {
+        elapsed: Date.now() - metaStart,
+        name: metadata.name,
+        size: metadata.size,
+        encrypted: metadata.encrypted,
+        zipped: metadata.zipped,
+        fileCount: metadata.files?.length,
+    });
 
     // Get download URL
     const headers: Record<string, string> = {};
@@ -1404,6 +1961,11 @@ export async function downloadFile(
     }
 
     const urlData = await urlResponse.json();
+
+    dlLog('Got download URL', {
+        useSignedUrl: urlData.useSignedUrl,
+        urlLength: urlData.url?.length,
+    });
 
     // Download from signed URL or stream
     const downloadUrl = urlData.useSignedUrl ? urlData.url : `${API_BASE_URL}/download/${id}`;
@@ -1462,9 +2024,23 @@ export async function downloadFile(
         throw new Error('No response body');
     }
 
+    onPhase?.('downloading');
+    dlLog('Starting download stream', {
+        contentLength,
+        metadataSize: metadata.size,
+        responseHeaders: {
+            contentType: response.headers.get('Content-Type'),
+            contentLength: response.headers.get('Content-Length'),
+        },
+    });
+
     const chunks: Uint8Array[] = [];
     let loaded = 0;
+    let chunkCount = 0;
+    const streamStart = Date.now();
+    let lastLogTime = streamStart;
 
+    // biome-ignore lint/correctness/noConstantCondition: intentional stream drain loop
     while (true) {
         const { done, value } = await reader.read();
         if (done) {
@@ -1473,41 +2049,91 @@ export async function downloadFile(
 
         chunks.push(value);
         loaded += value.length;
+        chunkCount++;
         onProgress?.(loaded, contentLength || metadata.size || loaded);
+
+        // Log progress every 5 seconds
+        const now = Date.now();
+        if (now - lastLogTime > 5000) {
+            const elapsed = (now - streamStart) / 1000;
+            const speedMBps = loaded / (1024 * 1024) / elapsed;
+            dlLog('Download progress', {
+                loaded,
+                total: contentLength,
+                percentage: contentLength ? Math.round((loaded / contentLength) * 100) : '?',
+                chunks: chunkCount,
+                elapsed: `${elapsed.toFixed(1)}s`,
+                speed: `${speedMBps.toFixed(1)} MB/s`,
+            });
+            lastLogTime = now;
+        }
     }
 
+    const streamElapsed = Date.now() - streamStart;
+    dlLog('Download stream complete', {
+        totalBytes: loaded,
+        chunks: chunkCount,
+        elapsed: `${(streamElapsed / 1000).toFixed(1)}s`,
+        speed: `${(loaded / (1024 * 1024) / (streamElapsed / 1000)).toFixed(1)} MB/s`,
+    });
+
     // Combine chunks
+    dlLog('Combining chunks into buffer...', { chunks: chunks.length, totalBytes: loaded });
+    const combineStart = Date.now();
     const data = new Uint8Array(loaded);
     let offset = 0;
     for (const chunk of chunks) {
         data.set(chunk, offset);
         offset += chunk.length;
     }
+    dlLog('Buffer combined', { elapsed: Date.now() - combineStart });
 
     // Decrypt if needed
     let decryptedData: Uint8Array;
     if (metadata.encrypted && keychain) {
+        onPhase?.('decrypting');
+        dlLog('Starting decryption...', {
+            encryptedSize: data.length,
+            encryptedSizeMB: Math.round((data.length / (1024 * 1024)) * 10) / 10,
+        });
+        const decryptStart = Date.now();
         const { createDecryptionStream } = await import('./crypto');
+        dlLog('Decryption stream created', { importElapsed: Date.now() - decryptStart });
+
         const decryptStream = createDecryptionStream(keychain);
         const decryptedResponse = new Response(
             new ReadableStream({
                 start(controller) {
+                    dlLog('Feeding encrypted data into decryption stream...');
                     controller.enqueue(data);
                     controller.close();
+                    dlLog('Encrypted data enqueued, stream closed');
                 },
             }).pipeThrough(decryptStream),
         );
+
+        dlLog('Awaiting decrypted arrayBuffer...');
         decryptedData = new Uint8Array(await decryptedResponse.arrayBuffer());
+        const decryptElapsed = Date.now() - decryptStart;
+        dlLog('Decryption complete', {
+            decryptedSize: decryptedData.length,
+            decryptedSizeMB: Math.round((decryptedData.length / (1024 * 1024)) * 10) / 10,
+            elapsed: `${(decryptElapsed / 1000).toFixed(1)}s`,
+            throughput: `${(decryptedData.length / (1024 * 1024) / (decryptElapsed / 1000)).toFixed(1)} MB/s`,
+        });
     } else {
+        dlLog('No decryption needed (unencrypted file)');
         decryptedData = data;
     }
 
     // Report download complete
+    onPhase?.('finalizing');
+    dlLog('Reporting download complete to server...');
     await fetch(`${API_BASE_URL}/download/complete/${id}`, {
         method: 'POST',
         headers: keychain ? { Authorization: await keychain.authHeader() } : {},
     }).catch((e) => {
-        console.warn('Failed to report download complete:', e);
+        console.warn('[Download] Failed to report download complete:', e);
         captureError(e, {
             operation: 'download.complete',
             extra: { fileId: id },
@@ -1520,6 +2146,10 @@ export async function downloadFile(
 
     // If file was zipped at upload time, return the zip directly
     if (metadata.zipped) {
+        dlLog('Returning zipped file', {
+            filename: metadata.zipFilename,
+            size: decryptedData.length,
+        });
         return {
             blob: new Blob([decryptedData], { type: 'application/zip' }),
             filename: metadata.zipFilename || generateZipFilename(files || []),
@@ -1529,8 +2159,11 @@ export async function downloadFile(
     // Legacy: multiple files uploaded before zip-at-upload-time feature
     // Slice data and create zip on the fly (may fail for very large files)
     if (files && files.length > 1) {
+        dlLog('Creating zip from legacy multi-file download', { fileCount: files.length });
+        const zipStart = Date.now();
         const fileSlices = sliceConcatenatedData(decryptedData, files);
         const zipBlob = await createZipFromFiles(fileSlices);
+        dlLog('Legacy zip created', { elapsed: Date.now() - zipStart, zipSize: zipBlob.size });
         return {
             blob: zipBlob,
             filename: generateZipFilename(files),
@@ -1538,6 +2171,13 @@ export async function downloadFile(
     }
 
     // Single file: return as-is
+    const totalElapsed = Date.now() - dlStart;
+    dlLog('Download complete', {
+        filename: metadata.name,
+        size: decryptedData.length,
+        sizeMB: Math.round((decryptedData.length / (1024 * 1024)) * 10) / 10,
+        totalElapsed: `${(totalElapsed / 1000).toFixed(1)}s`,
+    });
     return {
         blob: new Blob([decryptedData]),
         filename: metadata.name || 'download',

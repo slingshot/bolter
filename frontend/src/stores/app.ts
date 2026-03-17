@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { type Canceller, deleteFile, type UploadProgress } from '@/lib/api';
 import type { Keychain } from '@/lib/crypto';
 import { captureError } from '@/lib/sentry';
+import type { PersistedUpload } from '@/lib/upload-state';
 
 export interface FileItem {
     id: string;
@@ -49,6 +50,7 @@ export interface AppState {
     currentCanceller: Canceller | null;
     currentKeychain: Keychain | null;
     zippingProgress: number | null; // 0-100 percentage while zipping multiple files
+    checkingSpeed: boolean;
 
     setUploading: (uploading: boolean) => void;
     setUploadProgress: (progress: UploadProgress | null) => void;
@@ -56,6 +58,7 @@ export interface AppState {
     setCanceller: (canceller: Canceller | null) => void;
     setKeychain: (keychain: Keychain | null) => void;
     setZippingProgress: (progress: number | null) => void;
+    setCheckingSpeed: (checking: boolean) => void;
 
     // Uploaded files history
     uploadedFiles: UploadedFile[];
@@ -63,6 +66,10 @@ export interface AppState {
     removeUploadedFile: (id: string) => void;
     updateUploadedFile: (id: string, updates: Partial<UploadedFile>) => void;
     clearUploadedFiles: () => void;
+
+    // Resumable upload
+    resumableUpload: PersistedUpload | null;
+    setResumableUpload: (upload: PersistedUpload | null) => void;
 
     // Config
     config: {
@@ -130,6 +137,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     currentCanceller: null,
     currentKeychain: null,
     zippingProgress: null,
+    checkingSpeed: false,
 
     setUploading: (isUploading) => set({ isUploading }),
     setUploadProgress: (uploadProgress) => set({ uploadProgress }),
@@ -137,6 +145,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     setCanceller: (currentCanceller) => set({ currentCanceller }),
     setKeychain: (currentKeychain) => set({ currentKeychain }),
     setZippingProgress: (zippingProgress) => set({ zippingProgress }),
+    setCheckingSpeed: (checkingSpeed) => set({ checkingSpeed }),
 
     // Uploaded files
     uploadedFiles: loadUploadedFiles(),
@@ -194,6 +203,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         localStorage.removeItem('uploadedFiles');
         set({ uploadedFiles: [] });
     },
+
+    // Resumable upload
+    resumableUpload: null,
+    setResumableUpload: (resumableUpload) => set({ resumableUpload }),
 
     // Config
     config: null,

@@ -5,7 +5,8 @@ import { formatBytes, formatDuration, formatSpeed } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
 export function UploadProgress() {
-    const { isUploading, uploadProgress, zippingProgress, currentCanceller } = useAppStore();
+    const { isUploading, uploadProgress, zippingProgress, checkingSpeed, currentCanceller } =
+        useAppStore();
 
     if (!isUploading) {
         return null;
@@ -15,24 +16,42 @@ export function UploadProgress() {
         currentCanceller?.cancel();
     };
 
-    // Determine current phase
     const isZipping = zippingProgress !== null && zippingProgress < 100 && !uploadProgress;
     const isUploading_ = uploadProgress !== null;
-
-    // Show initial state before progress data is available
     const percentage = isZipping ? zippingProgress : (uploadProgress?.percentage ?? 0);
     const loaded = uploadProgress?.loaded ?? 0;
     const total = uploadProgress?.total ?? 0;
     const speed = uploadProgress?.speed ?? 0;
     const remainingTime = uploadProgress?.remainingTime ?? 0;
+    const connectionQuality = uploadProgress?.connectionQuality ?? 'good';
+    const retryCount = uploadProgress?.retryCount ?? 0;
+    const isOffline = uploadProgress?.isOffline ?? false;
 
-    // Status text
+    // Status text based on connection state
     let statusText = 'Preparing upload...';
-    if (isZipping) {
+    if (checkingSpeed) {
+        statusText = 'Checking speed...';
+    } else if (isZipping) {
         statusText = 'Compressing files...';
+    } else if (isOffline) {
+        statusText = 'Waiting for connection...';
+    } else if (connectionQuality === 'stalled') {
+        statusText = 'Connection stalled...';
+    } else if (retryCount > 0 && connectionQuality !== 'good') {
+        statusText = `Retrying... (${retryCount} ${retryCount === 1 ? 'retry' : 'retries'})`;
     } else if (isUploading_) {
         statusText = 'Uploading...';
     }
+
+    // Connection quality dot color
+    const qualityDotColors: Record<string, string> = {
+        good: 'bg-emerald-500',
+        fair: 'bg-yellow-500',
+        slow: 'bg-orange-500',
+        stalled: 'bg-red-500',
+        offline: 'bg-gray-500',
+    };
+    const dotColor = qualityDotColors[connectionQuality] || 'bg-emerald-500';
 
     return (
         <div className="bg-overlay-subtle border border-border-medium rounded-element p-4">
@@ -46,6 +65,9 @@ export function UploadProgress() {
                     <span className="text-paragraph-sm font-medium text-content-primary">
                         {statusText}
                     </span>
+                    {isUploading_ && !isZipping && (
+                        <span className={`inline-block h-2 w-2 rounded-full ${dotColor}`} />
+                    )}
                 </div>
                 <Button variant="ghost" size="sm" onClick={handleCancel}>
                     <X className="mr-2 h-4 w-4" />

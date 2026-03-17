@@ -16,6 +16,7 @@ import { useDocumentMeta } from '@/hooks/useDocumentMeta';
 import {
     API_BASE_URL,
     checkLegacyFile,
+    type DownloadPhase,
     downloadFile,
     fileExists,
     getDownloadStatus,
@@ -51,6 +52,7 @@ export function DownloadPage() {
     const [keychain, setKeychain] = useState<Keychain | null>(null);
     const [canDownloadAgain, setCanDownloadAgain] = useState(true);
     const [downloadsLeft, setDownloadsLeft] = useState<number | null>(null);
+    const [downloadPhase, setDownloadPhase] = useState<DownloadPhase>('downloading');
     const loadingRef = useRef(false);
 
     // Compute document meta based on state and metadata
@@ -126,8 +128,9 @@ export function DownloadPage() {
                     setDownloadsLeft(status.dlimit - status.dl);
                 }
 
-                // Create keychain if we have a secret key
-                const kc = secretKey ? new Keychain(secretKey) : null;
+                // Create keychain if we have a secret key and crypto.subtle is available
+                // (crypto.subtle requires a secure context: HTTPS or localhost)
+                const kc = secretKey && crypto?.subtle ? new Keychain(secretKey) : null;
                 setKeychain(kc);
 
                 // Fetch metadata
@@ -204,11 +207,19 @@ export function DownloadPage() {
         });
         setState('downloading');
         setProgress(0);
+        setDownloadPhase('downloading');
 
         try {
-            const result = await downloadFile(id, keychain, (loaded, total) => {
-                setProgress((loaded / total) * 100);
-            });
+            const result = await downloadFile(
+                id,
+                keychain,
+                (loaded, total) => {
+                    setProgress((loaded / total) * 100);
+                },
+                (phase) => {
+                    setDownloadPhase(phase);
+                },
+            );
 
             // Trigger browser download
             triggerDownload(result.blob, result.filename);
@@ -464,10 +475,16 @@ export function DownloadPage() {
                         {/* Download button or progress */}
                         {state === 'downloading' ? (
                             <div className="w-full space-y-3">
-                                <Progress value={progress} className="h-2" />
+                                <Progress
+                                    value={downloadPhase === 'downloading' ? progress : 100}
+                                    className="h-2"
+                                />
                                 <p className="text-center text-paragraph-xs text-content-secondary">
-                                    Downloading{metadata?.encrypted ? ' and decrypting' : ''}...{' '}
-                                    {Math.round(progress)}%
+                                    {downloadPhase === 'decrypting'
+                                        ? 'Decrypting...'
+                                        : downloadPhase === 'finalizing'
+                                          ? 'Finalizing...'
+                                          : `Downloading... ${Math.round(progress)}%`}
                                 </p>
                             </div>
                         ) : (

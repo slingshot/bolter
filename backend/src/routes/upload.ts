@@ -19,8 +19,19 @@ interface PartInfo {
     maxSize: number;
 }
 
-function calculateOptimalPartSize(fileSize: number): { partSize: number; numParts: number } {
+function calculateOptimalPartSize(
+    fileSize: number,
+    preferredPartSize?: number,
+): { partSize: number; numParts: number } {
     let partSize = DEFAULT_PART_SIZE;
+
+    // Use client-preferred part size if provided and within valid bounds
+    if (preferredPartSize) {
+        if (preferredPartSize >= MIN_PART_SIZE && preferredPartSize <= MAX_PART_SIZE) {
+            partSize = preferredPartSize;
+        }
+    }
+
     let numParts = Math.ceil(fileSize / partSize);
 
     if (numParts > MAX_PARTS) {
@@ -59,7 +70,7 @@ export const uploadRoutes = new Elysia()
     .post(
         '/upload/url',
         async ({ body, request }) => {
-            const { fileSize, encrypted, timeLimit, dlimit } = body;
+            const { fileSize, encrypted, timeLimit, dlimit, preferredPartSize } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info(
@@ -161,7 +172,10 @@ export const uploadRoutes = new Elysia()
             );
 
             if (useMultipart) {
-                const { partSize, numParts } = calculateOptimalPartSize(fileSize);
+                const { partSize, numParts } = calculateOptimalPartSize(
+                    fileSize,
+                    preferredPartSize,
+                );
 
                 logger.info(
                     {
@@ -268,6 +282,7 @@ export const uploadRoutes = new Elysia()
                 await storage.setField(id, 'uploadId', uploadId);
                 await storage.setField(id, 'multipart', 'true');
                 await storage.setField(id, 'numParts', numParts.toString());
+                await storage.setField(id, 'partSize', partSize.toString());
 
                 const response = {
                     useSignedUrl: true,
@@ -339,6 +354,7 @@ export const uploadRoutes = new Elysia()
                 encrypted: t.Optional(t.Boolean()),
                 timeLimit: t.Optional(t.Number()),
                 dlimit: t.Optional(t.Number()),
+                preferredPartSize: t.Optional(t.Number()),
             }),
         },
     )
@@ -596,6 +612,139 @@ export const uploadRoutes = new Elysia()
         {
             body: t.Object({
                 uploadId: t.String(),
+            }),
+        },
+    )
+
+    // Resume multipart upload — generate pre-signed URLs for remaining parts
+    .post(
+        '/upload/multipart/:id/resume',
+        async ({ params, body }) => {
+            const { id } = params;
+            const { uploadId, completedPartNumbers } = body;
+            const requestId = randomBytes(4).toString('hex');
+
+            logger.info(
+                { requestId, id, uploadId, completedCount: completedPartNumbers.length },
+                'Resume upload request received',
+            );
+
+            // Verify upload exists in Redis
+            const fileInfo = await storage.getMetadata(id);
+            if (!fileInfo) {
+                logger.warn({ requestId, id }, 'File not found for resume');
+                return new Response(JSON.stringify({ error: 'Upload not found or expired' }), {
+                    status: 404,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+
+            if (!fileInfo.uploadId || fileInfo.uploadId !== uploadId) {
+                logger.warn({ requestId, id }, 'Upload ID mismatch');
+                return new Response(JSON.stringify({ error: 'Upload ID mismatch' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+
+            const numParts = fileInfo.numParts || 0;
+            const partSize = Number(fileInfo.partSize || DEFAULT_PART_SIZE);
+            const completedSet = new Set(completedPartNumbers);
+
+            // Generate pre-signed URLs for parts NOT in completedPartNumbers
+            const parts: PartInfo[] = [];
+            const BATCH_SIZE = 100;
+
+            for (let batchStart = 1; batchStart <= numParts; batchStart += BATCH_SIZE) {
+                const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, numParts);
+                const batchPromises: Promise<PartInfo | null>[] = [];
+
+                for (let i = batchStart; i <= batchEnd; i++) {
+                    if (completedSet.has(i)) {
+                        continue;
+                    }
+                    batchPromises.push(
+                        storage
+                            .getSignedMultipartUploadUrl(id, uploadId, i, URL_EXPIRATION_SECONDS)
+                            .then((url) => ({
+                                partNumber: i,
+                                url,
+                                minSize: i === numParts ? 0 : partSize,
+                                maxSize: partSize,
+                            })),
+                    );
+                }
+
+                const batchParts = await Promise.all(batchPromises);
+                parts.push(...(batchParts.filter(Boolean) as PartInfo[]));
+            }
+
+            logger.info(
+                { requestId, id, remainingParts: parts.length, totalParts: numParts },
+                'Resume URLs generated',
+            );
+
+            return { parts, partSize, numParts };
+        },
+        {
+            body: t.Object({
+                uploadId: t.String(),
+                completedPartNumbers: t.Array(t.Number()),
+            }),
+        },
+    )
+
+    // Speed test — creates a multipart upload with 5 pre-signed part URLs.
+    // The client uploads 5x100MB parts concurrently to measure real throughput.
+    .post('/upload/speedtest', async () => {
+        const SPEEDTEST_NUM_PARTS = 5;
+        const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
+
+        try {
+            const uploadId = await storage.createMultipartUpload(testId);
+            if (!uploadId) {
+                return { error: 'Failed to create speed test upload' };
+            }
+
+            const parts = await Promise.all(
+                Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
+                    storage
+                        .getSignedMultipartUploadUrl(testId, uploadId, i + 1, 60)
+                        .then((url) => ({ partNumber: i + 1, url })),
+                ),
+            );
+
+            logger.info(
+                { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS },
+                'Speed test URLs generated',
+            );
+            return { testId, uploadId, parts };
+        } catch (e) {
+            logger.warn({ testId, error: e }, 'Speed test setup failed');
+            return { error: 'Speed test setup failed' };
+        }
+    })
+
+    // Clean up speed test object after the test completes
+    .post(
+        '/upload/speedtest/cleanup',
+        async ({ body }) => {
+            const { testId, uploadId } = body;
+            try {
+                // Abort the multipart upload (cleans up parts from S3)
+                if (uploadId) {
+                    await storage.abortMultipartUpload(testId, uploadId);
+                }
+                logger.info({ testId }, 'Speed test cleaned up');
+            } catch (e) {
+                logger.warn({ testId, error: e }, 'Failed to clean up speed test');
+            }
+            return { ok: true };
+        },
+        {
+            body: t.Object({
+                testId: t.String(),
+                uploadId: t.Optional(t.String()),
             }),
         },
     );
