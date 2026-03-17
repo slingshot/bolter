@@ -59,22 +59,34 @@ function waitForOnline(): Promise<void> {
 
 /**
  * Measure upload speed with a preflight test.
- * Uploads a 20MB random payload for up to 10 seconds,
- * then returns the measured speed in bytes/second.
- * Returns 0 if the test fails (server will use default part size).
+ * Gets a pre-signed S3 URL from the backend, uploads a blob directly to S3
+ * for up to 10 seconds, then cleans up the test object.
+ * Returns measured speed in bytes/second, or 0 on failure.
  */
 async function measureUploadSpeed(): Promise<number> {
+    let testId: string | null = null;
     try {
-        // Create a zero-filled blob — content doesn't matter for speed measurement,
-        // and this avoids the cost of filling 500MB with random data
+        // Get a pre-signed S3 URL for the speed test
+        const res = await fetch(`${API_BASE_URL}/upload/speedtest`, { method: 'POST' });
+        if (!res.ok) {
+            console.warn(`[Upload] Speed test setup failed: HTTP ${res.status}`);
+            return 0;
+        }
+        const { url, testId: id } = await res.json();
+        testId = id;
+        if (!url) {
+            console.warn('[Upload] Speed test: no URL returned');
+            return 0;
+        }
+
+        // Upload a zero-filled blob directly to S3 (no body limit)
         const blob = new Blob([new ArrayBuffer(PREFLIGHT_SIZE)]);
         let uploadedBytes = 0;
         const startTime = Date.now();
 
-        return await new Promise<number>((resolve) => {
+        const speed = await new Promise<number>((resolve) => {
             const xhr = new XMLHttpRequest();
             const timeout = setTimeout(() => {
-                // Time's up — calculate speed from what we managed to send
                 xhr.abort();
                 const elapsed = (Date.now() - startTime) / 1000;
                 resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
@@ -92,13 +104,12 @@ async function measureUploadSpeed(): Promise<number> {
                 if (xhr.status >= 200 && xhr.status < 300) {
                     resolve(elapsed > 0 ? blob.size / elapsed : 0);
                 } else if (xhr.status !== 0) {
-                    // Non-zero status = server responded with error
                     console.warn(
-                        `[Upload] Speed test failed: HTTP ${xhr.status} ${xhr.statusText}`,
+                        `[Upload] Speed test upload failed: HTTP ${xhr.status} ${xhr.statusText}`,
                     );
                     resolve(0);
                 } else {
-                    // status 0 = aborted by timeout (expected), use tracked bytes
+                    // status 0 = aborted by our timeout, use tracked bytes
                     resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
                 }
             });
@@ -109,13 +120,25 @@ async function measureUploadSpeed(): Promise<number> {
                 resolve(0);
             });
 
-            xhr.open('POST', `${API_BASE_URL}/upload/speedtest`);
-            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+            xhr.open('PUT', url);
             xhr.send(blob);
         });
+
+        return speed;
     } catch (e) {
         console.warn('[Upload] Speed test exception:', e);
         return 0;
+    } finally {
+        // Clean up the test object from S3
+        if (testId) {
+            fetch(`${API_BASE_URL}/upload/speedtest/cleanup`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ testId }),
+            }).catch(() => {
+                // Best-effort cleanup
+            });
+        }
     }
 }
 

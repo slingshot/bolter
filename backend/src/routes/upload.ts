@@ -694,41 +694,34 @@ export const uploadRoutes = new Elysia()
         },
     )
 
-    // Speed test endpoint — accepts and discards a blob for preflight measurement
+    // Speed test — returns a pre-signed S3 URL for the client to upload to directly.
+    // The client uploads a junk blob to S3, measures speed, then we delete the object.
+    .post('/upload/speedtest', async () => {
+        const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
+        const url = await storage.getSignedUploadUrl(testId, 60);
+        if (!url) {
+            return { error: 'Failed to generate speed test URL' };
+        }
+        logger.info({ testId }, 'Speed test URL generated');
+        return { url, testId };
+    })
+
+    // Clean up speed test object after the test completes
     .post(
-        '/upload/speedtest',
-        async ({ request }) => {
-            const startTime = Date.now();
-            let totalBytes = 0;
-
-            const body = request.body;
-            if (body) {
-                const reader = (body as ReadableStream).getReader();
-                // biome-ignore lint/correctness/noConstantCondition: intentional drain loop
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        break;
-                    }
-                    if (value) {
-                        totalBytes += value.length;
-                    }
-                }
+        '/upload/speedtest/cleanup',
+        async ({ body }) => {
+            const { testId } = body;
+            try {
+                await storage.del(testId);
+                logger.info({ testId }, 'Speed test object deleted');
+            } catch (e) {
+                logger.warn({ testId, error: e }, 'Failed to delete speed test object');
             }
-
-            const elapsed = (Date.now() - startTime) / 1000;
-            const speedMbps =
-                elapsed > 0 ? Math.round((totalBytes / (1024 * 1024) / elapsed) * 10) / 10 : 0;
-            logger.info(
-                { totalBytes, elapsedMs: Date.now() - startTime, speedMbps },
-                'Speed test completed',
-            );
-
-            return { ok: true, speedMbps };
+            return { ok: true };
         },
         {
-            // Skip Elysia body parsing — we stream the raw body ourselves
-            // biome-ignore lint/suspicious/noEmptyBlockStatements: intentional no-op parser
-            parse: () => {},
+            body: t.Object({
+                testId: t.String(),
+            }),
         },
     );
