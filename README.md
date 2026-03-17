@@ -24,6 +24,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **No accounts required** — generate a link, share it, done
 - **Resilient uploads** — stall detection, offline awareness, progress-based retries, and IndexedDB-backed resume on page reload
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
+- **CLI tool** — upload and download from the terminal with `bolter upload` / `bolter download`, standalone binaries for macOS and Linux
 - **Self-hostable** — Docker Compose, or run directly with Bun
 - **Fully customizable** — white-label with your own branding, limits, and expiration options via environment variables
 
@@ -91,6 +92,31 @@ bun run dev
 
 The frontend runs at `http://localhost:3000` and the backend at `http://localhost:3001`.
 
+### CLI
+
+Upload and download files from the terminal:
+
+```bash
+# Upload a file (unencrypted)
+bun run --cwd apps/cli cli.ts upload report.pdf
+
+# Upload with encryption
+bun run --cwd apps/cli cli.ts upload secret.zip --encrypt
+
+# Upload multiple files (auto-zipped)
+bun run --cwd apps/cli cli.ts upload file1.txt file2.txt --encrypt --expire 7d --downloads 5
+
+# Download a file
+bun run --cwd apps/cli cli.ts download https://send.fm/download/abc123#secretKey
+
+# JSON output for scripting
+bun run --cwd apps/cli cli.ts upload data.csv --json
+
+# Build standalone binaries
+turbo run compile --filter=@bolter/cli
+# Produces: dist/bolter-darwin-arm64, bolter-linux-x64, etc.
+```
+
 ### Docker
 
 ```bash
@@ -123,12 +149,18 @@ bolter/
 │   │   │   └── stores/       # Zustand state management
 │   │   └── Dockerfile        # Multi-stage: Bun build → Nginx
 │   │
-│   └── backend/           # Elysia (Bun-native web framework)
-│       ├── src/
-│       │   ├── routes/       # Upload + download endpoints
-│       │   ├── storage/      # S3 + Redis adapters
-│       │   └── config.ts     # Convict-based env validation
-│       └── Dockerfile        # Multi-stage: Bun slim
+│   ├── backend/           # Elysia (Bun-native web framework)
+│   │   ├── src/
+│   │   │   ├── routes/       # Upload + download endpoints
+│   │   │   ├── storage/      # S3 + Redis adapters
+│   │   │   └── config.ts     # Convict-based env validation
+│   │   └── Dockerfile        # Multi-stage: Bun slim
+│   │
+│   └── cli/               # Bunli CLI tool (standalone binaries)
+│       ├── cli.ts            # Entry point
+│       ├── commands/         # upload, download, config
+│       ├── lib/              # Crypto, API client, engines, state
+│       └── build.ts          # Cross-platform compilation
 │
 ├── packages/
 │   └── shared/            # Constants shared across workspaces
