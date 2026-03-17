@@ -692,4 +692,21 @@ export const uploadRoutes = new Elysia()
                 completedPartNumbers: t.Array(t.Number()),
             }),
         },
-    );
+    )
+
+    // Speed test endpoint — accepts and discards a blob for preflight measurement
+    .put('/upload/speedtest', async ({ request }) => {
+        // Consume and discard the body
+        const body = request.body;
+        if (body) {
+            const reader = (body as ReadableStream).getReader();
+            // biome-ignore lint/correctness/noConstantCondition: intentional drain loop
+            while (true) {
+                const { done } = await reader.read();
+                if (done) {
+                    break;
+                }
+            }
+        }
+        return { ok: true };
+    });

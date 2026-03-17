@@ -43,28 +43,9 @@ const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
-// Speed persistence via localStorage
-const SPEED_STORAGE_KEY = 'bolter:uploadSpeed';
-
-function getObservedSpeed(): number {
-    try {
-        const stored = localStorage.getItem(SPEED_STORAGE_KEY);
-        return stored ? Number(stored) : 0;
-    } catch {
-        return 0;
-    }
-}
-
-function updateObservedSpeed(speed: number): void {
-    try {
-        const current = getObservedSpeed();
-        // Exponential moving average (alpha = 0.3)
-        const smoothed = current === 0 ? speed : current * 0.7 + speed * 0.3;
-        localStorage.setItem(SPEED_STORAGE_KEY, smoothed.toString());
-    } catch {
-        // Ignore storage errors
-    }
-}
+// Preflight speed test configuration
+const PREFLIGHT_SIZE = 20 * 1024 * 1024; // 20MB test payload
+const PREFLIGHT_TIMEOUT = 10_000; // Run for up to 10 seconds
 
 function waitForOnline(): Promise<void> {
     if (navigator.onLine) {
@@ -76,10 +57,57 @@ function waitForOnline(): Promise<void> {
     });
 }
 
-function getPreferredPartSize(): number | undefined {
-    const speed = getObservedSpeed();
+/**
+ * Measure upload speed with a preflight test.
+ * Uploads a 20MB random payload for up to 10 seconds,
+ * then returns the measured speed in bytes/second.
+ * Returns 0 if the test fails (server will use default part size).
+ */
+async function measureUploadSpeed(): Promise<number> {
+    try {
+        const blob = new Blob([crypto.getRandomValues(new Uint8Array(PREFLIGHT_SIZE))]);
+        let uploadedBytes = 0;
+        const startTime = Date.now();
+
+        return await new Promise<number>((resolve) => {
+            const xhr = new XMLHttpRequest();
+            const timeout = setTimeout(() => {
+                // Time's up — calculate speed from what we managed to send
+                xhr.abort();
+                const elapsed = (Date.now() - startTime) / 1000;
+                resolve(elapsed > 0 ? uploadedBytes / elapsed : 0);
+            }, PREFLIGHT_TIMEOUT);
+
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    uploadedBytes = e.loaded;
+                }
+            });
+
+            xhr.addEventListener('loadend', () => {
+                clearTimeout(timeout);
+                const elapsed = (Date.now() - startTime) / 1000;
+                // Use total blob size on success, tracked bytes on abort
+                const bytes = xhr.status >= 200 && xhr.status < 300 ? blob.size : uploadedBytes;
+                resolve(elapsed > 0 ? bytes / elapsed : 0);
+            });
+
+            xhr.addEventListener('error', () => {
+                clearTimeout(timeout);
+                resolve(0);
+            });
+
+            xhr.open('PUT', `${API_BASE_URL}/upload/speedtest`);
+            xhr.send(blob);
+        });
+    } catch {
+        return 0;
+    }
+}
+
+function getPreferredPartSize(speed: number): number | undefined {
     if (speed === 0) {
-        return undefined; // No data yet, use server default
+        return undefined;
     }
 
     for (const tier of PART_SIZE_TIERS) {
@@ -486,6 +514,16 @@ export async function uploadFiles(
         stream = createFileStream(files, keychain, encrypted);
     }
 
+    // Run preflight speed test to determine optimal part size
+    console.log('[Upload] Running preflight speed test...');
+    const measuredSpeed = await measureUploadSpeed();
+    const preferredPartSize = getPreferredPartSize(measuredSpeed);
+    if (measuredSpeed > 0) {
+        console.log(
+            `[Upload] Preflight: ${(measuredSpeed / (1024 * 1024)).toFixed(1)} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+        );
+    }
+
     // Request upload URLs
     const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
         method: 'POST',
@@ -495,7 +533,7 @@ export async function uploadFiles(
             encrypted,
             timeLimit,
             dlimit: downloadLimit,
-            preferredPartSize: getPreferredPartSize(),
+            preferredPartSize,
         }),
     });
 
@@ -1151,9 +1189,6 @@ async function uploadMultipartStream(
     // Track actual uploaded part sizes for pre-completion consistency check
     const uploadedPartSizes: Record<number, number> = {};
 
-    // Track per-part start times for speed measurement
-    const partStartTimes: Record<number, number> = {};
-
     // Promise to signal when all uploads are done
     let resolveAllDone: () => void;
     const allDonePromise = new Promise<void>((resolve) => {
@@ -1170,7 +1205,6 @@ async function uploadMultipartStream(
             console.log(
                 `[Upload] Part ${partNum} starting (${(partBlob.size / (1024 * 1024)).toFixed(1)}MB)`,
             );
-            partStartTimes[partNum] = Date.now();
             const result = await uploadPartWithRetry(
                 partBlob,
                 partUrl,
@@ -1180,10 +1214,6 @@ async function uploadMultipartStream(
                 0,
                 onRetry,
             );
-            const elapsed = (Date.now() - partStartTimes[partNum]) / 1000;
-            if (elapsed > 0) {
-                updateObservedSpeed(partBlob.size / elapsed);
-            }
             completedParts.push(result);
             uploadedPartSizes[partNum] = partBlob.size;
             if (fileId) {
