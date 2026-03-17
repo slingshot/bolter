@@ -1878,10 +1878,13 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
 /**
  * Download a file
  */
+export type DownloadPhase = 'downloading' | 'decrypting' | 'finalizing';
+
 export async function downloadFile(
     id: string,
     keychain: Keychain | null,
     onProgress?: (loaded: number, total: number) => void,
+    onPhase?: (phase: DownloadPhase) => void,
 ): Promise<{ blob: Blob; filename: string }> {
     const dlStart = Date.now();
     const dlLog = (msg: string, data?: Record<string, unknown>) =>
@@ -2011,6 +2014,7 @@ export async function downloadFile(
         throw new Error('No response body');
     }
 
+    onPhase?.('downloading');
     dlLog('Starting download stream', {
         contentLength,
         metadataSize: metadata.size,
@@ -2077,6 +2081,7 @@ export async function downloadFile(
     // Decrypt if needed
     let decryptedData: Uint8Array;
     if (metadata.encrypted && keychain) {
+        onPhase?.('decrypting');
         dlLog('Starting decryption...', {
             encryptedSize: data.length,
             encryptedSizeMB: Math.round((data.length / (1024 * 1024)) * 10) / 10,
@@ -2112,6 +2117,7 @@ export async function downloadFile(
     }
 
     // Report download complete
+    onPhase?.('finalizing');
     dlLog('Reporting download complete to server...');
     await fetch(`${API_BASE_URL}/download/complete/${id}`, {
         method: 'POST',
