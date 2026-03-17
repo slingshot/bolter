@@ -14,6 +14,7 @@
         "lint:fix": "biome lint --write .",
         "format": "biome format --write .",
         "check": "biome check --write .",
+        "test": "turbo run test",
         "commit": "cz",
         "prepare": "lefthook install || true"
     },

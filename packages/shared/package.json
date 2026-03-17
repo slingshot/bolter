@@ -5,6 +5,15 @@
     "type": "module",
     "main": "config.ts",
     "exports": {
-        ".": "./config.ts"
+        ".": {
+            "bun": "./config.ts",
+            "import": "./dist/config.js",
+            "default": "./config.ts"
+        }
+    },
+    "scripts": {
+        "postinstall": "bun build config.ts --outdir dist --format esm",
+        "build": "bun build config.ts --outdir dist --format esm",
+        "test": "bun test"
     }
 }

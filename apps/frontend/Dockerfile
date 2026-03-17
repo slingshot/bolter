@@ -13,6 +13,9 @@ COPY packages/shared/config.ts ./packages/shared/
 # Install dependencies
 RUN bun install --frozen-lockfile
 
+# Build shared package (needed for Node.js/Vite import resolution)
+RUN cd packages/shared && bun run build
+
 # Copy frontend source
 COPY apps/frontend/ ./apps/frontend/
 

@@ -19,7 +19,7 @@ interface PartInfo {
     maxSize: number;
 }
 
-function calculateOptimalPartSize(
+export function calculateOptimalPartSize(
     fileSize: number,
     preferredPartSize?: number,
 ): { partSize: number; numParts: number } {
