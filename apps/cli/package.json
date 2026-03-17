@@ -1,0 +1,27 @@
+{
+    "name": "@bolter/cli",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "bun run cli.ts",
+        "build": "bun build cli.ts --outdir ./dist --target bun --sourcemap=external",
+        "compile": "bun run build.ts",
+        "typecheck": "tsc --noEmit",
+        "test": "bun test"
+    },
+    "dependencies": {
+        "@bolter/shared": "workspace:*",
+        "@bunli/core": "^0.8.2",
+        "archiver": "^7.0.1",
+        "qrcode-terminal": "^0.12.0",
+        "react": "^19.1.0",
+        "zod": "^3.24.4"
+    },
+    "devDependencies": {
+        "@types/archiver": "^6.0.3",
+        "@types/bun": "latest",
+        "@types/qrcode-terminal": "^0.12.0",
+        "typescript": "^5.9.3"
+    }
+}

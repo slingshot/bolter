@@ -24,7 +24,7 @@ turbo run dev --filter=@bolter/backend   # http://localhost:3001
 # Production build (cached — second run is instant)
 bun run build
 
-# Type checking (both workspaces)
+# Type checking (all workspaces)
 bun run typecheck
 
 # Linting / formatting (biome, runs at root)
@@ -32,6 +32,14 @@ bun run check
 
 # Docker deployment
 docker compose up
+
+# CLI usage
+bun run --cwd apps/cli cli.ts upload <files...> [options]
+bun run --cwd apps/cli cli.ts download <url> [options]
+bun run --cwd apps/cli cli.ts config [options]
+
+# CLI binary compilation (macOS + Linux, arm64 + x64)
+turbo run compile --filter=@bolter/cli
 ```
 
 ## Turborepo
@@ -40,6 +48,7 @@ Task pipeline is defined in `turbo.json`. Key tasks:
 - `build` — depends on `^build` (shared builds first), outputs cached in `dist/**`
 - `dev` — persistent, not cached, depends on `^build`
 - `typecheck` — depends on `^build`
+- `compile` — builds standalone CLI binaries, depends on `build`, outputs `dist/bolter-*`
 
 Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`) are in `build.env` for cache busting. Runtime-only vars (S3, Redis, limits, etc.) are in `globalPassThroughEnv`.
 
@@ -48,7 +57,8 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 **Monorepo Structure** (Turborepo + Bun workspaces):
 - `apps/frontend/` - Vite + React 18 + TypeScript + Tailwind
 - `apps/backend/` - Elysia (Bun web framework) + TypeScript
-- `packages/shared/` - Constants exported to both (BYTES, LIMITS, DEFAULTS)
+- `apps/cli/` - Bunli CLI framework + TypeScript (standalone binaries via `bun build --compile`)
+- `packages/shared/` - Constants exported to all workspaces (BYTES, LIMITS, DEFAULTS)
 
 **Data Flow**:
 1. Frontend optionally encrypts files with Web Crypto API (AES-GCM + HKDF key derivation)
@@ -77,6 +87,19 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 - `apps/frontend/src/stores/app.ts` - Zustand store (config, upload state, files)
 - `apps/frontend/src/pages/Home.tsx` - Upload interface
 - `apps/frontend/src/pages/Download.tsx` - Download/decryption interface
+
+**Key CLI Components**:
+- `apps/cli/cli.ts` - Entry point, registers commands with Bunli
+- `apps/cli/commands/upload.ts` - Upload command with encryption, multipart, resume, QR code
+- `apps/cli/commands/download.ts` - Download command with streaming decryption
+- `apps/cli/commands/config.ts` - Configuration management (~/.bolter/config.json)
+- `apps/cli/lib/crypto.ts` - Byte-identical port of frontend crypto (AES-GCM, ECE streams)
+- `apps/cli/lib/api.ts` - HTTP client with challenge-response auth for all backend endpoints
+- `apps/cli/lib/upload-engine.ts` - Multipart orchestration: speed test, concurrency, stall detection
+- `apps/cli/lib/download-engine.ts` - Streaming download with progress tracking + decryption
+- `apps/cli/lib/upload-state.ts` - JSON resume persistence at ~/.bolter/uploads/
+- `apps/cli/lib/zip.ts` - Multi-file archiving via archiver
+- `apps/cli/build.ts` - Cross-platform binary compilation (4 targets)
 
 **Path Alias**: `@/` maps to `apps/frontend/src/`
 

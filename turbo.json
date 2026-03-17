@@ -26,6 +26,11 @@
             "dependsOn": ["build"],
             "cache": false,
             "persistent": true
+        },
+        "compile": {
+            "dependsOn": ["build"],
+            "outputs": ["dist/bolter-*"],
+            "cache": false
         }
     },
     "globalDependencies": [".env", ".env.*"],

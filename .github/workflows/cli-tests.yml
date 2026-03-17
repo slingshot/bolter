@@ -1,0 +1,38 @@
+name: CLI Tests
+
+on:
+  push:
+    branches: [main, feat/cli]
+    paths:
+      - 'apps/cli/**'
+      - 'packages/shared/**'
+      - '.github/workflows/cli-tests.yml'
+  pull_request:
+    paths:
+      - 'apps/cli/**'
+      - 'packages/shared/**'
+
+jobs:
+  test:
+    name: Unit & Integration Tests
+    runs-on: namespace-profile-default
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+        working-directory: apps/cli
+
+      - name: Lint
+        run: bunx biome check apps/cli/
+
+      - name: Run tests
+        run: bun test
+        working-directory: apps/cli
