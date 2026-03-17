@@ -126,8 +126,9 @@ export function DownloadPage() {
                     setDownloadsLeft(status.dlimit - status.dl);
                 }
 
-                // Create keychain if we have a secret key
-                const kc = secretKey ? new Keychain(secretKey) : null;
+                // Create keychain if we have a secret key and crypto.subtle is available
+                // (crypto.subtle requires a secure context: HTTPS or localhost)
+                const kc = secretKey && crypto?.subtle ? new Keychain(secretKey) : null;
                 setKeychain(kc);
 
                 // Fetch metadata
