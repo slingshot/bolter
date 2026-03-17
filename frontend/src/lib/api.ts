@@ -637,35 +637,38 @@ export async function uploadFiles(
 
     try {
         if (uploadInfo.multipart && uploadInfo.parts) {
-            // Persist upload state for resumability
-            // Store the raw (pre-encryption) file size for matching against File.size on resume
-            const rawFileSize = files.length === 1 ? files[0].size : totalInputSize;
-            // Calculate plaintext bytes per encrypted part
-            // Each ECE record: plaintext ECE_RECORD_SIZE → encrypted ECE_RECORD_SIZE + 17 (tag + delimiter)
-            const encryptedRecordSize = ECE_RECORD_SIZE + 17;
-            const plaintextPartSize = encrypted
-                ? Math.floor((uploadInfo.partSize || 0) / encryptedRecordSize) * ECE_RECORD_SIZE
-                : uploadInfo.partSize || 0;
-            const persistState: PersistedUpload = {
-                fileId: uploadInfo.id,
-                uploadId: uploadInfo.uploadId || '',
-                ownerToken: uploadInfo.owner,
-                fileName: files.length === 1 ? files[0].name : `${files.length}_files.zip`,
-                fileSize: rawFileSize,
-                fileLastModified: files.length === 1 ? files[0].lastModified : 0,
-                encrypted,
-                partSize: uploadInfo.partSize || 0,
-                plaintextPartSize,
-                completedParts: [],
-                totalParts: uploadInfo.parts.length,
-                secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
-                timeLimit: timeLimit || 86400,
-                downloadLimit: downloadLimit || 1,
-                createdAt: Date.now(),
-            };
-            saveUploadState(persistState).catch((e) =>
-                console.warn('[Upload] Failed to persist upload state:', e),
-            );
+            // Only persist resumability state for single-file uploads.
+            // Multi-file uploads create a streaming zip that can't be
+            // reconstructed from the original files on resume.
+            const canResume = !isMultiFile;
+            if (canResume) {
+                // Calculate plaintext bytes per encrypted part
+                // Each ECE record: plaintext ECE_RECORD_SIZE → encrypted ECE_RECORD_SIZE + 17 (tag + delimiter)
+                const encryptedRecordSize = ECE_RECORD_SIZE + 17;
+                const plaintextPartSize = encrypted
+                    ? Math.floor((uploadInfo.partSize || 0) / encryptedRecordSize) * ECE_RECORD_SIZE
+                    : uploadInfo.partSize || 0;
+                const persistState: PersistedUpload = {
+                    fileId: uploadInfo.id,
+                    uploadId: uploadInfo.uploadId || '',
+                    ownerToken: uploadInfo.owner,
+                    fileName: files[0].name,
+                    fileSize: files[0].size,
+                    fileLastModified: files[0].lastModified,
+                    encrypted,
+                    partSize: uploadInfo.partSize || 0,
+                    plaintextPartSize,
+                    completedParts: [],
+                    totalParts: uploadInfo.parts.length,
+                    secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
+                    timeLimit: timeLimit || 86400,
+                    downloadLimit: downloadLimit || 1,
+                    createdAt: Date.now(),
+                };
+                saveUploadState(persistState).catch((e) =>
+                    console.warn('[Upload] Failed to persist upload state:', e),
+                );
+            }
 
             // Multipart upload
             const multipartResult = await uploadMultipartStream(
@@ -682,7 +685,7 @@ export async function uploadFiles(
                     const part1Bytes = partProgress[1] ?? 0;
                     updateProgress(1, part1Bytes);
                 },
-                uploadInfo.id,
+                canResume ? uploadInfo.id : undefined,
             );
 
             // Handle fallback: stream produced too little data for multipart
