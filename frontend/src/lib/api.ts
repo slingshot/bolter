@@ -575,16 +575,20 @@ export async function uploadFiles(
         stream = createFileStream(files, keychain, encrypted);
     }
 
-    // Run preflight speed test to determine optimal part size
-    onSpeedTest?.('started');
-    console.log('[Upload] Running preflight speed test...');
-    const measuredSpeed = await measureUploadSpeed();
-    const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
-    const preferredPartSize = getPreferredPartSize(measuredSpeed);
-    console.log(
-        `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
-    );
-    onSpeedTest?.('done', speedMbps);
+    // Run preflight speed test for multipart uploads to determine optimal part size.
+    // Single-part uploads (<100MB) don't need this since there's no part sizing decision.
+    let preferredPartSize: number | undefined;
+    if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+        onSpeedTest?.('started');
+        console.log('[Upload] Running preflight speed test...');
+        const measuredSpeed = await measureUploadSpeed();
+        const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
+        preferredPartSize = getPreferredPartSize(measuredSpeed);
+        console.log(
+            `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+        );
+        onSpeedTest?.('done', speedMbps);
+    }
 
     // Request upload URLs
     const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
