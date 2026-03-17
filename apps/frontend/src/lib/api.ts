@@ -1298,10 +1298,18 @@ async function uploadMultipartStream(
     const uploadedPartSizes: Record<number, number> = {};
 
     // Promise to signal when all uploads are done
-    let resolveAllDone: () => void;
+    let resolveAllDone!: () => void;
     const allDonePromise = new Promise<void>((resolve) => {
         resolveAllDone = resolve;
     });
+
+    // Guard: prevent resolveAllDone() from firing before the final buffered
+    // part has been flushed.  Without this, the one-shot Promise resolves
+    // when totalPartsFinished === totalPartsQueued *before* the flush code
+    // increments totalPartsQueued for the trailing part — causing the
+    // completion call to fire with missing parts (race condition on iOS
+    // Safari where few-part uploads finish before the stream is drained).
+    let flushComplete = false;
 
     // Upload a single part and manage concurrency
     const doUploadPart = async (
@@ -1359,8 +1367,9 @@ async function uploadMultipartStream(
                 `[Upload] Progress: ${totalPartsFinished}/${totalPartsQueued} parts finished, ${activeUploads} active`,
             );
 
-            // Check if all done
-            if (totalPartsFinished === totalPartsQueued) {
+            // Check if all done — only after the flush has finished
+            // processing the final buffered part (flushComplete guard).
+            if (flushComplete && totalPartsFinished === totalPartsQueued) {
                 resolveAllDone();
             }
 
@@ -1572,6 +1581,15 @@ async function uploadMultipartStream(
             processQueue();
         }
 
+        // All parts are now known — allow resolveAllDone() to fire.
+        flushComplete = true;
+
+        // If every part already completed while we were flushing,
+        // resolveAllDone() was suppressed by the guard.  Fire it now.
+        if (totalPartsQueued > 0 && totalPartsFinished >= totalPartsQueued) {
+            resolveAllDone();
+        }
+
         // Wait for all uploads to complete
         if (totalPartsQueued > 0 && totalPartsFinished < totalPartsQueued) {
             console.log(
@@ -1593,6 +1611,31 @@ async function uploadMultipartStream(
         }
 
         console.log(`[Upload] All ${completedParts.length} parts completed successfully`);
+
+        // Defensive assertion: ensure every queued part is accounted for.
+        // This catches any residual race conditions where the completion call
+        // could fire with fewer parts than R2 expects.
+        if (completedParts.length + failedPartNumbers.length < totalPartsQueued) {
+            const missing = totalPartsQueued - completedParts.length - failedPartNumbers.length;
+            const diagnostic = {
+                completedParts: completedParts.length,
+                failedParts: failedPartNumbers.length,
+                totalPartsQueued,
+                totalPartsFinished,
+                uploadId: uploadInfo.uploadId,
+                partSize,
+                totalFileSize,
+            };
+            console.error(
+                '[Upload] CRITICAL: Part accounting mismatch — some parts unaccounted for',
+                diagnostic,
+            );
+            captureError(new Error(`Part accounting mismatch: ${missing} parts unaccounted for`), {
+                operation: 'upload.part-accounting',
+                extra: diagnostic,
+            });
+            throw new Error('Upload failed: internal part tracking error. Please try again.');
+        }
 
         // Pre-completion consistency check: verify all non-trailing parts have identical sizes
         // This is the key diagnostic for R2's "All non-trailing parts must have the same length" error
