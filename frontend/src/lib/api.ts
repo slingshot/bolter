@@ -45,7 +45,6 @@ const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Preflight speed test configuration
 const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
-const SPEEDTEST_PARTS = 5; // 5 concurrent parts
 const SPEEDTEST_TIMEOUT = 10_000; // Run for up to 10 seconds
 
 function waitForOnline(): Promise<void> {
