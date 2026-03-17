@@ -44,7 +44,7 @@ const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Preflight speed test configuration
-const PREFLIGHT_SIZE = 20 * 1024 * 1024; // 20MB test payload
+const PREFLIGHT_SIZE = 500 * 1024 * 1024; // 500MB test payload
 const PREFLIGHT_TIMEOUT = 10_000; // Run for up to 10 seconds
 
 function waitForOnline(): Promise<void> {
@@ -65,14 +65,9 @@ function waitForOnline(): Promise<void> {
  */
 async function measureUploadSpeed(): Promise<number> {
     try {
-        // crypto.getRandomValues has a 65536-byte limit per call,
-        // so fill the buffer in chunks
-        const buffer = new Uint8Array(PREFLIGHT_SIZE);
-        for (let offset = 0; offset < PREFLIGHT_SIZE; offset += 65536) {
-            const chunk = Math.min(65536, PREFLIGHT_SIZE - offset);
-            crypto.getRandomValues(buffer.subarray(offset, offset + chunk));
-        }
-        const blob = new Blob([buffer]);
+        // Create a zero-filled blob — content doesn't matter for speed measurement,
+        // and this avoids the cost of filling 500MB with random data
+        const blob = new Blob([new ArrayBuffer(PREFLIGHT_SIZE)]);
         let uploadedBytes = 0;
         const startTime = Date.now();
 
@@ -816,6 +811,13 @@ export async function uploadFiles(
         };
     } finally {
         cleanupStatusPoll();
+        // If cancelled, always clean up persisted state — the user
+        // intentionally cancelled, so don't offer resume on next visit
+        if (canceller.cancelled && uploadInfo.multipart) {
+            deleteUploadState(uploadInfo.id).catch(() => {
+                // Intentionally ignored — best-effort cleanup
+            });
+        }
     }
 }
 
