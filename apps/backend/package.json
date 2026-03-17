@@ -15,6 +15,7 @@
         "@aws-sdk/s3-request-presigner": "^3.500.0",
         "@bolter/shared": "workspace:*",
         "@elysiajs/cors": "^1.0.0",
+        "@elysiajs/openapi": "^1.4.14",
         "@elysiajs/static": "^1.0.0",
         "@sentry/bun": "^10.35.0",
         "convict": "^6.2.4",

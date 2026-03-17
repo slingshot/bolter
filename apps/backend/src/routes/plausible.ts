@@ -20,4 +20,7 @@ export const plausibleRoutes = new Elysia({ prefix: '/pl' }).post(
 
         return new Response(response.body, { status: response.status });
     },
+    {
+        detail: { hide: true },
+    },
 );

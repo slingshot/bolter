@@ -91,14 +91,28 @@ See `.env.example` for full list of configurable limits and UI options.
 
 ## API Endpoints
 
+- `GET /` - Interactive API documentation (Scalar UI)
+- `GET /openapi.json` - Raw OpenAPI 3.x specification
 - `GET /health` - Full health check (Redis + S3)
 - `GET /config` - Client configuration (limits, defaults)
 - `POST /upload/url` - Request pre-signed upload URL
-- `POST /upload/multipart/:id` - Initiate multipart upload
-- `POST /upload/multipart/:id/resume` - List completed parts for upload resumption
+- `POST /upload/complete` - Complete file upload (finalize multipart, store metadata)
+- `POST /upload/abort/:id` - Abort multipart upload
+- `POST /upload/multipart/:id/resume` - Resume interrupted multipart upload
 - `POST /upload/speedtest` - Generate pre-signed URLs for preflight speed test parts
 - `POST /upload/speedtest/cleanup` - Clean up speed test objects from S3
+- `GET /download/direct/:id` - Direct download (redirect to S3)
 - `GET /download/url/:id` - Get pre-signed download URL
+- `GET /download/:id` - Stream download (fallback)
+- `GET /download/blob/:id` - Blob download (alternative)
+- `POST /download/complete/:id` - Report download complete
+- `GET /metadata/:id` - Get file metadata
+- `GET /exists/:id` - Check file existence
+- `GET /download/legacy/:id` - Check legacy system
+- `POST /delete/:id` - Delete file (owner only)
+- `POST /params/:id` - Update file parameters (owner only)
+- `POST /info/:id` - Get file info (owner only)
+- `POST /password/:id` - Set file password (owner only)
 
 ## Documentation Maintenance
 
@@ -108,3 +122,14 @@ When making changes to the project, ensure the following files stay in sync:
 - **`README.md`** — features, configuration tables, API reference, deployment instructions
 - **`SECURITY.md`** — if encryption or security model changes
 - **`CONTRIBUTING.md`** — if project structure or dev workflow changes
+
+## OpenAPI Specification
+
+Interactive API docs are served at `/` (Scalar UI) with the raw spec at `/openapi.json`, powered by `@elysiajs/openapi`.
+
+**When adding or modifying API routes, you MUST:**
+1. Add a `detail` object with `summary`, `description`, and `tags`
+2. Add `response` schemas using `t.Object()` for each status code (skip for stream/redirect responses)
+3. Use an existing tag: `Health`, `Configuration`, `Upload`, `Speed Test`, `Download`, `File Management`
+4. Set `detail: { hide: true }` for internal endpoints not meant for public documentation
+5. Keep `body`/`params`/`query` validation schemas — they auto-generate request docs

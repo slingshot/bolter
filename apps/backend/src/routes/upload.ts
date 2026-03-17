@@ -352,6 +352,12 @@ export const uploadRoutes = new Elysia()
             }
         },
         {
+            detail: {
+                tags: ['Upload'],
+                summary: 'Request upload URL(s)',
+                description:
+                    'Generates pre-signed S3 upload URLs. Returns a single URL for small files or multipart upload URLs for files exceeding the multipart threshold.',
+            },
             body: t.Object({
                 fileSize: t.Number(),
                 encrypted: t.Optional(t.Boolean()),
@@ -359,6 +365,29 @@ export const uploadRoutes = new Elysia()
                 dlimit: t.Optional(t.Number()),
                 preferredPartSize: t.Optional(t.Number()),
             }),
+            response: {
+                200: t.Object({
+                    useSignedUrl: t.Optional(t.Boolean()),
+                    multipart: t.Optional(t.Boolean()),
+                    id: t.Optional(t.String()),
+                    owner: t.Optional(t.String()),
+                    url: t.Optional(t.Union([t.String(), t.Null()])),
+                    uploadId: t.Optional(t.String()),
+                    parts: t.Optional(
+                        t.Array(
+                            t.Object({
+                                partNumber: t.Number(),
+                                url: t.String(),
+                                minSize: t.Number(),
+                                maxSize: t.Number(),
+                            }),
+                        ),
+                    ),
+                    partSize: t.Optional(t.Number()),
+                    completeUrl: t.Optional(t.String()),
+                    error: t.Optional(t.String()),
+                }),
+            },
         },
     )
 
@@ -562,6 +591,12 @@ export const uploadRoutes = new Elysia()
             };
         },
         {
+            detail: {
+                tags: ['Upload'],
+                summary: 'Complete file upload',
+                description:
+                    'Finalizes an upload by completing the S3 multipart upload (if applicable), storing file metadata, and setting authentication.',
+            },
             body: t.Object({
                 id: t.String(),
                 metadata: t.Optional(t.String()),
@@ -576,6 +611,15 @@ export const uploadRoutes = new Elysia()
                     ),
                 ),
             }),
+            response: {
+                200: t.Object({
+                    success: t.Optional(t.Boolean()),
+                    id: t.Optional(t.String()),
+                    url: t.Optional(t.String()),
+                    error: t.Optional(t.String()),
+                    status: t.Optional(t.Number()),
+                }),
+            },
         },
     )
 
@@ -613,16 +657,28 @@ export const uploadRoutes = new Elysia()
             }
         },
         {
+            detail: {
+                tags: ['Upload'],
+                summary: 'Abort multipart upload',
+                description:
+                    'Aborts an in-progress multipart upload, cleaning up uploaded parts from S3 and removing metadata from Redis.',
+            },
             body: t.Object({
                 uploadId: t.String(),
             }),
+            response: {
+                200: t.Object({
+                    success: t.Optional(t.Boolean()),
+                    error: t.Optional(t.String()),
+                }),
+            },
         },
     )
 
     // Resume multipart upload — generate pre-signed URLs for remaining parts
     .post(
         '/upload/multipart/:id/resume',
-        async ({ params, body }) => {
+        async ({ params, body, set }) => {
             const { id } = params;
             const { uploadId, completedPartNumbers } = body;
             const requestId = randomBytes(4).toString('hex');
@@ -636,18 +692,14 @@ export const uploadRoutes = new Elysia()
             const fileInfo = await storage.getMetadata(id);
             if (!fileInfo) {
                 logger.warn({ requestId, id }, 'File not found for resume');
-                return new Response(JSON.stringify({ error: 'Upload not found or expired' }), {
-                    status: 404,
-                    headers: { 'Content-Type': 'application/json' },
-                });
+                set.status = 404;
+                return { error: 'Upload not found or expired' };
             }
 
             if (!fileInfo.uploadId || fileInfo.uploadId !== uploadId) {
                 logger.warn({ requestId, id }, 'Upload ID mismatch');
-                return new Response(JSON.stringify({ error: 'Upload ID mismatch' }), {
-                    status: 400,
-                    headers: { 'Content-Type': 'application/json' },
-                });
+                set.status = 400;
+                return { error: 'Upload ID mismatch' };
             }
 
             const numParts = fileInfo.numParts || 0;
@@ -690,43 +742,91 @@ export const uploadRoutes = new Elysia()
             return { parts, partSize, numParts };
         },
         {
+            detail: {
+                tags: ['Upload'],
+                summary: 'Resume multipart upload',
+                description:
+                    'Generates new pre-signed URLs for remaining parts of an interrupted multipart upload. Skips already-uploaded parts.',
+            },
             body: t.Object({
                 uploadId: t.String(),
                 completedPartNumbers: t.Array(t.Number()),
             }),
+            response: {
+                200: t.Object({
+                    parts: t.Array(
+                        t.Object({
+                            partNumber: t.Number(),
+                            url: t.String(),
+                            minSize: t.Number(),
+                            maxSize: t.Number(),
+                        }),
+                    ),
+                    partSize: t.Number(),
+                    numParts: t.Number(),
+                }),
+                400: t.Object({ error: t.String() }),
+                404: t.Object({ error: t.String() }),
+            },
         },
     )
 
     // Speed test — creates a multipart upload with 5 pre-signed part URLs.
     // The client uploads 5x100MB parts concurrently to measure real throughput.
-    .post('/upload/speedtest', async () => {
-        const SPEEDTEST_NUM_PARTS = 5;
-        const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
+    .post(
+        '/upload/speedtest',
+        async () => {
+            const SPEEDTEST_NUM_PARTS = 5;
+            const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
 
-        try {
-            const uploadId = await storage.createMultipartUpload(testId);
-            if (!uploadId) {
-                return { error: 'Failed to create speed test upload' };
+            try {
+                const uploadId = await storage.createMultipartUpload(testId);
+                if (!uploadId) {
+                    return { error: 'Failed to create speed test upload' };
+                }
+
+                const parts = await Promise.all(
+                    Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
+                        storage
+                            .getSignedMultipartUploadUrl(testId, uploadId, i + 1, 60)
+                            .then((url) => ({ partNumber: i + 1, url })),
+                    ),
+                );
+
+                logger.info(
+                    { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS },
+                    'Speed test URLs generated',
+                );
+                return { testId, uploadId, parts };
+            } catch (e) {
+                logger.warn({ testId, error: e }, 'Speed test setup failed');
+                return { error: 'Speed test setup failed' };
             }
-
-            const parts = await Promise.all(
-                Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
-                    storage
-                        .getSignedMultipartUploadUrl(testId, uploadId, i + 1, 60)
-                        .then((url) => ({ partNumber: i + 1, url })),
-                ),
-            );
-
-            logger.info(
-                { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS },
-                'Speed test URLs generated',
-            );
-            return { testId, uploadId, parts };
-        } catch (e) {
-            logger.warn({ testId, error: e }, 'Speed test setup failed');
-            return { error: 'Speed test setup failed' };
-        }
-    })
+        },
+        {
+            detail: {
+                tags: ['Speed Test'],
+                summary: 'Start upload speed test',
+                description:
+                    'Creates a temporary multipart upload with 5 pre-signed part URLs for measuring upload throughput.',
+            },
+            response: {
+                200: t.Object({
+                    testId: t.Optional(t.String()),
+                    uploadId: t.Optional(t.String()),
+                    parts: t.Optional(
+                        t.Array(
+                            t.Object({
+                                partNumber: t.Number(),
+                                url: t.String(),
+                            }),
+                        ),
+                    ),
+                    error: t.Optional(t.String()),
+                }),
+            },
+        },
+    )
 
     // Clean up speed test object after the test completes
     .post(
@@ -745,9 +845,20 @@ export const uploadRoutes = new Elysia()
             return { ok: true };
         },
         {
+            detail: {
+                tags: ['Speed Test'],
+                summary: 'Clean up speed test',
+                description:
+                    'Aborts the temporary multipart upload created by the speed test, removing all test parts from S3.',
+            },
             body: t.Object({
                 testId: t.String(),
                 uploadId: t.Optional(t.String()),
             }),
+            response: {
+                200: t.Object({
+                    ok: t.Boolean(),
+                }),
+            },
         },
     );
