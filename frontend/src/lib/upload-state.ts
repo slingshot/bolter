@@ -107,8 +107,10 @@ export async function getResumableUpload(
                     state.fileSize === fileSize &&
                     state.fileLastModified === lastModified
                 ) {
-                    found = state;
-                    return; // Stop scanning after first match
+                    // Keep the most recent match (by createdAt)
+                    if (!found || state.createdAt > found.createdAt) {
+                        found = state;
+                    }
                 }
                 cursor.continue();
             }

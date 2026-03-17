@@ -1041,7 +1041,15 @@ export async function resumeUpload(
     }
 
     // Combine completed parts (contiguous prefix + newly uploaded)
-    const allParts = [...trulyCompletedParts, ...(multipartResult.parts || [])];
+    // Deduplicate by PartNumber, preferring newly uploaded ETags over persisted ones
+    const partMap = new Map<number, { PartNumber: number; ETag: string }>();
+    for (const p of trulyCompletedParts) {
+        partMap.set(p.PartNumber, p);
+    }
+    for (const p of multipartResult.parts || []) {
+        partMap.set(p.PartNumber, p);
+    }
+    const allParts = [...partMap.values()].sort((a, b) => a.PartNumber - b.PartNumber);
 
     // Complete the upload
     let metadataString: string;
@@ -1731,6 +1739,8 @@ function uploadPart(
             clearTimeout(stallTimer);
             stallTimer = setTimeout(() => {
                 stalledAbort = true;
+                window.removeEventListener('offline', handleOffline);
+                window.removeEventListener('online', handleOnline);
                 xhr.abort();
                 reject(new Error('Upload stalled'));
             }, STALL_TIMEOUT);
