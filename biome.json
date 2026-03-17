@@ -46,6 +46,7 @@
         }
     },
     "javascript": {
+        "globals": ["Bun"],
         "formatter": {
             "quoteStyle": "single",
             "trailingCommas": "all",
