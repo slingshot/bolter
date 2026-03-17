@@ -813,7 +813,9 @@ export async function resumeUpload(
 
         const now = Date.now();
         const elapsed = (now - lastProgressTime) / 1000;
-        const bytesInPeriod = totalLoaded - lastProgressBytes - alreadyUploaded;
+        // Use partLoaded (not totalLoaded) for speed calculation to avoid
+        // the alreadyUploaded offset skewing the delta between updates
+        const bytesInPeriod = partLoaded - lastProgressBytes;
         const instantSpeed = elapsed > 0 ? Math.max(0, bytesInPeriod / elapsed) : 0;
 
         if (bytesInPeriod > 0) {
@@ -827,7 +829,7 @@ export async function resumeUpload(
             smoothedRemaining = smoothedSpeed > 0 ? (totalSize - totalLoaded) / smoothedSpeed : 0;
             lastDisplayTime = now;
             lastProgressTime = now;
-            lastProgressBytes = totalLoaded;
+            lastProgressBytes = partLoaded;
         }
 
         const isOffline = !navigator.onLine;
