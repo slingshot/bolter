@@ -1,6 +1,6 @@
 import { UPLOAD_LIMITS } from '@bolter/shared';
-import { ChevronDown, ChevronUp, Plus } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { ChevronDown, ChevronUp, Plus, Upload } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { DropZone } from '@/components/DropZone';
 import { FileList } from '@/components/FileList';
@@ -13,7 +13,11 @@ import { Canceller, FileReadError, resumeUpload, uploadFiles } from '@/lib/api';
 import { Keychain } from '@/lib/crypto';
 import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
-import { cleanupExpiredUploads, deleteUploadState, getResumableUpload } from '@/lib/upload-state';
+import {
+    cleanupExpiredUploads,
+    deleteUploadState,
+    getAnyResumableUpload,
+} from '@/lib/upload-state';
 import { formatBytes } from '@/lib/utils';
 import { type UploadedFile, useAppStore } from '@/stores/app';
 
@@ -43,96 +47,106 @@ export function HomePage() {
         setResumableUpload,
     } = useAppStore();
 
-    // Check for resumable uploads when files change
+    const resumeFileInputRef = useRef<HTMLInputElement>(null);
+
+    // Check for any resumable upload on mount
     useEffect(() => {
-        if (files.length === 1) {
-            const file = files[0].file;
-            cleanupExpiredUploads()
-                .then(() => getResumableUpload(file.name, file.size, file.lastModified))
-                .then((state) => setResumableUpload(state))
-                .catch(() => setResumableUpload(null));
-        } else {
-            setResumableUpload(null);
-        }
-    }, [files, setResumableUpload]);
+        cleanupExpiredUploads()
+            .then(() => getAnyResumableUpload())
+            .then((state) => setResumableUpload(state))
+            .catch(() => setResumableUpload(null));
+    }, [setResumableUpload]);
 
-    const handleResume = useCallback(async () => {
-        if (!resumableUpload || files.length !== 1) {
-            return;
-        }
+    const handleResumeFileSelected = useCallback(
+        async (file: File) => {
+            if (!resumableUpload) {
+                return;
+            }
 
-        const file = files[0].file;
-        const canceller = new Canceller();
-        const keychain =
-            resumableUpload.encrypted && resumableUpload.secretKeyB64
-                ? new Keychain(resumableUpload.secretKeyB64)
-                : new Keychain();
-
-        setUploading(true);
-        setUploadError(null);
-        setCanceller(canceller);
-        setKeychain(keychain);
-
-        try {
-            const result = await resumeUpload(
-                file,
-                resumableUpload,
-                (progress) => setUploadProgress(progress),
-                (error) => console.error('Resume error:', error),
-                canceller,
-            );
-
-            const uploaded: UploadedFile = {
-                id: result.id,
-                url: result.url,
-                secretKey: keychain.secretKeyB64,
-                ownerToken: result.ownerToken,
-                name: file.name,
-                size: file.size,
-                expiresAt: new Date(Date.now() + resumableUpload.timeLimit * 1000),
-                downloadLimit: resumableUpload.downloadLimit,
-                downloadCount: 0,
-            };
-
-            addUploadedFile(uploaded);
-            setUploadedFile(uploaded);
-            clearFiles();
-            setResumableUpload(null);
-
-            addToast({
-                title: 'Upload resumed and completed!',
-                description: 'Your file is ready to share.',
-                variant: 'success',
-            });
-        } catch (e: unknown) {
-            const message = e instanceof Error ? e.message : String(e);
-            if (message !== 'Upload cancelled') {
-                setUploadError(message);
+            // Verify the file matches
+            if (
+                file.name !== resumableUpload.fileName ||
+                file.size !== resumableUpload.fileSize ||
+                file.lastModified !== resumableUpload.fileLastModified
+            ) {
                 addToast({
-                    title: 'Resume failed',
-                    description: message,
+                    title: 'Wrong file',
+                    description: `Please select "${resumableUpload.fileName}" to resume the upload.`,
                     variant: 'destructive',
                 });
+                return;
             }
-        } finally {
-            setUploading(false);
-            setUploadProgress(null);
-            setCanceller(null);
-            setKeychain(null);
-        }
-    }, [
-        resumableUpload,
-        files,
-        setUploading,
-        setUploadError,
-        setCanceller,
-        setKeychain,
-        setUploadProgress,
-        addUploadedFile,
-        clearFiles,
-        addToast,
-        setResumableUpload,
-    ]);
+
+            const canceller = new Canceller();
+            const keychain =
+                resumableUpload.encrypted && resumableUpload.secretKeyB64
+                    ? new Keychain(resumableUpload.secretKeyB64)
+                    : new Keychain();
+
+            setUploading(true);
+            setUploadError(null);
+            setCanceller(canceller);
+            setKeychain(keychain);
+
+            try {
+                const result = await resumeUpload(
+                    file,
+                    resumableUpload,
+                    (progress) => setUploadProgress(progress),
+                    (error) => console.error('Resume error:', error),
+                    canceller,
+                );
+
+                const uploaded: UploadedFile = {
+                    id: result.id,
+                    url: result.url,
+                    secretKey: keychain.secretKeyB64,
+                    ownerToken: result.ownerToken,
+                    name: file.name,
+                    size: file.size,
+                    expiresAt: new Date(Date.now() + resumableUpload.timeLimit * 1000),
+                    downloadLimit: resumableUpload.downloadLimit,
+                    downloadCount: 0,
+                };
+
+                addUploadedFile(uploaded);
+                setUploadedFile(uploaded);
+                setResumableUpload(null);
+
+                addToast({
+                    title: 'Upload resumed and completed!',
+                    description: 'Your file is ready to share.',
+                    variant: 'success',
+                });
+            } catch (e: unknown) {
+                const message = e instanceof Error ? e.message : String(e);
+                if (message !== 'Upload cancelled') {
+                    setUploadError(message);
+                    addToast({
+                        title: 'Resume failed',
+                        description: message,
+                        variant: 'destructive',
+                    });
+                }
+            } finally {
+                setUploading(false);
+                setUploadProgress(null);
+                setCanceller(null);
+                setKeychain(null);
+            }
+        },
+        [
+            resumableUpload,
+            setUploading,
+            setUploadError,
+            setCanceller,
+            setKeychain,
+            setUploadProgress,
+            addUploadedFile,
+            addToast,
+            setResumableUpload,
+        ],
+    );
 
     const handleStartFresh = useCallback(() => {
         if (resumableUpload) {
@@ -301,7 +315,49 @@ export function HomePage() {
                 {/* Main Card */}
                 <div className="card-glass p-card shadow-card">
                     <div className="relative z-10 flex flex-col gap-5">
-                        {!isUploading && (
+                        {!isUploading && resumableUpload && (
+                            <div className="bg-overlay-subtle border border-border-medium rounded-element p-6 flex flex-col items-center gap-4 text-center">
+                                <Upload className="h-8 w-8 text-content-secondary" />
+                                <div>
+                                    <p className="text-paragraph-sm font-medium text-content-primary mb-1">
+                                        Resume interrupted upload
+                                    </p>
+                                    <p className="text-paragraph-xs text-content-secondary">
+                                        <span className="font-medium">
+                                            {resumableUpload.fileName}
+                                        </span>{' '}
+                                        ({formatBytes(resumableUpload.fileSize)}) &mdash;{' '}
+                                        {resumableUpload.completedParts.length} of{' '}
+                                        {resumableUpload.totalParts} parts completed
+                                    </p>
+                                </div>
+                                <div className="flex gap-3 w-full">
+                                    <Button
+                                        className="flex-1"
+                                        onClick={() => resumeFileInputRef.current?.click()}
+                                    >
+                                        Select file to resume
+                                    </Button>
+                                    <Button variant="ghost" onClick={handleStartFresh}>
+                                        Start fresh
+                                    </Button>
+                                </div>
+                                <input
+                                    ref={resumeFileInputRef}
+                                    type="file"
+                                    className="hidden"
+                                    onChange={(e) => {
+                                        const file = e.target.files?.[0];
+                                        if (file) {
+                                            handleResumeFileSelected(file);
+                                        }
+                                        e.target.value = '';
+                                    }}
+                                />
+                            </div>
+                        )}
+
+                        {!isUploading && !resumableUpload && (
                             <>
                                 <DropZone />
 
@@ -385,31 +441,6 @@ export function HomePage() {
                                                 <UploadSettings />
                                             </div>
                                         )}
-                                    </div>
-                                )}
-
-                                {resumableUpload && !isUploading && (
-                                    <div className="bg-overlay-subtle border border-border-medium rounded-element p-4">
-                                        <p className="text-paragraph-sm font-medium text-content-primary mb-1">
-                                            Resume previous upload?
-                                        </p>
-                                        <p className="text-paragraph-xs text-content-secondary mb-3">
-                                            A previous upload of this file was interrupted.{' '}
-                                            {resumableUpload.completedParts.length} of{' '}
-                                            {resumableUpload.totalParts} parts completed.
-                                        </p>
-                                        <div className="flex gap-2">
-                                            <Button size="sm" onClick={handleResume}>
-                                                Resume
-                                            </Button>
-                                            <Button
-                                                size="sm"
-                                                variant="ghost"
-                                                onClick={handleStartFresh}
-                                            >
-                                                Start fresh
-                                            </Button>
-                                        </div>
                                     </div>
                                 )}
 

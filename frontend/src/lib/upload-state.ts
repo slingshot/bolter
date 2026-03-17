@@ -124,6 +124,31 @@ export async function getResumableUpload(
     });
 }
 
+export async function getAnyResumableUpload(): Promise<PersistedUpload | null> {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.openCursor();
+
+        request.onsuccess = () => {
+            const cursor = request.result;
+            if (cursor) {
+                resolve(cursor.value as PersistedUpload);
+                return; // Return first found
+            }
+            resolve(null);
+        };
+        tx.oncomplete = () => {
+            db.close();
+        };
+        tx.onerror = () => {
+            db.close();
+            reject(tx.error);
+        };
+    });
+}
+
 export async function deleteUploadState(fileId: string): Promise<void> {
     const db = await openDB();
     return new Promise((resolve, reject) => {
