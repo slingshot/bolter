@@ -1883,13 +1883,28 @@ export async function downloadFile(
     keychain: Keychain | null,
     onProgress?: (loaded: number, total: number) => void,
 ): Promise<{ blob: Blob; filename: string }> {
+    const dlStart = Date.now();
+    const dlLog = (msg: string, data?: Record<string, unknown>) =>
+        console.log(`[Download] ${msg}`, data ? data : '');
+
+    dlLog('Starting', { fileId: id, encrypted: !!keychain });
     addBreadcrumb('downloadFile called', {
         category: 'download',
         data: { fileId: id, encrypted: !!keychain },
     });
 
     // Get metadata first
+    dlLog('Fetching metadata...');
+    const metaStart = Date.now();
     const metadata = await getMetadata(id, keychain || undefined);
+    dlLog('Metadata received', {
+        elapsed: Date.now() - metaStart,
+        name: metadata.name,
+        size: metadata.size,
+        encrypted: metadata.encrypted,
+        zipped: metadata.zipped,
+        fileCount: metadata.files?.length,
+    });
 
     // Get download URL
     const headers: Record<string, string> = {};
@@ -1933,6 +1948,11 @@ export async function downloadFile(
     }
 
     const urlData = await urlResponse.json();
+
+    dlLog('Got download URL', {
+        useSignedUrl: urlData.useSignedUrl,
+        urlLength: urlData.url?.length,
+    });
 
     // Download from signed URL or stream
     const downloadUrl = urlData.useSignedUrl ? urlData.url : `${API_BASE_URL}/download/${id}`;
@@ -1991,9 +2011,22 @@ export async function downloadFile(
         throw new Error('No response body');
     }
 
+    dlLog('Starting download stream', {
+        contentLength,
+        metadataSize: metadata.size,
+        responseHeaders: {
+            contentType: response.headers.get('Content-Type'),
+            contentLength: response.headers.get('Content-Length'),
+        },
+    });
+
     const chunks: Uint8Array[] = [];
     let loaded = 0;
+    let chunkCount = 0;
+    const streamStart = Date.now();
+    let lastLogTime = streamStart;
 
+    // biome-ignore lint/correctness/noConstantCondition: intentional stream drain loop
     while (true) {
         const { done, value } = await reader.read();
         if (done) {
@@ -2002,41 +2035,89 @@ export async function downloadFile(
 
         chunks.push(value);
         loaded += value.length;
+        chunkCount++;
         onProgress?.(loaded, contentLength || metadata.size || loaded);
+
+        // Log progress every 5 seconds
+        const now = Date.now();
+        if (now - lastLogTime > 5000) {
+            const elapsed = (now - streamStart) / 1000;
+            const speedMBps = loaded / (1024 * 1024) / elapsed;
+            dlLog('Download progress', {
+                loaded,
+                total: contentLength,
+                percentage: contentLength ? Math.round((loaded / contentLength) * 100) : '?',
+                chunks: chunkCount,
+                elapsed: `${elapsed.toFixed(1)}s`,
+                speed: `${speedMBps.toFixed(1)} MB/s`,
+            });
+            lastLogTime = now;
+        }
     }
 
+    const streamElapsed = Date.now() - streamStart;
+    dlLog('Download stream complete', {
+        totalBytes: loaded,
+        chunks: chunkCount,
+        elapsed: `${(streamElapsed / 1000).toFixed(1)}s`,
+        speed: `${(loaded / (1024 * 1024) / (streamElapsed / 1000)).toFixed(1)} MB/s`,
+    });
+
     // Combine chunks
+    dlLog('Combining chunks into buffer...', { chunks: chunks.length, totalBytes: loaded });
+    const combineStart = Date.now();
     const data = new Uint8Array(loaded);
     let offset = 0;
     for (const chunk of chunks) {
         data.set(chunk, offset);
         offset += chunk.length;
     }
+    dlLog('Buffer combined', { elapsed: Date.now() - combineStart });
 
     // Decrypt if needed
     let decryptedData: Uint8Array;
     if (metadata.encrypted && keychain) {
+        dlLog('Starting decryption...', {
+            encryptedSize: data.length,
+            encryptedSizeMB: Math.round((data.length / (1024 * 1024)) * 10) / 10,
+        });
+        const decryptStart = Date.now();
         const { createDecryptionStream } = await import('./crypto');
+        dlLog('Decryption stream created', { importElapsed: Date.now() - decryptStart });
+
         const decryptStream = createDecryptionStream(keychain);
         const decryptedResponse = new Response(
             new ReadableStream({
                 start(controller) {
+                    dlLog('Feeding encrypted data into decryption stream...');
                     controller.enqueue(data);
                     controller.close();
+                    dlLog('Encrypted data enqueued, stream closed');
                 },
             }).pipeThrough(decryptStream),
         );
+
+        dlLog('Awaiting decrypted arrayBuffer...');
         decryptedData = new Uint8Array(await decryptedResponse.arrayBuffer());
+        const decryptElapsed = Date.now() - decryptStart;
+        dlLog('Decryption complete', {
+            decryptedSize: decryptedData.length,
+            decryptedSizeMB: Math.round((decryptedData.length / (1024 * 1024)) * 10) / 10,
+            elapsed: `${(decryptElapsed / 1000).toFixed(1)}s`,
+            throughput: `${(decryptedData.length / (1024 * 1024) / (decryptElapsed / 1000)).toFixed(1)} MB/s`,
+        });
     } else {
+        dlLog('No decryption needed (unencrypted file)');
         decryptedData = data;
     }
 
     // Report download complete
+    dlLog('Reporting download complete to server...');
     await fetch(`${API_BASE_URL}/download/complete/${id}`, {
         method: 'POST',
         headers: keychain ? { Authorization: await keychain.authHeader() } : {},
     }).catch((e) => {
-        console.warn('Failed to report download complete:', e);
+        console.warn('[Download] Failed to report download complete:', e);
         captureError(e, {
             operation: 'download.complete',
             extra: { fileId: id },
@@ -2049,6 +2130,10 @@ export async function downloadFile(
 
     // If file was zipped at upload time, return the zip directly
     if (metadata.zipped) {
+        dlLog('Returning zipped file', {
+            filename: metadata.zipFilename,
+            size: decryptedData.length,
+        });
         return {
             blob: new Blob([decryptedData], { type: 'application/zip' }),
             filename: metadata.zipFilename || generateZipFilename(files || []),
@@ -2058,8 +2143,11 @@ export async function downloadFile(
     // Legacy: multiple files uploaded before zip-at-upload-time feature
     // Slice data and create zip on the fly (may fail for very large files)
     if (files && files.length > 1) {
+        dlLog('Creating zip from legacy multi-file download', { fileCount: files.length });
+        const zipStart = Date.now();
         const fileSlices = sliceConcatenatedData(decryptedData, files);
         const zipBlob = await createZipFromFiles(fileSlices);
+        dlLog('Legacy zip created', { elapsed: Date.now() - zipStart, zipSize: zipBlob.size });
         return {
             blob: zipBlob,
             filename: generateZipFilename(files),
@@ -2067,6 +2155,13 @@ export async function downloadFile(
     }
 
     // Single file: return as-is
+    const totalElapsed = Date.now() - dlStart;
+    dlLog('Download complete', {
+        filename: metadata.name,
+        size: decryptedData.length,
+        sizeMB: Math.round((decryptedData.length / (1024 * 1024)) * 10) / 10,
+        totalElapsed: `${(totalElapsed / 1000).toFixed(1)}s`,
+    });
     return {
         blob: new Blob([decryptedData]),
         filename: metadata.name || 'download',
