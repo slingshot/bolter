@@ -7,7 +7,8 @@
         "dev": "bun run cli.ts",
         "build": "bun build cli.ts --outdir ./dist --target bun --sourcemap=external",
         "compile": "bun run build.ts",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "test": "bun test"
     },
     "dependencies": {
         "@bolter/shared": "workspace:*",
