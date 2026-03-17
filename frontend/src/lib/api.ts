@@ -569,15 +569,24 @@ export async function uploadFiles(
 
     if (uploadInfo.multipart && uploadInfo.parts) {
         // Persist upload state for resumability
+        // Store the raw (pre-encryption) file size for matching against File.size on resume
+        const rawFileSize = files.length === 1 ? files[0].size : totalInputSize;
+        // Calculate plaintext bytes per encrypted part
+        // Each ECE record: plaintext ECE_RECORD_SIZE → encrypted ECE_RECORD_SIZE + 17 (tag + delimiter)
+        const encryptedRecordSize = ECE_RECORD_SIZE + 17;
+        const plaintextPartSize = encrypted
+            ? Math.floor((uploadInfo.partSize || 0) / encryptedRecordSize) * ECE_RECORD_SIZE
+            : uploadInfo.partSize || 0;
         const persistState: PersistedUpload = {
             fileId: uploadInfo.id,
             uploadId: uploadInfo.uploadId || '',
             ownerToken: uploadInfo.owner,
             fileName: files.length === 1 ? files[0].name : `${files.length}_files.zip`,
-            fileSize: totalSize,
+            fileSize: rawFileSize,
             fileLastModified: files.length === 1 ? files[0].lastModified : 0,
             encrypted,
             partSize: uploadInfo.partSize || 0,
+            plaintextPartSize,
             completedParts: [],
             totalParts: uploadInfo.parts.length,
             secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
@@ -746,14 +755,22 @@ export async function resumeUpload(
         keychain = new Keychain(state.secretKeyB64);
     }
 
-    // Determine which parts still need uploading
-    const completedPartNumbers = new Set(state.completedParts.map((p) => p.PartNumber));
-    const remainingPartNumbers: number[] = [];
-    for (let i = 1; i <= state.totalParts; i++) {
-        if (!completedPartNumbers.has(i)) {
-            remainingPartNumbers.push(i);
+    // Find contiguous prefix of completed parts (concurrent uploads may leave gaps)
+    // Only the contiguous prefix can be safely skipped — parts after a gap need re-uploading
+    const sortedCompleted = [...state.completedParts].sort((a, b) => a.PartNumber - b.PartNumber);
+    let contiguousCount = 0;
+    for (const p of sortedCompleted) {
+        if (p.PartNumber === contiguousCount + 1) {
+            contiguousCount++;
+        } else {
+            break;
         }
     }
+    const trulyCompletedParts = sortedCompleted.slice(0, contiguousCount);
+
+    // Use plaintext part size for file offset (encrypted part size includes ECE overhead)
+    const plaintextPartSize = state.plaintextPartSize || state.partSize;
+    const skipBytes = contiguousCount * plaintextPartSize;
 
     // Request new pre-signed URLs for remaining parts
     const resumeResponse = await fetch(`${API_BASE_URL}/upload/multipart/${state.fileId}/resume`, {
@@ -761,7 +778,7 @@ export async function resumeUpload(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             uploadId: state.uploadId,
-            completedPartNumbers: Array.from(completedPartNumbers),
+            completedPartNumbers: trulyCompletedParts.map((p) => p.PartNumber),
         }),
     });
 
@@ -777,18 +794,15 @@ export async function resumeUpload(
         numParts: number;
     } = await resumeResponse.json();
 
-    // Calculate how much data to skip (already uploaded)
-    const completedCount = state.completedParts.length;
-    const skipBytes = completedCount * state.partSize;
-
     // Create a stream from the file, skipping already-uploaded data
     const remainingBlob = file.slice(skipBytes);
     let stream: ReadableStream<Uint8Array> = remainingBlob.stream();
 
     // If encrypted, wrap with encryption stream starting at the correct counter
     if (state.encrypted && keychain) {
-        const recordsPerPart = Math.ceil(state.partSize / ECE_RECORD_SIZE);
-        const initialCounter = completedCount * recordsPerPart;
+        // Each plaintext part contains ceil(plaintextPartSize / ECE_RECORD_SIZE) records
+        const recordsPerPart = Math.ceil(plaintextPartSize / ECE_RECORD_SIZE);
+        const initialCounter = contiguousCount * recordsPerPart;
         stream = stream.pipeThrough(createEncryptionStream(keychain, initialCounter));
     }
 
@@ -803,8 +817,9 @@ export async function resumeUpload(
     const partProgress: Record<number, number> = {};
 
     // Account for already-completed data in progress
-    const alreadyUploaded = skipBytes;
-    const totalSize = state.fileSize;
+    // Use encrypted part size for progress since that's what's actually uploaded
+    const alreadyUploaded = contiguousCount * state.partSize;
+    const totalSize = state.totalParts * state.partSize;
 
     const updateProgress = (partNum: number, loaded: number) => {
         partProgress[partNum] = loaded;
@@ -891,8 +906,8 @@ export async function resumeUpload(
         throw new Error('Upload cancelled');
     }
 
-    // Combine completed parts (previously completed + newly completed)
-    const allParts = [...state.completedParts, ...(multipartResult.parts || [])];
+    // Combine completed parts (contiguous prefix + newly uploaded)
+    const allParts = [...trulyCompletedParts, ...(multipartResult.parts || [])];
 
     // Complete the upload
     let metadataString: string;
@@ -1585,9 +1600,11 @@ function uploadPart(
         canceller.addXhr(xhr);
 
         let stallTimer: ReturnType<typeof setTimeout>;
+        let stalledAbort = false;
         const resetStallTimer = () => {
             clearTimeout(stallTimer);
             stallTimer = setTimeout(() => {
+                stalledAbort = true;
                 xhr.abort();
                 reject(new Error('Upload stalled'));
             }, STALL_TIMEOUT);
@@ -1621,7 +1638,9 @@ function uploadPart(
             if (xhr.status >= 200 && xhr.status < 300) {
                 const etag = xhr.getResponseHeader('ETag') || '';
                 resolve({ PartNumber: partNumber, ETag: etag });
-            } else {
+            } else if (!stalledAbort) {
+                // Skip error reporting if this was an intentional stall abort
+                // (the stall timer already rejected with 'Upload stalled')
                 let errorDetails = `HTTP ${xhr.status}`;
                 if (xhr.statusText) {
                     errorDetails += ` (${xhr.statusText})`;

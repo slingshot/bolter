@@ -8,10 +8,11 @@ export interface PersistedUpload {
     uploadId: string; // S3 multipart upload ID
     ownerToken: string; // For completion/abort
     fileName: string; // To match against re-selected file
-    fileSize: number; // To verify same file
+    fileSize: number; // Raw (pre-encryption) file size for matching
     fileLastModified: number; // To verify same file
     encrypted: boolean;
-    partSize: number; // Part size used
+    partSize: number; // Encrypted part size used by S3
+    plaintextPartSize: number; // Plaintext bytes per part (for resume offset)
     completedParts: Array<{ PartNumber: number; ETag: string }>;
     totalParts: number;
     encryptionSalt?: string; // Base64 salt for key derivation (reserved)
@@ -107,6 +108,7 @@ export async function getResumableUpload(
                     state.fileLastModified === lastModified
                 ) {
                     found = state;
+                    return; // Stop scanning after first match
                 }
                 cursor.continue();
             }
