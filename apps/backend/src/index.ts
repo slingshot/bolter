@@ -142,11 +142,14 @@ const app = new Elysia()
     .onError(({ code, error, set, request }) => {
         const url = new URL(request.url);
 
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorStack = error instanceof Error ? error.stack : undefined;
+
         logger.error(
             {
                 code,
-                error: error.message,
-                stack: error.stack,
+                error: errorMessage,
+                stack: errorStack,
             },
             'Server error',
         );
@@ -164,7 +167,7 @@ const app = new Elysia()
         captureError(error, {
             operation: 'server.unhandled',
             tags: {
-                errorCode: code,
+                errorCode: code.toString(),
                 method: request.method,
                 path: url.pathname,
             },

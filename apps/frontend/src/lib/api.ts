@@ -863,7 +863,7 @@ export async function uploadFiles(
             throw err;
         }
 
-        const _completeInfo = await completeResponse.json();
+        await completeResponse.json();
 
         // Clean up persisted upload state
         if (uploadInfo.multipart) {
@@ -1163,7 +1163,7 @@ function createFileStream(
                     controller.enqueue(value);
                     return;
                 } catch (e) {
-                    throw new FileReadError(currentFile?.name, e);
+                    throw new FileReadError(currentFile?.name ?? 'unknown', e);
                 }
             }
         },
@@ -1486,7 +1486,7 @@ async function uploadMultipartStream(
 
             // Buffer part if we have data
             if (currentPartData.length > 0) {
-                const partBlob = new Blob(currentPartData);
+                const partBlob = new Blob(currentPartData as BlobPart[]);
                 currentPartData = [];
                 currentPartSize = 0;
 
@@ -1536,34 +1536,36 @@ async function uploadMultipartStream(
         }
 
         // Stream is done — flush the buffered item
-        if (bufferedItem) {
+        // (bufferedItem is reassigned inside the queueOrBuffer closure, so TS can't narrow it)
+        const finalBuffered = bufferedItem as { blob: Blob; partNum: number; url: string } | null;
+        if (finalBuffered) {
             // Check if we only have 1 part total and it's too small for multipart
             const noPriorParts = totalPartsQueued === 0 && activeUploads === 0;
 
-            if (noPriorParts && bufferedItem.blob.size < MIN_PART) {
+            if (noPriorParts && finalBuffered.blob.size < MIN_PART) {
                 // Entire stream output is a single tiny blob — fallback to single-part upload
                 console.log(
-                    `[Upload] Stream produced only ${(bufferedItem.blob.size / 1024).toFixed(1)}KB — falling back to single-part upload`,
+                    `[Upload] Stream produced only ${(finalBuffered.blob.size / 1024).toFixed(1)}KB — falling back to single-part upload`,
                 );
-                return { fallbackBlob: bufferedItem.blob };
+                return { fallbackBlob: finalBuffered.blob };
             }
 
             // Check if final part is too small and we can merge it with a pending part
-            if (bufferedItem.blob.size < MIN_PART && pendingQueue.length > 0) {
+            if (finalBuffered.blob.size < MIN_PART && pendingQueue.length > 0) {
                 // Merge with the last pending part
                 const lastPending = pendingQueue[pendingQueue.length - 1];
-                totalUploadedSize += bufferedItem.blob.size;
-                const mergedBlob = new Blob([lastPending.blob, bufferedItem.blob]);
+                totalUploadedSize += finalBuffered.blob.size;
+                const mergedBlob = new Blob([lastPending.blob, finalBuffered.blob]);
                 console.log(
-                    `[Upload] Merging small final part (${(bufferedItem.blob.size / 1024).toFixed(1)}KB) into part ${lastPending.partNum} (${(lastPending.blob.size / (1024 * 1024)).toFixed(1)}MB → ${(mergedBlob.size / (1024 * 1024)).toFixed(1)}MB)`,
+                    `[Upload] Merging small final part (${(finalBuffered.blob.size / 1024).toFixed(1)}KB) into part ${lastPending.partNum} (${(lastPending.blob.size / (1024 * 1024)).toFixed(1)}MB → ${(mergedBlob.size / (1024 * 1024)).toFixed(1)}MB)`,
                 );
                 lastPending.blob = mergedBlob;
                 // Don't queue the tiny buffered item separately
             } else {
                 // Final part is large enough, or no pending parts to merge with — queue it normally
-                totalUploadedSize += bufferedItem.blob.size;
+                totalUploadedSize += finalBuffered.blob.size;
                 totalPartsQueued++;
-                pendingQueue.push(bufferedItem);
+                pendingQueue.push(finalBuffered);
             }
 
             bufferedItem = null;
@@ -1628,7 +1630,15 @@ async function uploadMultipartStream(
                     ),
                     {
                         operation: 'upload.part-size-consistency',
-                        extra: diagnostic,
+                        extra: {
+                            expectedSize: expectedNonTrailingSize,
+                            inconsistentParts: JSON.stringify(inconsistentParts),
+                            allPartSizes: JSON.stringify(uploadedPartSizes),
+                            uploadId: uploadInfo.uploadId,
+                            partSize,
+                            totalFileSize,
+                            totalParts: sortedPartNums.length,
+                        },
                     },
                 );
             }
@@ -2137,7 +2147,7 @@ export async function downloadFile(
             decryptedSize += value.length;
 
             if (pendingSize >= CONSOLIDATION_SIZE) {
-                blobs.push(new Blob(pending));
+                blobs.push(new Blob(pending as BlobPart[]));
                 pending = [];
                 pendingSize = 0;
             }
@@ -2158,7 +2168,7 @@ export async function downloadFile(
     }
 
     if (pending.length > 0) {
-        blobs.push(new Blob(pending));
+        blobs.push(new Blob(pending as BlobPart[]));
     }
 
     const streamElapsed = Math.max(Date.now() - streamStart, 1);

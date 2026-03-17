@@ -313,7 +313,10 @@ export const uploadRoutes = new Elysia()
                 // Single part upload
                 logger.info({ requestId, id }, 'Generating single upload URL');
                 const singleUrlStartTime = Date.now();
-                const uploadUrl = await storage.getSignedUploadUrl(id, URL_EXPIRATION_SECONDS);
+                const uploadUrl = await storage.getSignedUploadUrl(
+                    id,
+                    new Date(Date.now() + URL_EXPIRATION_SECONDS * 1000),
+                );
                 const singleUrlDuration = Date.now() - singleUrlStartTime;
 
                 logger.info(

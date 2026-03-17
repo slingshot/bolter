@@ -73,7 +73,9 @@ export function DownloadPage() {
             const isMultiFile = metadata.files && metadata.files.length > 1;
             const fileName = isMultiFile ? `${metadata.files?.length} files` : metadata.name;
             const fileSize = formatBytes(
-                isMultiFile ? metadata.files?.reduce((sum, f) => sum + f.size, 0) : metadata.size,
+                isMultiFile
+                    ? (metadata.files?.reduce((sum, f) => sum + f.size, 0) ?? 0)
+                    : metadata.size,
             );
             return {
                 title: `Download ${fileName}`,
@@ -92,6 +94,7 @@ export function DownloadPage() {
             setState('not-found');
             return;
         }
+        const fileId = id;
 
         // Prevent duplicate requests from StrictMode double-render
         if (loadingRef.current) {
@@ -104,10 +107,10 @@ export function DownloadPage() {
         async function loadMetadata() {
             try {
                 // Check if file exists
-                const exists = await fileExists(id);
+                const exists = await fileExists(fileId);
                 if (!exists) {
                     // Check legacy system before showing not found
-                    const legacyUrl = await checkLegacyFile(id);
+                    const legacyUrl = await checkLegacyFile(fileId);
                     if (legacyUrl) {
                         window.location.href = legacyUrl;
                         return;
@@ -122,7 +125,7 @@ export function DownloadPage() {
                 setKeychain(kc);
 
                 // Check if download limit already reached
-                const status = await getDownloadStatus(id, kc);
+                const status = await getDownloadStatus(fileId, kc);
                 if (status && status.dl >= status.dlimit) {
                     setState('not-found');
                     return;
@@ -134,7 +137,7 @@ export function DownloadPage() {
                 }
 
                 // Fetch metadata
-                const meta = await getMetadata(id, kc || undefined);
+                const meta = await getMetadata(fileId, kc || undefined);
                 setMetadata(meta as FileMetadata);
                 setState('ready');
             } catch (e: unknown) {

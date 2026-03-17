@@ -12,17 +12,20 @@ try {
 }
 
 // Safe wrapper for track that fails silently
-const safeTrack = (eventName: string, options?: { props?: Record<string, unknown> }) => {
+const safeTrack = (eventName: string, options?: { props?: Record<string, string> }) => {
     try {
-        track(eventName, options);
+        track(eventName, options ?? {});
     } catch (e) {
         console.warn(`[Plausible] Failed to track "${eventName}":`, e);
     }
 };
 
-// Typed event helpers
+// Typed event helpers — Plausible custom properties must be strings
 export const trackUpload = (props?: { fileSize?: number; encrypted?: boolean }) => {
-    safeTrack('Upload', { props });
+    const stringProps = props
+        ? Object.fromEntries(Object.entries(props).map(([k, v]) => [k, String(v)]))
+        : undefined;
+    safeTrack('Upload', { props: stringProps });
 };
 
 export const trackDownload = (props?: { fileId?: string }) => {

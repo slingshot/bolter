@@ -15,7 +15,7 @@ const NONCE_LENGTH = 12; // AES-GCM nonce length
 
 // Key derivation info strings
 const KEY_INFO = encoder.encode('Content-Encoding: aes128gcm');
-const _NONCE_INFO = encoder.encode('Content-Encoding: nonce');
+// NONCE_INFO kept as a comment for documentation: encoder.encode('Content-Encoding: nonce')
 const AUTH_INFO = encoder.encode('Content-Encoding: auth');
 const META_INFO = encoder.encode('Content-Encoding: meta');
 
@@ -68,14 +68,16 @@ async function hkdf(
     info: Uint8Array,
     length: number,
 ): Promise<Uint8Array> {
-    const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+    const key = await crypto.subtle.importKey('raw', ikm as BufferSource, 'HKDF', false, [
+        'deriveBits',
+    ]);
 
     const bits = await crypto.subtle.deriveBits(
         {
             name: 'HKDF',
             hash: 'SHA-256',
-            salt,
-            info,
+            salt: salt as BufferSource,
+            info: info as BufferSource,
         },
         key,
         length * 8,
@@ -124,7 +126,7 @@ export class Keychain {
 
         this.encryptionKey = await crypto.subtle.importKey(
             'raw',
-            keyMaterial,
+            keyMaterial as BufferSource,
             { name: 'AES-GCM', length: 128 },
             false,
             ['encrypt', 'decrypt'],
@@ -146,7 +148,7 @@ export class Keychain {
 
         this.metaKey = await crypto.subtle.importKey(
             'raw',
-            keyMaterial,
+            keyMaterial as BufferSource,
             { name: 'AES-GCM', length: 128 },
             false,
             ['encrypt', 'decrypt'],
@@ -187,13 +189,13 @@ export class Keychain {
         // HMAC-SHA256(authKey, nonce)
         const key = await crypto.subtle.importKey(
             'raw',
-            authKey,
+            authKey as BufferSource,
             { name: 'HMAC', hash: 'SHA-256' },
             false,
             ['sign'],
         );
 
-        const sig = await crypto.subtle.sign('HMAC', key, nonceBytes);
+        const sig = await crypto.subtle.sign('HMAC', key, nonceBytes as BufferSource);
         return `send-v1 ${arrayToB64(sig)}`;
     }
 
@@ -224,7 +226,7 @@ export class Keychain {
         const decrypted = await crypto.subtle.decrypt(
             { name: 'AES-GCM', iv, tagLength: 128 },
             key,
-            encryptedData,
+            encryptedData as BufferSource,
         );
 
         return JSON.parse(decoder.decode(decrypted));
@@ -384,14 +386,14 @@ async function decryptRecord(
         decrypted = await crypto.subtle.decrypt(
             { name: 'AES-GCM', iv: finalNonce, tagLength: TAG_LENGTH * 8 },
             key,
-            data,
+            data as BufferSource,
         );
     } catch {
         // Try without final flag
         decrypted = await crypto.subtle.decrypt(
             { name: 'AES-GCM', iv: nonce, tagLength: TAG_LENGTH * 8 },
             key,
-            data,
+            data as BufferSource,
         );
     }
 

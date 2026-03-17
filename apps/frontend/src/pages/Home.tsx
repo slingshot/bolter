@@ -1,7 +1,6 @@
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { ChevronDown, ChevronUp, Plus, Upload } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { DropZone } from '@/components/DropZone';
 import { FileList } from '@/components/FileList';
 import { ShareDialog } from '@/components/ShareDialog';
@@ -22,7 +21,6 @@ import { formatBytes } from '@/lib/utils';
 import { type UploadedFile, useAppStore } from '@/stores/app';
 
 export function HomePage() {
-    const _navigate = useNavigate();
     const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
     const [filesExpanded, setFilesExpanded] = useState(true);
     const [securityExpanded, setSecurityExpanded] = useState(true);
