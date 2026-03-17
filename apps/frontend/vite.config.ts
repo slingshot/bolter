@@ -23,15 +23,16 @@ export default defineConfig({
     plugins: [
         react(),
         htmlConfigPlugin(),
-        sentryVitePlugin({
-            url: 'https://glitch.slingshot.fm',
-            org: process.env.SENTRY_ORG,
-            project: process.env.SENTRY_PROJECT,
-            authToken: process.env.SENTRY_AUTH_TOKEN,
-            sourcemaps: {
-                filesToDeleteAfterUpload: ['**/*.map'],
-            },
-        }),
+        process.env.SENTRY_AUTH_TOKEN &&
+            sentryVitePlugin({
+                url: 'https://glitch.slingshot.fm',
+                org: process.env.SENTRY_ORG,
+                project: process.env.SENTRY_PROJECT,
+                authToken: process.env.SENTRY_AUTH_TOKEN,
+                sourcemaps: {
+                    filesToDeleteAfterUpload: ['**/*.map'],
+                },
+            }),
     ],
     resolve: {
         alias: {
@@ -40,6 +41,7 @@ export default defineConfig({
     },
     server: {
         port: 3000,
+        allowedHosts: true,
     },
     build: {
         outDir: 'dist',

@@ -5,16 +5,16 @@ WORKDIR /app
 
 # Copy workspace files for dependency resolution
 COPY package.json bun.lock ./
-COPY frontend/package.json ./frontend/
-COPY backend/package.json ./backend/
-COPY shared/package.json ./shared/
-COPY shared/config.ts ./shared/
+COPY apps/frontend/package.json ./apps/frontend/
+COPY apps/backend/package.json ./apps/backend/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/shared/config.ts ./packages/shared/
 
 # Install dependencies
 RUN bun install --frozen-lockfile --production
 
 # Copy backend source
-COPY backend/ ./backend/
+COPY apps/backend/ ./apps/backend/
 
 # Production stage
 FROM oven/bun:1-slim
@@ -23,12 +23,12 @@ WORKDIR /app
 
 # Copy installed dependencies and source from builder
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/backend ./backend
-COPY --from=builder /app/shared ./shared
+COPY --from=builder /app/apps/backend ./apps/backend
+COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/package.json ./
 
 # Set working directory to backend
-WORKDIR /app/backend
+WORKDIR /app/apps/backend
 
 # Expose port
 EXPOSE 3001

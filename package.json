@@ -1,26 +1,19 @@
 {
     "name": "bolter-monorepo",
     "private": true,
+    "packageManager": "bun@1.3.10",
     "workspaces": [
-        "frontend",
-        "backend",
-        "shared"
+        "apps/*",
+        "packages/*"
     ],
     "scripts": {
-        "dev": "bunx dotenvx run -f .env* -- bun run --cwd backend dev & bunx dotenvx run -f .env* -- bun run --cwd frontend dev",
-        "dev:frontend": "bun run --cwd frontend dev",
-        "dev:backend": "bunx dotenvx run -f .env* -- bun run --cwd backend dev",
-        "build": "bun run --cwd frontend build && bun run --cwd backend build",
-        "build:frontend": "bun run --cwd frontend build",
-        "build:backend": "bun run --cwd backend build",
-        "start": "bunx dotenvx run -f .env* -- bun run --cwd backend start & bun run --cwd frontend preview",
-        "start:frontend": "bun run --cwd frontend preview",
-        "start:backend": "bunx dotenvx run -f .env* -- bun run --cwd backend start",
-        "install:all": "cd frontend && bun install && cd ../backend && bun install",
-        "lint": "bunx biome lint .",
-        "lint:fix": "bunx biome lint --write .",
-        "format": "bunx biome format --write .",
-        "check": "bunx biome check --write .",
+        "dev": "turbo run dev",
+        "build": "turbo run build",
+        "typecheck": "turbo run typecheck",
+        "lint": "biome lint .",
+        "lint:fix": "biome lint --write .",
+        "format": "biome format --write .",
+        "check": "biome check --write .",
         "commit": "cz",
         "prepare": "lefthook install || true"
     },
@@ -40,7 +33,8 @@
         "@dotenvx/dotenvx": "^1.51.4",
         "commitizen": "^4.3.1",
         "cz-conventional-changelog": "^3.3.0",
-        "lefthook": "^2.1.2"
+        "lefthook": "^2.1.2",
+        "turbo": "^2.8.17"
     },
     "dependencies": {
         "@vercel/analytics": "^1.6.1"

@@ -5,19 +5,19 @@ WORKDIR /app
 
 # Copy workspace files for dependency resolution
 COPY package.json bun.lock ./
-COPY frontend/package.json ./frontend/
-COPY backend/package.json ./backend/
-COPY shared/package.json ./shared/
-COPY shared/config.ts ./shared/
+COPY apps/frontend/package.json ./apps/frontend/
+COPY apps/backend/package.json ./apps/backend/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/shared/config.ts ./packages/shared/
 
 # Install dependencies
 RUN bun install --frozen-lockfile
 
 # Copy frontend source
-COPY frontend/ ./frontend/
+COPY apps/frontend/ ./apps/frontend/
 
 # Build the frontend
-WORKDIR /app/frontend
+WORKDIR /app/apps/frontend
 ARG VITE_APP_TITLE
 ARG VITE_APP_DESCRIPTION
 RUN bun run build
@@ -26,10 +26,10 @@ RUN bun run build
 FROM nginx:alpine
 
 # Copy custom nginx config
-COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY apps/frontend/nginx.conf /etc/nginx/conf.d/default.conf
 
 # Copy built assets and set proper permissions
-COPY --from=builder /app/frontend/dist /usr/share/nginx/html
+COPY --from=builder /app/apps/frontend/dist /usr/share/nginx/html
 
 # Fix permissions for nginx user
 RUN chown -R nginx:nginx /usr/share/nginx/html && \

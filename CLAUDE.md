@@ -12,29 +12,41 @@ Bolter is an end-to-end encrypted file sharing application. Files are encrypted 
 # Install dependencies
 bun install
 
-# Development (runs both frontend and backend)
+# Development (runs both frontend and backend via Turborepo)
 bun run dev
 
-# Run individually
-bun run dev:frontend  # http://localhost:3000
-bun run dev:backend   # http://localhost:3001
+# Run individually via turbo filtering
+turbo run dev --filter=@bolter/frontend  # http://localhost:3000
+turbo run dev --filter=@bolter/backend   # http://localhost:3001
 
-# Production build
+# Production build (cached — second run is instant)
 bun run build
 
-# Start production
-bun run start
+# Type checking (both workspaces)
+bun run typecheck
+
+# Linting / formatting (biome, runs at root)
+bun run check
 
 # Docker deployment
 docker-compose up
 ```
 
+## Turborepo
+
+Task pipeline is defined in `turbo.json`. Key tasks:
+- `build` — depends on `^build` (shared builds first), outputs cached in `dist/**`
+- `dev` — persistent, not cached, depends on `^build`
+- `typecheck` — depends on `^build`
+
+Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`) are in `build.env` for cache busting. Runtime-only vars (S3, Redis, limits, etc.) are in `globalPassThroughEnv`.
+
 ## Architecture
 
-**Monorepo Structure** (Bun workspaces):
-- `frontend/` - Vite + React 18 + TypeScript + Tailwind
-- `backend/` - Elysia (Bun web framework) + TypeScript
-- `shared/` - Constants exported to both (BYTES, LIMITS, DEFAULTS)
+**Monorepo Structure** (Turborepo + Bun workspaces):
+- `apps/frontend/` - Vite + React 18 + TypeScript + Tailwind
+- `apps/backend/` - Elysia (Bun web framework) + TypeScript
+- `packages/shared/` - Constants exported to both (BYTES, LIMITS, DEFAULTS)
 
 **Data Flow**:
 1. Frontend encrypts files with Web Crypto API (AES-GCM + HKDF key derivation)
@@ -43,28 +55,28 @@ docker-compose up
 4. Download URLs contain encryption key in hash fragment for client-side decryption
 
 **Resilient Uploads**:
-- **Upload resumability**: Multipart upload state (uploadId, completed parts, encryption counter) is persisted to IndexedDB via `frontend/src/lib/upload-state.ts`. On page reload, the user is prompted to resume incomplete uploads, skipping already-uploaded parts.
+- **Upload resumability**: Multipart upload state (uploadId, completed parts, encryption counter) is persisted to IndexedDB via `apps/frontend/src/lib/upload-state.ts`. On page reload, the user is prompted to resume incomplete uploads, skipping already-uploaded parts.
 - **Preflight speed test**: Before multipart uploads (>100MB), a speed test uploads 5x100MB parts concurrently to S3 via pre-signed URLs to measure real throughput, then cleans up the test objects.
-- **Adaptive part sizing**: Upload part size is selected from `PART_SIZE_TIERS` (defined in `shared/config.ts`) based on the measured upload speed from the preflight test.
+- **Adaptive part sizing**: Upload part size is selected from `PART_SIZE_TIERS` (defined in `packages/shared/config.ts`) based on the measured upload speed from the preflight test.
 - **Stall detection**: Instead of hard XHR timeouts, uploads use progress-based stall detection — if no bytes are transferred for a threshold period, the part is retried. Retries pause automatically when the browser goes offline.
 - **Connection quality UI**: The upload progress component displays real-time connection quality states (e.g., "Checking speed...", online/offline awareness) and updates every second during uploads.
 
 **Key Backend Components**:
-- `backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints
-- `backend/src/routes/download.ts` - URL signing, download count enforcement
-- `backend/src/storage/s3.ts` - S3 client with multipart support
-- `backend/src/storage/redis.ts` - Metadata operations with TTL
-- `backend/src/config.ts` - Environment validation via Convict
+- `apps/backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints
+- `apps/backend/src/routes/download.ts` - URL signing, download count enforcement
+- `apps/backend/src/storage/s3.ts` - S3 client with multipart support
+- `apps/backend/src/storage/redis.ts` - Metadata operations with TTL
+- `apps/backend/src/config.ts` - Environment validation via Convict
 
 **Key Frontend Components**:
-- `frontend/src/lib/crypto.ts` - AES-GCM encryption, HKDF key derivation
-- `frontend/src/lib/api.ts` - Direct S3 multipart uploads, download logic, stall detection, adaptive part sizing
-- `frontend/src/lib/upload-state.ts` - IndexedDB persistence for multipart upload resumability
-- `frontend/src/stores/app.ts` - Zustand store (config, upload state, files)
-- `frontend/src/pages/Home.tsx` - Upload interface
-- `frontend/src/pages/Download.tsx` - Download/decryption interface
+- `apps/frontend/src/lib/crypto.ts` - AES-GCM encryption, HKDF key derivation
+- `apps/frontend/src/lib/api.ts` - Direct S3 multipart uploads, download logic, stall detection, adaptive part sizing
+- `apps/frontend/src/lib/upload-state.ts` - IndexedDB persistence for multipart upload resumability
+- `apps/frontend/src/stores/app.ts` - Zustand store (config, upload state, files)
+- `apps/frontend/src/pages/Home.tsx` - Upload interface
+- `apps/frontend/src/pages/Download.tsx` - Download/decryption interface
 
-**Path Alias**: `@/` maps to `frontend/src/`
+**Path Alias**: `@/` maps to `apps/frontend/src/`
 
 ## Environment Variables
 
