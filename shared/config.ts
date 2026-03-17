@@ -2,10 +2,10 @@
 
 // Size constants in bytes
 export const BYTES = {
-    KB: 1024,
-    MB: 1024 * 1024,
-    GB: 1024 * 1024 * 1024,
-    TB: 1024 * 1024 * 1024 * 1024,
+    KB: 1000,
+    MB: 1000 * 1000,
+    GB: 1000 * 1000 * 1000,
+    TB: 1000 * 1000 * 1000 * 1000,
 } as const;
 
 // Upload limits
