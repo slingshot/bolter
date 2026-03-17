@@ -168,79 +168,37 @@ async function measureUploadSpeed(): Promise<number> {
 // WebKit/Safari detection — used for iOS HEIC/HEVC transcoding workaround
 const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
 
-// Threshold for pre-reading files to resolve transcoded size on Safari.
-// Files above this are too large to justify a counting pass (the streaming
-// empty-chunk fixes handle them instead).
-const PREREAD_SIZE_THRESHOLD = 2 * 1024 * 1024 * 1024; // 2GB
-
 /**
- * On iOS/Safari, files picked via <input> may be lazily transcoded from HEIC/HEVC
- * to JPEG/H.264. File.size reports an estimated transcoded size that can differ
- * from the actual bytes produced by File.stream(). This function streams through
- * the file to count the real byte total, forcing the transcoding to complete.
- * The result is cached by WebKit, so the subsequent upload stream is fast.
+ * On Safari/WebKit, materialize a File into a stable Blob before uploading.
  *
- * Returns the actual byte count, or File.size on non-WebKit browsers.
+ * Why: iOS lazily transcodes HEIC→JPEG and HEVC→H.264 when File.stream() is
+ * called. This causes two problems:
+ * 1. File.size may differ from actual transcoded bytes → wrong part allocation
+ * 2. Calling file.stream() twice can produce different data or empty chunks
+ *
+ * By reading the file into a Blob once, we force transcoding to complete and
+ * get a stable artifact with an exact .size for part calculation.
+ * The Blob is then used as the upload source (blob.stream()).
+ *
+ * Returns the original File on non-WebKit browsers (no-op).
  */
-async function resolveTranscodedSize(file: File): Promise<number> {
-    if (!isWebKit || file.size > PREREAD_SIZE_THRESHOLD) {
-        return file.size;
-    }
-
-    // Only pre-read for file types iOS might transcode
-    const type = file.type.toLowerCase();
-    const name = file.name.toLowerCase();
-    const mayTranscode =
-        type.startsWith('image/hei') || // image/heic, image/heif
-        type === 'video/quicktime' || // .mov
-        type === 'video/x-m4v' ||
-        name.endsWith('.heic') ||
-        name.endsWith('.heif') ||
-        name.endsWith('.mov') ||
-        name.endsWith('.m4v') ||
-        // Catch-all: any image/video on WebKit could be transcoded
-        (type.startsWith('image/') &&
-            !type.includes('png') &&
-            !type.includes('gif') &&
-            !type.includes('webp')) ||
-        (type.startsWith('video/') && !type.includes('webm'));
-
-    if (!mayTranscode) {
-        return file.size;
-    }
-
+async function materializeFile(file: File): Promise<Blob> {
     console.log(
-        `[Upload] Safari detected with potential transcoded file (${type}), counting actual bytes...`,
+        `[Upload] Safari: materializing file "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)}MB, ${file.type}) to resolve transcoded size...`,
     );
-    const stream = file.stream();
-    const reader = stream.getReader();
-    let actualSize = 0;
+    const blob = await new Response(file.stream()).blob();
 
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-                break;
-            }
-            if (value.length > 0) {
-                actualSize += value.length;
-            }
-        }
-    } finally {
-        reader.releaseLock();
-    }
-
-    if (actualSize !== file.size) {
+    if (blob.size !== file.size) {
         console.log(
-            `[Upload] Transcoded size differs: File.size=${file.size}, actual=${actualSize} (delta: ${actualSize - file.size})`,
+            `[Upload] Transcoded size differs: File.size=${file.size}, Blob.size=${blob.size} (delta: ${blob.size - file.size})`,
         );
-        addBreadcrumb(`iOS transcoded size: File.size=${file.size}, actual=${actualSize}`, {
+        addBreadcrumb(`Safari transcoded size: File.size=${file.size}, actual=${blob.size}`, {
             category: 'upload',
             level: 'info',
         });
     }
 
-    return actualSize;
+    return blob;
 }
 
 function getPreferredPartSize(speed: number): number | undefined {
@@ -606,7 +564,10 @@ export async function uploadFiles(
     // Determine upload strategy for multi-file uploads
     const isMultiFile = files.length > 1;
     const totalInputSize = files.reduce((sum, f) => sum + f.size, 0);
-    const useStreamingZip = isMultiFile && totalInputSize >= STREAMING_ZIP_THRESHOLD;
+    // On Safari/WebKit, always use buffered zip — streaming zip produces estimated
+    // sizes that can mismatch actual bytes due to HEIC/HEVC lazy transcoding, and
+    // WebKit's ReadableStream can emit empty chunks during transcoding pauses.
+    const useStreamingZip = isMultiFile && totalInputSize >= STREAMING_ZIP_THRESHOLD && !isWebKit;
 
     // For multiple files, create a zip (buffered for small, streaming for large)
     let uploadBlob: Blob | null = null;
@@ -626,7 +587,7 @@ export async function uploadFiles(
             zipFilename = streamingResult.filename;
             estimatedZipSize = streamingResult.estimatedSize;
         } else {
-            // Small files: use buffered zip for compression benefits
+            // Small files (or Safari): use buffered zip for exact sizing
             const zipResult = await createZipFromUploadFiles(files, onZipProgress);
             uploadBlob = zipResult.blob;
             zipFilename = zipResult.filename;
@@ -635,18 +596,22 @@ export async function uploadFiles(
         }
     }
 
+    // On Safari single-file uploads, materialize the file into a Blob to force
+    // HEIC/HEVC transcoding to complete. This gives us exact .size and a stable
+    // stream source (avoids empty chunks and double-stream issues).
+    if (!isMultiFile && isWebKit) {
+        uploadBlob = await materializeFile(files[0]);
+    }
+
     // Calculate total size
     // For streaming zip: use estimated size (actual uncompressed + headers)
-    // For buffered zip: use actual blob size
-    // For single file: resolve actual size (handles iOS HEIC/HEVC transcoding)
+    // For buffered zip / materialized blob: use actual blob size
+    // For single file (non-Safari): use file size
     let plainSize: number;
     if (streamingZipStream) {
         plainSize = estimatedZipSize;
     } else if (uploadBlob) {
         plainSize = uploadBlob.size;
-    } else if (files.length === 1) {
-        // Single file — resolve transcoded size on Safari to get accurate part allocation
-        plainSize = await resolveTranscodedSize(files[0]);
     } else {
         plainSize = totalInputSize;
     }
@@ -671,9 +636,9 @@ export async function uploadFiles(
     }
 
     // Create stream based on upload type:
-    // - Streaming zip for large multi-file uploads
-    // - Blob stream for buffered zip
-    // - File stream for single files
+    // - Streaming zip for large multi-file uploads (non-Safari)
+    // - Blob stream for buffered zip, materialized Safari files, or single blobs
+    // - File stream for single files (non-Safari only)
     let stream: ReadableStream<Uint8Array>;
     if (streamingZipStream) {
         // Streaming zip - optionally encrypt
