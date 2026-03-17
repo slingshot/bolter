@@ -169,36 +169,146 @@ async function measureUploadSpeed(): Promise<number> {
 const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
 
 /**
- * On Safari/WebKit, materialize a File into a stable Blob before uploading.
+ * Upload multipart parts using file.slice() instead of file.stream().
  *
- * Why: iOS lazily transcodes HEIC→JPEG and HEVC→H.264 when File.stream() is
- * called. This causes two problems:
- * 1. File.size may differ from actual transcoded bytes → wrong part allocation
- * 2. Calling file.stream() twice can produce different data or empty chunks
+ * Why: Safari/WebKit's ReadableStream has multiple bugs that make file.stream()
+ * unreliable — empty Uint8Array(0) chunks, NotReadableError for files >4GB
+ * (WebKit bug #272600), and a 60-second timeout on iOS (WebKit bug #228683).
  *
- * By reading the file into a Blob once, we force transcoding to complete and
- * get a stable artifact with an exact .size for part calculation.
- * The Blob is then used as the upload source (blob.stream()).
- *
- * Returns the original File on non-WebKit browsers (no-op).
+ * file.slice() is universally reliable: it creates lightweight byte-range
+ * references without copying data into memory. Safari can send Blob slices
+ * directly via XHR. iOS transcoding happens at file picker time (not lazily),
+ * so File.size and file.slice() are consistent with the transcoded data.
  */
-async function materializeFile(file: File): Promise<Blob> {
-    console.log(
-        `[Upload] Safari: materializing file "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)}MB, ${file.type}) to resolve transcoded size...`,
-    );
-    const blob = await new Response(file.stream()).blob();
-
-    if (blob.size !== file.size) {
-        console.log(
-            `[Upload] Transcoded size differs: File.size=${file.size}, Blob.size=${blob.size} (delta: ${blob.size - file.size})`,
-        );
-        addBreadcrumb(`Safari transcoded size: File.size=${file.size}, actual=${blob.size}`, {
-            category: 'upload',
-            level: 'info',
-        });
+async function uploadMultipartSliced(
+    file: Blob,
+    uploadInfo: UploadUrlResponse,
+    onProgress: (partNum: number, loaded: number) => void,
+    canceller: Canceller,
+    onError?: (error: UploadError) => void,
+    onRetry?: () => void,
+    fileId?: string,
+): Promise<{ parts: { PartNumber: number; ETag: string }[]; actualSize: number }> {
+    const { parts, partSize } = uploadInfo;
+    if (!parts || !partSize) {
+        throw new Error('Invalid upload info');
     }
 
-    return blob;
+    const maxConcurrent = getConcurrentUploads(file.size);
+    console.log(
+        `[Upload] Safari slice-based upload: ${parts.length} parts, ${partSize / (1024 * 1024)}MB each, file=${(file.size / (1024 * 1024)).toFixed(1)}MB, concurrency: ${maxConcurrent}`,
+    );
+
+    const completedParts: { PartNumber: number; ETag: string }[] = [];
+    const failedPartNumbers: number[] = [];
+    const partErrors: Record<number, { error: string; size: number }> = {};
+    let activeUploads = 0;
+
+    // Process parts with concurrency control
+    const pendingQueue: Array<{
+        blob: Blob;
+        partNum: number;
+        url: string;
+    }> = [];
+
+    let resolveAllDone!: () => void;
+    const allDonePromise = new Promise<void>((resolve) => {
+        resolveAllDone = resolve;
+    });
+    let totalPartsFinished = 0;
+    const totalPartsQueued = parts.length;
+
+    const processQueue = (): void => {
+        while (pendingQueue.length > 0 && activeUploads < maxConcurrent) {
+            const item = pendingQueue.shift();
+            if (!item) {
+                break;
+            }
+            activeUploads++;
+            doUploadPart(item.blob, item.partNum, item.url);
+        }
+    };
+
+    const doUploadPart = async (
+        partBlob: Blob,
+        partNum: number,
+        partUrl: string,
+    ): Promise<void> => {
+        try {
+            const result = await uploadPartWithRetry(
+                partBlob,
+                partUrl,
+                partNum,
+                (loaded) => onProgress(partNum, loaded),
+                canceller,
+                0,
+                onRetry,
+            );
+            completedParts.push(result);
+            if (fileId) {
+                updateCompletedPart(fileId, result).catch((e) =>
+                    console.warn('[Upload] Failed to persist completed part:', e),
+                );
+            }
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[Upload] Part ${partNum} failed:`, message);
+            captureError(error, {
+                operation: 'upload.part.sliced',
+                extra: { partNumber: partNum, partSize: partBlob.size, totalParts: parts.length },
+                level: 'warning',
+            });
+            partErrors[partNum] = { error: message, size: partBlob.size };
+            failedPartNumbers.push(partNum);
+        } finally {
+            activeUploads--;
+            totalPartsFinished++;
+            if (totalPartsFinished === totalPartsQueued) {
+                resolveAllDone();
+            }
+            processQueue();
+        }
+    };
+
+    // Slice the file into parts and queue them
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const start = i * partSize;
+        const end = Math.min(start + partSize, file.size);
+        const partBlob = file.slice(start, end);
+
+        // Skip empty slices (shouldn't happen, but defensive)
+        if (partBlob.size === 0) {
+            console.warn(`[Upload] Skipping empty slice for part ${part.partNumber}`);
+            continue;
+        }
+
+        pendingQueue.push({ blob: partBlob, partNum: part.partNumber, url: part.url });
+    }
+
+    processQueue();
+
+    if (totalPartsQueued > 0) {
+        await allDonePromise;
+    }
+
+    if (failedPartNumbers.length > 0) {
+        const error: UploadError = {
+            message: `Failed to upload ${failedPartNumbers.length} parts: ${failedPartNumbers.join(', ')}`,
+            failedParts: failedPartNumbers,
+            partErrors,
+            retryable: true,
+        };
+        onError?.(error);
+        throw new Error(error.message);
+    }
+
+    console.log(`[Upload] All ${completedParts.length} parts completed (slice-based)`);
+
+    return {
+        parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
+        actualSize: file.size,
+    };
 }
 
 function getPreferredPartSize(speed: number): number | undefined {
@@ -215,14 +325,15 @@ function getPreferredPartSize(speed: number): number | undefined {
 }
 
 // Adaptive concurrency based on file size
+// R2 limits concurrent part uploads to ~2-3 per upload ID, so we cap at 3.
 // With backpressure, memory is bounded to ~(concurrency + 1) * partSize
-// e.g., concurrency 5 with 200MB parts = max ~1.2GB buffered
+// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
 function getConcurrentUploads(fileSize: number): number {
     const GB = 1024 * 1024 * 1024;
     if (fileSize > 50 * GB) {
-        return 3; // > 50GB: conservative
+        return 2; // > 50GB: conservative for R2
     }
-    return 5; // default: 5 concurrent uploads
+    return 3; // default: 3 concurrent uploads (R2 limit)
 }
 
 export interface UploadProgress {
@@ -596,17 +707,10 @@ export async function uploadFiles(
         }
     }
 
-    // On Safari single-file uploads, materialize the file into a Blob to force
-    // HEIC/HEVC transcoding to complete. This gives us exact .size and a stable
-    // stream source (avoids empty chunks and double-stream issues).
-    if (!isMultiFile && isWebKit) {
-        uploadBlob = await materializeFile(files[0]);
-    }
-
     // Calculate total size
     // For streaming zip: use estimated size (actual uncompressed + headers)
-    // For buffered zip / materialized blob: use actual blob size
-    // For single file (non-Safari): use file size
+    // For buffered zip: use actual blob size
+    // For single file: use file size (on iOS, File.size reflects transcoded size)
     let plainSize: number;
     if (streamingZipStream) {
         plainSize = estimatedZipSize;
@@ -635,10 +739,11 @@ export async function uploadFiles(
         metadata.zipFilename = zipFilename;
     }
 
-    // Create stream based on upload type:
+    // Create stream for stream-based upload path.
+    // Safari single-file unencrypted uploads use the slice-based path instead (no stream needed).
     // - Streaming zip for large multi-file uploads (non-Safari)
-    // - Blob stream for buffered zip, materialized Safari files, or single blobs
-    // - File stream for single files (non-Safari only)
+    // - Blob stream for buffered zip or single blobs
+    // - File stream for single files
     let stream: ReadableStream<Uint8Array>;
     if (streamingZipStream) {
         // Streaming zip - optionally encrypt
@@ -807,23 +912,43 @@ export async function uploadFiles(
                 );
             }
 
-            // Multipart upload
-            const multipartResult = await uploadMultipartStream(
-                stream,
-                uploadInfo,
-                updateProgress,
-                canceller,
-                onError,
-                totalSize,
-                () => {
-                    totalRetryCount++;
-                    // Trigger a progress update so the UI reflects the new retry count.
-                    // Re-emit part 1's current tracked bytes (or 0 if not started yet).
-                    const part1Bytes = partProgress[1] ?? 0;
-                    updateProgress(1, part1Bytes);
-                },
-                canResume ? uploadInfo.id : undefined,
-            );
+            // Multipart upload — use slice-based path on Safari for unencrypted
+            // single-file uploads (avoids WebKit ReadableStream bugs entirely).
+            // Encrypted uploads still need the stream path for the encryption transform.
+            const useSlicedUpload = isWebKit && !encrypted && !isMultiFile;
+            let multipartResult: MultipartStreamResult;
+
+            if (useSlicedUpload) {
+                console.log('[Upload] Using Safari slice-based multipart upload');
+                multipartResult = await uploadMultipartSliced(
+                    files[0],
+                    uploadInfo,
+                    updateProgress,
+                    canceller,
+                    onError,
+                    () => {
+                        totalRetryCount++;
+                        const part1Bytes = partProgress[1] ?? 0;
+                        updateProgress(1, part1Bytes);
+                    },
+                    canResume ? uploadInfo.id : undefined,
+                );
+            } else {
+                multipartResult = await uploadMultipartStream(
+                    stream,
+                    uploadInfo,
+                    updateProgress,
+                    canceller,
+                    onError,
+                    totalSize,
+                    () => {
+                        totalRetryCount++;
+                        const part1Bytes = partProgress[1] ?? 0;
+                        updateProgress(1, part1Bytes);
+                    },
+                    canResume ? uploadInfo.id : undefined,
+                );
+            }
 
             // Handle fallback: stream produced too little data for multipart
             if ('fallbackBlob' in multipartResult) {
