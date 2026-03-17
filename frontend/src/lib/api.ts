@@ -65,7 +65,14 @@ function waitForOnline(): Promise<void> {
  */
 async function measureUploadSpeed(): Promise<number> {
     try {
-        const blob = new Blob([crypto.getRandomValues(new Uint8Array(PREFLIGHT_SIZE))]);
+        // crypto.getRandomValues has a 65536-byte limit per call,
+        // so fill the buffer in chunks
+        const buffer = new Uint8Array(PREFLIGHT_SIZE);
+        for (let offset = 0; offset < PREFLIGHT_SIZE; offset += 65536) {
+            const chunk = Math.min(65536, PREFLIGHT_SIZE - offset);
+            crypto.getRandomValues(buffer.subarray(offset, offset + chunk));
+        }
+        const blob = new Blob([buffer]);
         let uploadedBytes = 0;
         const startTime = Date.now();
 
@@ -111,7 +118,8 @@ async function measureUploadSpeed(): Promise<number> {
             xhr.setRequestHeader('Content-Type', 'application/octet-stream');
             xhr.send(blob);
         });
-    } catch {
+    } catch (e) {
+        console.warn('[Upload] Speed test exception:', e);
         return 0;
     }
 }
