@@ -696,17 +696,31 @@ export const uploadRoutes = new Elysia()
 
     // Speed test endpoint — accepts and discards a blob for preflight measurement
     .put('/upload/speedtest', async ({ request }) => {
-        // Consume and discard the body
+        const startTime = Date.now();
+        let totalBytes = 0;
+
         const body = request.body;
         if (body) {
             const reader = (body as ReadableStream).getReader();
             // biome-ignore lint/correctness/noConstantCondition: intentional drain loop
             while (true) {
-                const { done } = await reader.read();
+                const { done, value } = await reader.read();
                 if (done) {
                     break;
                 }
+                if (value) {
+                    totalBytes += value.length;
+                }
             }
         }
-        return { ok: true };
+
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speedMbps =
+            elapsed > 0 ? Math.round((totalBytes / (1024 * 1024) / elapsed) * 10) / 10 : 0;
+        logger.info(
+            { totalBytes, elapsedMs: Date.now() - startTime, speedMbps },
+            'Speed test completed',
+        );
+
+        return { ok: true, speedMbps };
     });

@@ -5,7 +5,8 @@ import { formatBytes, formatDuration, formatSpeed } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
 export function UploadProgress() {
-    const { isUploading, uploadProgress, zippingProgress, currentCanceller } = useAppStore();
+    const { isUploading, uploadProgress, zippingProgress, checkingSpeed, currentCanceller } =
+        useAppStore();
 
     if (!isUploading) {
         return null;
@@ -28,7 +29,9 @@ export function UploadProgress() {
 
     // Status text based on connection state
     let statusText = 'Preparing upload...';
-    if (isZipping) {
+    if (checkingSpeed) {
+        statusText = 'Checking speed...';
+    } else if (isZipping) {
         statusText = 'Compressing files...';
     } else if (isOffline) {
         statusText = 'Waiting for connection...';

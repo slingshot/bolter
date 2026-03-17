@@ -154,6 +154,7 @@ export interface UploadOptions {
     downloadLimit?: number;
     onProgress?: (progress: UploadProgress) => void;
     onZipProgress?: (percent: number) => void;
+    onSpeedTest?: (phase: 'started' | 'done', speedMbps?: number) => void;
     onError?: (error: UploadError) => void;
 }
 
@@ -425,6 +426,7 @@ export async function uploadFiles(
         downloadLimit,
         onProgress,
         onZipProgress,
+        onSpeedTest,
         onError,
     } = options;
 
@@ -515,14 +517,15 @@ export async function uploadFiles(
     }
 
     // Run preflight speed test to determine optimal part size
+    onSpeedTest?.('started');
     console.log('[Upload] Running preflight speed test...');
     const measuredSpeed = await measureUploadSpeed();
+    const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
     const preferredPartSize = getPreferredPartSize(measuredSpeed);
-    if (measuredSpeed > 0) {
-        console.log(
-            `[Upload] Preflight: ${(measuredSpeed / (1024 * 1024)).toFixed(1)} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
-        );
-    }
+    console.log(
+        `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+    );
+    onSpeedTest?.('done', speedMbps);
 
     // Request upload URLs
     const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
