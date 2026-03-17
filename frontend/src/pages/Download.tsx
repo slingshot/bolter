@@ -116,8 +116,13 @@ export function DownloadPage() {
                     return;
                 }
 
+                // Create keychain early so it can be used for authenticated status checks
+                // (crypto.subtle requires a secure context: HTTPS or localhost)
+                const kc = secretKey && crypto?.subtle ? new Keychain(secretKey) : null;
+                setKeychain(kc);
+
                 // Check if download limit already reached
-                const status = await getDownloadStatus(id);
+                const status = await getDownloadStatus(id, kc);
                 if (status && status.dl >= status.dlimit) {
                     setState('not-found');
                     return;
@@ -127,11 +132,6 @@ export function DownloadPage() {
                 if (status) {
                     setDownloadsLeft(status.dlimit - status.dl);
                 }
-
-                // Create keychain if we have a secret key and crypto.subtle is available
-                // (crypto.subtle requires a secure context: HTTPS or localhost)
-                const kc = secretKey && crypto?.subtle ? new Keychain(secretKey) : null;
-                setKeychain(kc);
 
                 // Fetch metadata
                 const meta = await getMetadata(id, kc || undefined);
@@ -184,7 +184,7 @@ export function DownloadPage() {
             setTimeout(async () => {
                 document.body.removeChild(iframe);
                 // Check download count vs limit to determine if more downloads available
-                const status = await getDownloadStatus(id);
+                const status = await getDownloadStatus(id, keychain);
                 const hasMoreDownloads = status ? status.dl < status.dlimit : false;
                 setCanDownloadAgain(hasMoreDownloads);
                 if (status) {
@@ -225,7 +225,7 @@ export function DownloadPage() {
             triggerDownload(result.blob, result.filename);
 
             // Check download count vs limit to determine if more downloads available
-            const status = await getDownloadStatus(id);
+            const status = await getDownloadStatus(id, keychain);
             const hasMoreDownloads = status ? status.dl < status.dlimit : false;
             setCanDownloadAgain(hasMoreDownloads);
             if (status) {
