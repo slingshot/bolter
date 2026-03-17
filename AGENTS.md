@@ -62,6 +62,8 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 - **Adaptive part sizing**: Upload part size is selected from `PART_SIZE_TIERS` (defined in `packages/shared/config.ts`) based on the measured upload speed from the preflight test.
 - **Stall detection**: Instead of hard XHR timeouts, uploads use progress-based stall detection — if no bytes are transferred for a threshold period, the part is retried. Retries pause automatically when the browser goes offline.
 - **Connection quality UI**: The upload progress component displays real-time connection quality states (e.g., "Checking speed...", online/offline awareness) and updates every second during uploads.
+- **Safari/WebKit empty-chunk handling**: WebKit's ReadableStream can emit empty `Uint8Array(0)` chunks during lazy HEIC/HEVC transcoding or between internal buffer refills. The upload pipeline filters these at multiple layers — stream reading, part creation, and queue buffering — to prevent 0-byte parts that would cause R2 `InvalidPart` errors. A pre-completion consistency check hard-fails if non-trailing parts have mismatched sizes.
+- **iOS transcoded file size resolution**: On Safari, files picked via `<input>` may be lazily transcoded (HEIC→JPEG, HEVC→H.264). `File.size` can differ from actual stream bytes. For single-file uploads under 2GB on WebKit, `resolveTranscodedSize()` streams through the file to count actual bytes before requesting upload URLs, ensuring accurate part allocation. The transcoding result is cached by WebKit so the subsequent upload stream is fast.
 
 **Key Backend Components**:
 - `apps/backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints

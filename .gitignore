@@ -1,6 +1,7 @@
 ### Claude Code
 .claude/settings.local.json
 .claude/worktrees/
+.mcp.json
 
 ### Turborepo
 .turbo

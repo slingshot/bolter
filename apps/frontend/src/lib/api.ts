@@ -165,6 +165,84 @@ async function measureUploadSpeed(): Promise<number> {
     }
 }
 
+// WebKit/Safari detection — used for iOS HEIC/HEVC transcoding workaround
+const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
+
+// Threshold for pre-reading files to resolve transcoded size on Safari.
+// Files above this are too large to justify a counting pass (the streaming
+// empty-chunk fixes handle them instead).
+const PREREAD_SIZE_THRESHOLD = 2 * 1024 * 1024 * 1024; // 2GB
+
+/**
+ * On iOS/Safari, files picked via <input> may be lazily transcoded from HEIC/HEVC
+ * to JPEG/H.264. File.size reports an estimated transcoded size that can differ
+ * from the actual bytes produced by File.stream(). This function streams through
+ * the file to count the real byte total, forcing the transcoding to complete.
+ * The result is cached by WebKit, so the subsequent upload stream is fast.
+ *
+ * Returns the actual byte count, or File.size on non-WebKit browsers.
+ */
+async function resolveTranscodedSize(file: File): Promise<number> {
+    if (!isWebKit || file.size > PREREAD_SIZE_THRESHOLD) {
+        return file.size;
+    }
+
+    // Only pre-read for file types iOS might transcode
+    const type = file.type.toLowerCase();
+    const name = file.name.toLowerCase();
+    const mayTranscode =
+        type.startsWith('image/hei') || // image/heic, image/heif
+        type === 'video/quicktime' || // .mov
+        type === 'video/x-m4v' ||
+        name.endsWith('.heic') ||
+        name.endsWith('.heif') ||
+        name.endsWith('.mov') ||
+        name.endsWith('.m4v') ||
+        // Catch-all: any image/video on WebKit could be transcoded
+        (type.startsWith('image/') &&
+            !type.includes('png') &&
+            !type.includes('gif') &&
+            !type.includes('webp')) ||
+        (type.startsWith('video/') && !type.includes('webm'));
+
+    if (!mayTranscode) {
+        return file.size;
+    }
+
+    console.log(
+        `[Upload] Safari detected with potential transcoded file (${type}), counting actual bytes...`,
+    );
+    const stream = file.stream();
+    const reader = stream.getReader();
+    let actualSize = 0;
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (value.length > 0) {
+                actualSize += value.length;
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    if (actualSize !== file.size) {
+        console.log(
+            `[Upload] Transcoded size differs: File.size=${file.size}, actual=${actualSize} (delta: ${actualSize - file.size})`,
+        );
+        addBreadcrumb(`iOS transcoded size: File.size=${file.size}, actual=${actualSize}`, {
+            category: 'upload',
+            level: 'info',
+        });
+    }
+
+    return actualSize;
+}
+
 function getPreferredPartSize(speed: number): number | undefined {
     if (speed === 0) {
         return undefined;
@@ -560,12 +638,18 @@ export async function uploadFiles(
     // Calculate total size
     // For streaming zip: use estimated size (actual uncompressed + headers)
     // For buffered zip: use actual blob size
-    // For single file: use file size
-    const plainSize = streamingZipStream
-        ? estimatedZipSize
-        : uploadBlob
-          ? uploadBlob.size
-          : totalInputSize;
+    // For single file: resolve actual size (handles iOS HEIC/HEVC transcoding)
+    let plainSize: number;
+    if (streamingZipStream) {
+        plainSize = estimatedZipSize;
+    } else if (uploadBlob) {
+        plainSize = uploadBlob.size;
+    } else if (files.length === 1) {
+        // Single file — resolve transcoded size on Safari to get accurate part allocation
+        plainSize = await resolveTranscodedSize(files[0]);
+    } else {
+        plainSize = totalInputSize;
+    }
     const totalSize = encrypted ? calculateEncryptedSize(plainSize) : plainSize;
 
     // Create metadata - keep original file info for display, mark as zipped if applicable
@@ -1421,6 +1505,28 @@ async function uploadMultipartStream(
     const queueOrBuffer = (blob: Blob, partNum: number, url: string) => {
         if (bufferedItem) {
             // Queue the previously buffered part — it's not the last (non-trailing)
+            // Skip 0-byte parts entirely — WebKit/Safari can produce these from empty stream chunks
+            if (bufferedItem.blob.size === 0) {
+                console.warn(
+                    `[Upload] Skipping 0-byte non-trailing part ${bufferedItem.partNum} (WebKit empty chunk)`,
+                );
+                captureError(
+                    new Error(`Skipped 0-byte non-trailing part ${bufferedItem.partNum}`),
+                    {
+                        operation: 'upload.part-size-validation',
+                        extra: {
+                            partNumber: bufferedItem.partNum,
+                            uploadId: uploadInfo.uploadId,
+                            totalParts: parts.length,
+                            totalFileSize,
+                        },
+                        level: 'warning',
+                    },
+                );
+                // Don't queue — just replace with the new part
+                bufferedItem = { blob, partNum, url };
+                return;
+            }
             // Validate: all non-trailing parts must be exactly partSize for R2 compliance
             if (bufferedItem.blob.size !== partSize) {
                 const diagnostic = {
@@ -1465,10 +1571,12 @@ async function uploadMultipartStream(
         while (currentPartIndex < parts.length) {
             const part = parts[currentPartIndex];
 
-            // Add leftover data from previous part
-            if (leftoverData) {
+            // Add leftover data from previous part (skip if empty)
+            if (leftoverData && leftoverData.length > 0) {
                 currentPartData.push(leftoverData);
                 currentPartSize += leftoverData.length;
+                leftoverData = null;
+            } else {
                 leftoverData = null;
             }
 
@@ -1495,6 +1603,12 @@ async function uploadMultipartStream(
                     throw new Error('Upload cancelled');
                 }
 
+                // Skip empty chunks — WebKit/Safari can emit Uint8Array(0) between
+                // internal buffer refills, which would create 0-byte parts
+                if (value.length === 0) {
+                    continue;
+                }
+
                 const wouldExceed = currentPartSize + value.length > partSize;
 
                 if (wouldExceed && !isLastAllocatedPart) {
@@ -1513,8 +1627,8 @@ async function uploadMultipartStream(
                 }
             }
 
-            // Buffer part if we have data
-            if (currentPartData.length > 0) {
+            // Buffer part if we have actual bytes (not just empty chunk entries)
+            if (currentPartSize > 0) {
                 const partBlob = new Blob(currentPartData as BlobPart[]);
                 currentPartData = [];
                 currentPartSize = 0;
@@ -1687,23 +1801,23 @@ async function uploadMultipartStream(
                     '[Upload] CRITICAL: Non-trailing part size inconsistency detected!',
                     diagnostic,
                 );
-                captureError(
-                    new Error(
-                        `Non-trailing part size inconsistency: expected ${expectedNonTrailingSize}, found ${inconsistentParts.map((p) => `part ${p.partNumber}=${p.size}`).join(', ')}`,
-                    ),
-                    {
-                        operation: 'upload.part-size-consistency',
-                        extra: {
-                            expectedSize: expectedNonTrailingSize,
-                            inconsistentParts: JSON.stringify(inconsistentParts),
-                            allPartSizes: JSON.stringify(uploadedPartSizes),
-                            uploadId: uploadInfo.uploadId,
-                            partSize,
-                            totalFileSize,
-                            totalParts: sortedPartNums.length,
-                        },
-                    },
+                const err = new Error(
+                    `Non-trailing part size inconsistency: expected ${expectedNonTrailingSize}, found ${inconsistentParts.map((p) => `part ${p.partNumber}=${p.size}`).join(', ')}`,
                 );
+                captureError(err, {
+                    operation: 'upload.part-size-consistency',
+                    extra: {
+                        expectedSize: expectedNonTrailingSize,
+                        inconsistentParts: JSON.stringify(inconsistentParts),
+                        allPartSizes: JSON.stringify(uploadedPartSizes),
+                        uploadId: uploadInfo.uploadId,
+                        partSize,
+                        totalFileSize,
+                        totalParts: sortedPartNums.length,
+                    },
+                });
+                // Hard fail — R2 will reject this with "All non-trailing parts must have the same length"
+                throw err;
             }
         }
 

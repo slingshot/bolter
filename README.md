@@ -22,7 +22,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **Files up to 1 TB** — multipart uploads with adaptive part sizing and resumability
 - **Self-destructing links** — configurable expiration (5 min to 6 months) and download limits
 - **No accounts required** — generate a link, share it, done
-- **Resilient uploads** — stall detection, offline awareness, progress-based retries, and IndexedDB-backed resume on page reload
+- **Resilient uploads** — stall detection, offline awareness, progress-based retries, IndexedDB-backed resume on page reload, and Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
 - **Self-hostable** — Docker Compose, or run directly with Bun
 - **Fully customizable** — white-label with your own branding, limits, and expiration options via environment variables
@@ -152,6 +152,7 @@ bolter/
 | **HKDF key derivation** | Derives separate keys for content and metadata from a single secret |
 | **64KB record encryption** | Streaming-friendly — encrypt/decrypt without loading the entire file into memory |
 | **IndexedDB resume state** | Multipart upload state survives page reloads; users can resume interrupted uploads |
+| **Safari/WebKit compat** | Handles empty stream chunks from iOS HEIC/HEVC transcoding; pre-resolves transcoded file sizes for accurate part allocation |
 
 ## Configuration
 
