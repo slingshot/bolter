@@ -1,0 +1,181 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit & Integration Tests
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run check
+
+      - name: Test (all workspaces)
+        run: bun run test
+
+  build:
+    name: Production Build
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build all workspaces
+        run: bun run build
+
+  docker:
+    name: Docker Build
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build frontend image
+        run: docker build -f apps/frontend/Dockerfile -t bolter-frontend:test .
+
+      - name: Build backend image
+        run: docker build -f apps/backend/Dockerfile -t bolter-backend:test .
+
+      - name: Verify images created
+        run: |
+          docker image inspect bolter-frontend:test > /dev/null
+          docker image inspect bolter-backend:test > /dev/null
+          echo "Both images built successfully"
+
+  test-frontend-coverage:
+    name: Frontend Coverage
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build shared package
+        run: cd packages/shared && bun run build
+
+      - name: Run frontend tests with coverage
+        run: cd apps/frontend && bun run test:coverage
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: apps/frontend/coverage/
+          retention-days: 7
+
+  pr-comment:
+    name: PR Status Comment
+    runs-on: namespace-profile-default
+    if: always() && github.event_name == 'pull_request'
+    needs: [test, build, docker, test-frontend-coverage]
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+
+            const results = jobs.jobs
+              .filter(j => j.name !== 'PR Status Comment')
+              .map(j => {
+                const icon = j.conclusion === 'success' ? '✅' : j.conclusion === 'failure' ? '❌' : '⏭️';
+                const duration = j.completed_at && j.started_at
+                  ? Math.round((new Date(j.completed_at) - new Date(j.started_at)) / 1000)
+                  : null;
+                const time = duration ? ` (${duration}s)` : '';
+                return `| ${icon} | ${j.name} | \`${j.conclusion || 'skipped'}\`${time} |`;
+              });
+
+            const allPassed = jobs.jobs
+              .filter(j => j.name !== 'PR Status Comment')
+              .every(j => j.conclusion === 'success' || j.conclusion === 'skipped');
+
+            const header = allPassed
+              ? '### ✅ All checks passed'
+              : '### ❌ Some checks failed';
+
+            const body = [
+              header,
+              '',
+              '| | Job | Status |',
+              '|---|---|---|',
+              ...results,
+              '',
+              `[View full run](${context.payload.repository.html_url}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('All checks passed') || c.body.includes('Some checks failed')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
