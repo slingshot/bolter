@@ -675,10 +675,12 @@ export async function uploadFiles(
     // Determine upload strategy for multi-file uploads
     const isMultiFile = files.length > 1;
     const totalInputSize = files.reduce((sum, f) => sum + f.size, 0);
-    // On Safari/WebKit, always use buffered zip — streaming zip produces estimated
-    // sizes that can mismatch actual bytes due to HEIC/HEVC lazy transcoding, and
-    // WebKit's ReadableStream can emit empty chunks during transcoding pauses.
-    const useStreamingZip = isMultiFile && totalInputSize >= STREAMING_ZIP_THRESHOLD && !isWebKit;
+    // Streaming zip is used for large multi-file uploads to avoid loading everything
+    // into memory. On Safari, the streaming zip's size estimate may differ from actual
+    // bytes, but the upload pipeline handles this gracefully (fewer/more parts are OK).
+    // The alternative (buffered zip) would OOM-crash iOS Safari for files >200-300MB
+    // since it loads all data + zip output into memory simultaneously.
+    const useStreamingZip = isMultiFile && totalInputSize >= STREAMING_ZIP_THRESHOLD;
 
     // For multiple files, create a zip (buffered for small, streaming for large)
     let uploadBlob: Blob | null = null;
@@ -698,7 +700,7 @@ export async function uploadFiles(
             zipFilename = streamingResult.filename;
             estimatedZipSize = streamingResult.estimatedSize;
         } else {
-            // Small files (or Safari): use buffered zip for exact sizing
+            // Small files: use buffered zip for compression benefits and exact sizing
             const zipResult = await createZipFromUploadFiles(files, onZipProgress);
             uploadBlob = zipResult.blob;
             zipFilename = zipResult.filename;
