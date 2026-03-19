@@ -177,8 +177,12 @@ const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome/.test(navig
  *
  * file.slice() is universally reliable: it creates lightweight byte-range
  * references without copying data into memory. Safari can send Blob slices
- * directly via XHR. iOS transcoding happens at file picker time (not lazily),
- * so File.size and file.slice() are consistent with the transcoded data.
+ * directly via XHR.
+ *
+ * Note: On some iOS versions, media files (HEVC, HEIC) may be lazily transcoded,
+ * causing File.size to differ from actual content bytes. This can result in
+ * truncated part uploads. The pre-completion consistency check below detects
+ * this and fails early with a clear error rather than hitting R2's EntityTooSmall.
  */
 async function uploadMultipartSliced(
     file: Blob,
@@ -194,6 +198,7 @@ async function uploadMultipartSliced(
         throw new Error('Invalid upload info');
     }
 
+    const MIN_PART = UPLOAD_LIMITS.MIN_PART_SIZE;
     const maxConcurrent = getConcurrentUploads(file.size);
     console.log(
         `[Upload] Safari slice-based upload: ${parts.length} parts, ${partSize / (1024 * 1024)}MB each, file=${(file.size / (1024 * 1024)).toFixed(1)}MB, concurrency: ${maxConcurrent}`,
@@ -203,6 +208,10 @@ async function uploadMultipartSliced(
     const failedPartNumbers: number[] = [];
     const partErrors: Record<number, { error: string; size: number }> = {};
     let activeUploads = 0;
+
+    // Track actual bytes sent per part (from XHR progress) to detect truncated
+    // uploads caused by iOS transcoding changing file size after slicing
+    const uploadedPartSizes: Record<number, number> = {};
 
     // Process parts with concurrency control
     const pendingQueue: Array<{
@@ -245,6 +254,31 @@ async function uploadMultipartSliced(
                 onRetry,
             );
             completedParts.push(result);
+            uploadedPartSizes[partNum] = result.bytesSent;
+
+            // Warn if actual bytes sent differ from expected blob size
+            if (result.bytesSent !== partBlob.size) {
+                console.warn(
+                    `[Upload] Part ${partNum} size mismatch: blob.size=${partBlob.size}, bytesSent=${result.bytesSent} (iOS transcoding?)`,
+                );
+                captureError(
+                    new Error(
+                        `Slice-based part size mismatch: part ${partNum} blob.size=${partBlob.size}, bytesSent=${result.bytesSent}`,
+                    ),
+                    {
+                        operation: 'upload.part.size-mismatch',
+                        extra: {
+                            partNumber: partNum,
+                            blobSize: partBlob.size,
+                            bytesSent: result.bytesSent,
+                            fileSize: file.size,
+                            totalParts: parts.length,
+                        },
+                        level: 'warning',
+                    },
+                );
+            }
+
             if (fileId) {
                 updateCompletedPart(fileId, result).catch((e) =>
                     console.warn('[Upload] Failed to persist completed part:', e),
@@ -304,6 +338,53 @@ async function uploadMultipartSliced(
     }
 
     console.log(`[Upload] All ${completedParts.length} parts completed (slice-based)`);
+
+    // Pre-completion consistency check: verify non-trailing parts meet R2's 5MB minimum.
+    // On iOS Safari, file.slice() can produce truncated blobs when the actual file content
+    // differs from File.size due to lazy media transcoding (HEVC→H.264, HEIC→JPEG).
+    const sortedPartNums = Object.keys(uploadedPartSizes)
+        .map(Number)
+        .sort((a, b) => a - b);
+    if (sortedPartNums.length > 1) {
+        const maxPartNum = Math.max(...sortedPartNums);
+        const undersizedParts = sortedPartNums
+            .filter((pn) => pn !== maxPartNum && uploadedPartSizes[pn] < MIN_PART)
+            .map((pn) => ({ partNumber: pn, size: uploadedPartSizes[pn] }));
+
+        if (undersizedParts.length > 0) {
+            const diagnostic = {
+                undersizedParts,
+                allPartSizes: uploadedPartSizes,
+                uploadId: uploadInfo.uploadId,
+                partSize,
+                fileSize: file.size,
+                totalParts: sortedPartNums.length,
+            };
+            console.error(
+                '[Upload] CRITICAL: Non-trailing parts below 5MB minimum detected (slice-based)!',
+                diagnostic,
+            );
+            captureError(
+                new Error(
+                    `Slice-based upload: ${undersizedParts.length} non-trailing parts below 5MB minimum: ${undersizedParts.map((p) => `part ${p.partNumber}=${p.size}`).join(', ')}`,
+                ),
+                {
+                    operation: 'upload.part-size-consistency.sliced',
+                    extra: {
+                        undersizedParts: JSON.stringify(undersizedParts),
+                        allPartSizes: JSON.stringify(uploadedPartSizes),
+                        uploadId: uploadInfo.uploadId,
+                        partSize,
+                        fileSize: file.size,
+                        totalParts: sortedPartNums.length,
+                    },
+                },
+            );
+            throw new Error(
+                'Upload failed: some parts were truncated during upload (iOS media transcoding may have changed the file size). Please try again.',
+            );
+        }
+    }
 
     return {
         parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
@@ -1527,7 +1608,7 @@ async function uploadMultipartStream(
                 onRetry,
             );
             completedParts.push(result);
-            uploadedPartSizes[partNum] = partBlob.size;
+            uploadedPartSizes[partNum] = result.bytesSent;
             if (fileId) {
                 updateCompletedPart(fileId, result).catch((e) =>
                     console.warn('[Upload] Failed to persist completed part:', e),
@@ -1960,7 +2041,7 @@ async function uploadPartWithRetry(
     canceller: Canceller,
     retryCount = 0,
     onRetry?: () => void,
-): Promise<{ PartNumber: number; ETag: string }> {
+): Promise<{ PartNumber: number; ETag: string; bytesSent: number }> {
     try {
         return await uploadPart(blob, url, partNumber, onProgress, canceller);
     } catch (error: unknown) {
@@ -2031,13 +2112,17 @@ function uploadPart(
     partNumber: number,
     onProgress: (loaded: number) => void,
     canceller: Canceller,
-): Promise<{ PartNumber: number; ETag: string }> {
+): Promise<{ PartNumber: number; ETag: string; bytesSent: number }> {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         canceller.addXhr(xhr);
 
         let stallTimer: ReturnType<typeof setTimeout>;
         let stalledAbort = false;
+        // Track actual bytes reported by XHR progress (detects truncated uploads
+        // where iOS Safari's file.slice() produces fewer bytes than Blob.size)
+        let lastProgressLoaded = 0;
+        let progressTotal = blob.size;
         const resetStallTimer = () => {
             clearTimeout(stallTimer);
             stallTimer = setTimeout(() => {
@@ -2062,6 +2147,8 @@ function uploadPart(
         xhr.upload.addEventListener('progress', (e) => {
             resetStallTimer();
             if (e.lengthComputable) {
+                lastProgressLoaded = e.loaded;
+                progressTotal = e.total;
                 onProgress(e.loaded);
             }
         });
@@ -2076,7 +2163,12 @@ function uploadPart(
 
             if (xhr.status >= 200 && xhr.status < 300) {
                 const etag = xhr.getResponseHeader('ETag') || '';
-                resolve({ PartNumber: partNumber, ETag: etag });
+                // Use progressTotal as the definitive byte count — if the browser
+                // determined a different Content-Length than blob.size (e.g. iOS
+                // transcoding changed actual file bytes), progressTotal reflects
+                // what was actually sent to the server.
+                const bytesSent = lastProgressLoaded > 0 ? progressTotal : blob.size;
+                resolve({ PartNumber: partNumber, ETag: etag, bytesSent });
             } else if (!stalledAbort) {
                 // Skip error reporting if this was an intentional stall abort
                 // (the stall timer already rejected with 'Upload stalled')

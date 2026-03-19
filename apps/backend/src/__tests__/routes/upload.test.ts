@@ -490,8 +490,9 @@ describe('POST /upload/complete', () => {
                 numParts: 2,
             }),
         );
+        // AWS SDK v3 puts S3 error codes in err.name, not err.code
         const err = new Error('NoSuchUpload') as Error & { code?: string };
-        err.code = 'NoSuchUpload';
+        err.name = 'NoSuchUpload';
         mockStorage.completeMultipartUpload.mockRejectedValue(err);
 
         const parts = [
@@ -516,8 +517,9 @@ describe('POST /upload/complete', () => {
                 numParts: 2,
             }),
         );
+        // AWS SDK v3 puts S3 error codes in err.name, not err.code
         const err = new Error('InvalidPart') as Error & { code?: string };
-        err.code = 'InvalidPart';
+        err.name = 'InvalidPart';
         mockStorage.completeMultipartUpload.mockRejectedValue(err);
 
         const parts = [
@@ -542,8 +544,9 @@ describe('POST /upload/complete', () => {
                 numParts: 2,
             }),
         );
+        // AWS SDK v3 puts S3 error codes in err.name, not err.code
         const err = new Error('EntityTooSmall') as Error & { code?: string };
-        err.code = 'EntityTooSmall';
+        err.name = 'EntityTooSmall';
         mockStorage.completeMultipartUpload.mockRejectedValue(err);
 
         const parts = [
@@ -556,7 +559,7 @@ describe('POST /upload/complete', () => {
 
         expect(res.status).toBe(200);
         const body = await res.json();
-        expect(body.error).toContain('Upload parts too small');
+        expect(body.error).toContain('smaller than the 5MB minimum');
         expect(body.status).toBe(400);
     });
 });

@@ -498,6 +498,8 @@ export const uploadRoutes = new Elysia()
                     );
                 } catch (e: unknown) {
                     const err = e as Error & { code?: string };
+                    // AWS SDK v3 puts S3 error codes in err.name, not err.code
+                    const errorCode = err.name || err.code;
                     captureError(e, {
                         operation: 'upload.multipart-complete',
                         extra: {
@@ -506,7 +508,7 @@ export const uploadRoutes = new Elysia()
                             uploadId,
                             partsReceived: parts.length,
                             partsAllocated: expectedParts,
-                            errorCode: err.code,
+                            errorCode,
                             errorName: err.name,
                         },
                     });
@@ -518,18 +520,23 @@ export const uploadRoutes = new Elysia()
                             error: e,
                             errorName: err.name,
                             errorMessage: err.message,
-                            errorCode: err.code,
+                            errorCode,
                         },
                         'Failed to complete multipart upload',
                     );
 
                     // Provide specific error messages
-                    if (err.code === 'NoSuchUpload') {
+                    // AWS SDK v3 uses err.name for S3 error codes (e.g. "EntityTooSmall"),
+                    // while err.code may be undefined. Check both for compatibility.
+                    if (errorCode === 'NoSuchUpload') {
                         return { error: 'Upload not found or expired', status: 404 };
-                    } else if (err.code === 'InvalidPart' || err.code === 'InvalidPartOrder') {
+                    } else if (errorCode === 'InvalidPart' || errorCode === 'InvalidPartOrder') {
                         return { error: 'Invalid upload parts', status: 400 };
-                    } else if (err.code === 'EntityTooSmall') {
-                        return { error: 'Upload parts too small', status: 400 };
+                    } else if (errorCode === 'EntityTooSmall') {
+                        return {
+                            error: 'One or more upload parts are smaller than the 5MB minimum. This can happen on iOS when the browser transcodes media files during upload. Please try again.',
+                            status: 400,
+                        };
                     }
 
                     throw e;
