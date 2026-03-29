@@ -24,6 +24,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **No accounts required** — generate a link, share it, done
 - **Resilient uploads** — stall detection, offline awareness, progress-based retries, IndexedDB-backed resume on page reload, and Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
+- **Multi-provider S3** — dynamic storage provider management via API; seamlessly migrate between S3-compatible services (Cloudflare R2, Railway, AWS S3, etc.) while existing files remain accessible on their original provider
 - **Self-hostable** — Docker Compose, or run directly with Bun
 - **Fully customizable** — white-label with your own branding, limits, and expiration options via environment variables
 
@@ -182,6 +183,14 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `MAX_DOWNLOADS` | `100` | Maximum download limit |
 | `DEFAULT_DOWNLOADS` | `1` | Default download limit |
 
+### Storage Provider Management
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROVIDER_ENCRYPTION_KEY` | _(none)_ | 32-byte hex key for AES-256-GCM encryption of provider secrets in Redis |
+| `PROVIDER_CACHE_TTL_SECONDS` | `60` | How often to refresh the in-memory provider cache |
+| `ADMIN_API_KEY` | _(none)_ | Bearer token for authenticating provider CRUD API requests |
+
 ### White-Labeling
 
 | Variable | Default | Description |
@@ -205,6 +214,106 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `POST` | `/upload/speedtest` | Generate pre-signed URLs for speed test |
 | `POST` | `/upload/speedtest/cleanup` | Clean up speed test objects |
 | `GET` | `/download/url/:id` | Get a pre-signed download URL |
+| `GET` | `/providers` | List all storage providers (admin) |
+| `GET` | `/providers/:id` | Get storage provider details (admin) |
+| `POST` | `/providers` | Add a new storage provider (admin) |
+| `PUT` | `/providers/:id` | Update a storage provider (admin) |
+| `DELETE` | `/providers/:id` | Remove a storage provider (admin) |
+| `POST` | `/providers/:id/ping` | Health-check a provider (admin) |
+| `POST` | `/providers/:id/activate` | Set provider as active upload target (admin) |
+
+## Multi-Provider Storage
+
+Bolter supports multiple S3-compatible storage providers simultaneously. This allows you to migrate between providers (e.g., Cloudflare R2 to Railway) without downtime — existing files remain accessible on their original provider while new uploads go to the new one.
+
+### How it works
+
+- On startup, the backend registers a **default provider** from environment variables (`S3_BUCKET`, `S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). This is automatic and requires no configuration beyond the existing env vars.
+- Every uploaded file records which provider it was uploaded to (`providerId` field in Redis metadata).
+- Downloads resolve the correct provider from the file's metadata. Files uploaded before multi-provider support (no `providerId` field) fall back to the default provider.
+- Additional providers can be added at runtime via the `/providers` API — no redeployment needed.
+- Provider configurations are stored in Redis with secrets encrypted via AES-256-GCM (when `PROVIDER_ENCRYPTION_KEY` is set).
+- Provider configs are cached in memory and refreshed from Redis on a configurable interval (default: 60 seconds).
+
+### Authentication
+
+All `/providers/*` endpoints require the `ADMIN_API_KEY` environment variable to be set. Requests must include the key as a Bearer token:
+
+```
+Authorization: Bearer <your-admin-api-key>
+```
+
+If `ADMIN_API_KEY` is not set, all provider management endpoints return `503 Service Unavailable`. This is by design — provider management is opt-in.
+
+### Generating an encryption key
+
+The `PROVIDER_ENCRYPTION_KEY` encrypts provider credentials (secret access keys) at rest in Redis. Generate one with:
+
+```bash
+openssl rand -hex 32
+```
+
+If not set, secrets are stored in plaintext (a warning is logged at startup). This is acceptable for local development but should be set in production.
+
+### Managing providers
+
+**List all providers:**
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:3001/providers
+```
+
+**Add a new provider:**
+```bash
+curl -X POST http://localhost:3001/providers \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Railway S3",
+    "bucket": "my-railway-bucket",
+    "endpoint": "https://s3.railway.app",
+    "accessKeyId": "...",
+    "secretAccessKey": "...",
+    "region": "auto",
+    "pathStyle": true,
+    "isActive": true
+  }'
+```
+
+Setting `isActive: true` makes this provider the target for all new uploads and deactivates the previously active provider.
+
+**Activate an existing provider:**
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  http://localhost:3001/providers/railway-s3/activate
+```
+
+**Health-check a provider:**
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  http://localhost:3001/providers/railway-s3/ping
+# Returns: { "healthy": true, "latencyMs": 45 }
+```
+
+**Delete a provider** (only if no active files reference it):
+```bash
+curl -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" \
+  http://localhost:3001/providers/railway-s3
+# Returns 409 if files still reference it. Use ?force=true to override.
+```
+
+> **Note:** The default provider (registered from env vars) cannot be deleted.
+
+### Migration example: Cloudflare R2 to Railway
+
+1. Deploy with existing env vars — the default provider (R2) is auto-registered. Zero behavior change.
+2. Add the Railway provider via `POST /providers` with `"isActive": true`.
+3. All new uploads now go to Railway. Existing R2 files continue to be served from R2.
+4. R2 files naturally drain as they hit their TTL or download limits.
+5. Once no files reference R2, the provider can be removed via `DELETE /providers/default`.
+
+### Provider API response format
+
+Secrets are never returned in API responses. The `accessKeyId` is masked (e.g., `AKIA****WXYZ`) and `secretAccessKey` is omitted entirely.
 
 ## Development
 

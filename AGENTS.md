@@ -65,12 +65,22 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 - **Safari/WebKit empty-chunk handling**: WebKit's ReadableStream can emit empty `Uint8Array(0)` chunks during lazy HEIC/HEVC transcoding or between internal buffer refills. The upload pipeline filters these at multiple layers — stream reading, part creation, and queue buffering — to prevent 0-byte parts that would cause R2 `InvalidPart` errors. A pre-completion consistency check hard-fails if non-trailing parts have mismatched sizes.
 - **iOS transcoded file size validation**: On Safari, files picked via `<input>` may be lazily transcoded (HEIC→JPEG, HEVC→H.264), causing `File.size` to differ from actual bytes. Both the stream-based and slice-based upload paths track actual bytes sent per part (via XHR progress events) and run a pre-completion consistency check — if any non-trailing part falls below R2's 5MB minimum, the upload fails early with a clear error instead of hitting a cryptic R2 `EntityTooSmall` rejection.
 
+**Multi-Provider Storage**:
+- Storage providers (S3-compatible buckets) are dynamically managed via a provider registry stored in Redis
+- Each file's metadata tracks which provider it was uploaded to (`providerId` field)
+- Downloads resolve the correct provider from file metadata; files without a `providerId` (pre-migration) fall back to the default (env-var) provider
+- New providers can be added/activated at runtime via the `/providers` API (admin-only)
+- Provider secrets are encrypted at rest in Redis via AES-256-GCM when `PROVIDER_ENCRYPTION_KEY` is set
+
 **Key Backend Components**:
 - `apps/backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints
 - `apps/backend/src/routes/download.ts` - URL signing, download count enforcement
-- `apps/backend/src/storage/s3.ts` - S3 client with multipart support
+- `apps/backend/src/routes/providers.ts` - Provider CRUD API (admin-only, protected by `ADMIN_API_KEY`)
+- `apps/backend/src/storage/s3.ts` - S3 client with explicit config (supports multiple instances per provider)
+- `apps/backend/src/storage/provider-registry.ts` - Provider registry with Redis persistence and in-memory caching
+- `apps/backend/src/storage/index.ts` - Storage facade routing operations to the correct provider
 - `apps/backend/src/storage/redis.ts` - Metadata operations with TTL
-- `apps/backend/src/config.ts` - Environment validation via Convict
+- `apps/backend/src/config.ts` - Environment validation
 
 **Key Frontend Components**:
 - `apps/frontend/src/lib/crypto.ts` - AES-GCM encryption, HKDF key derivation
@@ -85,9 +95,14 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 ## Environment Variables
 
 Required for local development:
-- `S3_BUCKET`, `S3_ENDPOINT` - Cloudflare R2 bucket config
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` - R2 credentials
+- `S3_BUCKET`, `S3_ENDPOINT` - S3-compatible bucket config (used as the default provider)
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` - S3 credentials for the default provider
 - `REDIS_URL` - Redis connection (default: `redis://localhost:6379`)
+
+Optional for provider management:
+- `PROVIDER_ENCRYPTION_KEY` - 32-byte hex key for encrypting provider secrets in Redis
+- `PROVIDER_CACHE_TTL_SECONDS` - In-memory provider cache refresh interval (default: `60`)
+- `ADMIN_API_KEY` - Bearer token for provider CRUD API (`/providers/*`)
 
 See `.env.example` for full list of configurable limits and UI options.
 
@@ -115,6 +130,13 @@ See `.env.example` for full list of configurable limits and UI options.
 - `POST /params/:id` - Update file parameters (owner only)
 - `POST /info/:id` - Get file info (owner only)
 - `POST /password/:id` - Set file password (owner only)
+- `GET /providers` - List storage providers (admin only)
+- `GET /providers/:id` - Get provider details (admin only)
+- `POST /providers` - Add storage provider (admin only)
+- `PUT /providers/:id` - Update storage provider (admin only)
+- `DELETE /providers/:id` - Remove storage provider (admin only)
+- `POST /providers/:id/ping` - Health-check a provider (admin only)
+- `POST /providers/:id/activate` - Set provider as active upload target (admin only)
 
 ## Documentation Maintenance
 

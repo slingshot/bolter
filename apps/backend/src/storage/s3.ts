@@ -13,36 +13,52 @@ import {
     UploadPartCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { config } from '../config';
 import { s3Logger as logger } from '../logger';
+
+export interface S3StorageOptions {
+    providerId: string;
+    bucket: string;
+    endpoint?: string;
+    region?: string;
+    pathStyle?: boolean;
+    accessKeyId: string;
+    secretAccessKey: string;
+}
 
 export class S3Storage {
     private s3: S3Client;
     private bucket: string;
+    readonly providerId: string;
 
-    constructor() {
-        this.bucket = config.s3Bucket;
+    constructor(options: S3StorageOptions) {
+        this.bucket = options.bucket;
+        this.providerId = options.providerId;
 
         const clientConfig: ConstructorParameters<typeof S3Client>[0] = {
-            region: 'auto',
+            region: options.region || 'auto',
             // Disable automatic checksums - R2 doesn't fully support SDK v3 flexible checksums
             requestChecksumCalculation: 'WHEN_REQUIRED',
             responseChecksumValidation: 'WHEN_REQUIRED',
+            credentials: {
+                accessKeyId: options.accessKeyId,
+                secretAccessKey: options.secretAccessKey,
+            },
         };
 
-        if (config.s3Endpoint) {
-            clientConfig.endpoint = config.s3Endpoint;
+        if (options.endpoint) {
+            clientConfig.endpoint = options.endpoint;
         }
 
-        if (config.s3UsePathStyle) {
+        if (options.pathStyle) {
             clientConfig.forcePathStyle = true;
         }
 
         logger.info(
             {
+                providerId: this.providerId,
                 bucket: this.bucket,
-                endpoint: config.s3Endpoint,
-                pathStyle: config.s3UsePathStyle,
+                endpoint: options.endpoint,
+                pathStyle: options.pathStyle,
             },
             'S3 client initialized',
         );
@@ -341,4 +357,4 @@ export class S3Storage {
     }
 }
 
-export const s3Storage = new S3Storage();
+export type { CompletedPart };

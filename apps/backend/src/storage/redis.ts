@@ -93,6 +93,46 @@ export class RedisStorage {
         const client = await this.getClient();
         return client.hIncrBy(key, field, increment);
     }
+
+    async hSetMultiple(key: string, data: Record<string, string>): Promise<void> {
+        const client = await this.getClient();
+        await client.hSet(key, data);
+    }
+
+    async sAdd(key: string, ...members: string[]): Promise<void> {
+        const client = await this.getClient();
+        await client.sAdd(key, members);
+    }
+
+    async sMembers(key: string): Promise<string[]> {
+        const client = await this.getClient();
+        return client.sMembers(key);
+    }
+
+    async sRem(key: string, ...members: string[]): Promise<void> {
+        const client = await this.getClient();
+        await client.sRem(key, members);
+    }
+
+    async incrBy(key: string, increment: number): Promise<number> {
+        const client = await this.getClient();
+        return client.incrBy(key, increment);
+    }
+
+    async decrBy(key: string, decrement: number): Promise<number> {
+        const client = await this.getClient();
+        return client.decrBy(key, decrement);
+    }
+
+    async get(key: string): Promise<string | null> {
+        const client = await this.getClient();
+        return client.get(key);
+    }
+
+    async set(key: string, value: string): Promise<void> {
+        const client = await this.getClient();
+        await client.set(key, value);
+    }
 }
 
 export const redis = new RedisStorage();

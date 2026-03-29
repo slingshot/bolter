@@ -30,6 +30,11 @@ export interface Config {
     // UI Configuration
     customTitle: string;
     customDescription: string;
+
+    // Provider Management
+    providerEncryptionKey: string;
+    providerCacheTtlSeconds: number;
+    adminApiKey: string;
 }
 
 function parseIntArray(value: string | undefined, defaults: number[]): number[] {
@@ -87,6 +92,11 @@ export const config: Config = {
     // UI
     customTitle: process.env.CUSTOM_TITLE || UI_DEFAULTS.TITLE,
     customDescription: process.env.CUSTOM_DESCRIPTION || UI_DEFAULTS.DESCRIPTION,
+
+    // Provider Management
+    providerEncryptionKey: process.env.PROVIDER_ENCRYPTION_KEY || '',
+    providerCacheTtlSeconds: parseInt(process.env.PROVIDER_CACHE_TTL_SECONDS || '60', 10),
+    adminApiKey: process.env.ADMIN_API_KEY || '',
 };
 
 export function deriveBaseUrl(request: Request): string {

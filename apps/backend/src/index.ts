@@ -11,6 +11,7 @@ import { config } from './config';
 import { captureError } from './lib/sentry';
 import { logger } from './logger';
 import { storage } from './storage';
+import { providerRegistry } from './storage/provider-registry';
 
 // Start server
 app.listen(config.port);
@@ -35,12 +36,16 @@ console.log(`
   ╚══════════════════════════════════════╝
 `);
 
-// Connect to Redis
+// Connect to Redis and initialize provider registry
 storage.redis
     .connect()
-    .then(() => {
+    .then(async () => {
         logger.info('Connected to Redis');
         console.log('Connected to Redis');
+
+        await providerRegistry.initialize();
+        logger.info('Provider registry initialized');
+        console.log('Provider registry initialized');
     })
     .catch((err) => {
         captureError(err, { operation: 'redis.connect' });

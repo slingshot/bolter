@@ -6,6 +6,7 @@ import { captureError } from './lib/sentry';
 import { logger } from './logger';
 import { downloadRoutes } from './routes/download';
 import { plausibleRoutes } from './routes/plausible';
+import { providerRoutes } from './routes/providers';
 import { uploadRoutes } from './routes/upload';
 import { storage } from './storage';
 
@@ -41,7 +42,7 @@ export const app = new Elysia()
             origin: config.env === 'development' ? true : config.baseUrl,
             credentials: true,
             methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'baggage', 'sentry-trace'],
             exposeHeaders: ['WWW-Authenticate'],
         }),
     )
@@ -78,6 +79,11 @@ export const app = new Elysia()
                         name: 'File Management',
                         description:
                             'Owner-only file operations — delete, update limits, set password',
+                    },
+                    {
+                        name: 'Storage Providers',
+                        description:
+                            'CRUD management of S3-compatible storage providers (admin only)',
                     },
                 ],
             },
@@ -309,6 +315,7 @@ export const app = new Elysia()
     .use(uploadRoutes)
     .use(downloadRoutes)
     .use(plausibleRoutes)
+    .use(providerRoutes)
 
     // Error handling
     .onError(({ code, error, set, request }) => {

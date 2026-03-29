@@ -5,6 +5,7 @@ import { config, deriveBaseUrl } from '../config';
 import { captureError } from '../lib/sentry';
 import { uploadLogger as logger } from '../logger';
 import { type CompletedPart, storage } from '../storage';
+import { providerRegistry } from '../storage/provider-registry';
 
 const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
 const DEFAULT_PART_SIZE = UPLOAD_LIMITS.DEFAULT_PART_SIZE;
@@ -154,16 +155,22 @@ export const uploadRoutes = new Elysia()
             logger.debug({ requestId, id }, 'Storing initial metadata in Redis');
             const redisStartTime = Date.now();
 
+            const activeProviderId = storage.getActiveProviderId();
             await storage.setField(id, 'prefix', prefix.toString());
             await storage.setField(id, 'owner', owner);
             await storage.setField(id, 'encrypted', encrypted ? 'true' : 'false');
             await storage.setField(id, 'dl', '0');
             await storage.setField(id, 'dlimit', (dlimit || config.defaultDownloads).toString());
             await storage.setField(id, 'fileSize', fileSize.toString());
+            await storage.setField(id, 'providerId', activeProviderId);
             await storage.redis.expire(id, expireSeconds);
+            await providerRegistry.incrementFileCount(activeProviderId);
 
             const redisDuration = Date.now() - redisStartTime;
-            logger.info({ requestId, id, redisDuration }, 'Initial metadata stored in Redis');
+            logger.info(
+                { requestId, id, redisDuration, providerId: activeProviderId },
+                'Initial metadata stored in Redis',
+            );
 
             const useMultipart = fileSize > MULTIPART_THRESHOLD;
             logger.info(
@@ -484,7 +491,12 @@ export const uploadRoutes = new Elysia()
 
                 try {
                     const completeStartTime = Date.now();
-                    await storage.completeMultipartUpload(id, uploadId, sortedParts);
+                    await storage.completeMultipartUpload(
+                        id,
+                        uploadId,
+                        sortedParts,
+                        fileInfo.providerId,
+                    );
                     const completeDuration = Date.now() - completeStartTime;
 
                     logger.info(
@@ -646,7 +658,8 @@ export const uploadRoutes = new Elysia()
             }
 
             try {
-                await storage.abortMultipartUpload(id, uploadId);
+                const fileInfo = await storage.getMetadata(id);
+                await storage.abortMultipartUpload(id, uploadId, fileInfo?.providerId);
                 await storage.redis.del(id);
                 logger.info({ requestId, id, uploadId }, 'Upload aborted successfully');
                 return { success: true };
@@ -727,7 +740,13 @@ export const uploadRoutes = new Elysia()
                     }
                     batchPromises.push(
                         storage
-                            .getSignedMultipartUploadUrl(id, uploadId, i, URL_EXPIRATION_SECONDS)
+                            .getSignedMultipartUploadUrl(
+                                id,
+                                uploadId,
+                                i,
+                                URL_EXPIRATION_SECONDS,
+                                fileInfo.providerId,
+                            )
                             .then((url) => ({
                                 partNumber: i,
                                 url,
