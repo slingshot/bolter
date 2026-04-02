@@ -952,8 +952,74 @@ export async function uploadFiles(
     const onConnectivityChange = () => emitProgress();
     window.addEventListener('online', onConnectivityChange);
     window.addEventListener('offline', onConnectivityChange);
+
+    // Progress regression detection — poll every 5s and report to Sentry if
+    // total uploaded bytes drop below the previously observed high-water mark.
+    // This catches unexpected progress resets that users see in the UI, whether
+    // caused by part retries, stream bugs, or transcoding quirks.
+    let progressHighWaterMark = 0;
+    let regressionReported = false; // one report per upload to avoid spam
+    const REGRESSION_CHECK_MS = 5_000;
+    const regressionInterval = setInterval(() => {
+        const currentLoaded = Object.values(partProgress).reduce((sum, p) => sum + p, 0);
+        if (currentLoaded < progressHighWaterMark && !regressionReported) {
+            regressionReported = true;
+            const regressionBytes = progressHighWaterMark - currentLoaded;
+            const now = Date.now();
+            captureError(new Error('Upload progress regression detected'), {
+                operation: 'upload.progress-regression',
+                level: 'warning',
+                extra: {
+                    highWaterMark: progressHighWaterMark,
+                    currentLoaded,
+                    regressionBytes,
+                    regressionPercent: Number(((regressionBytes / totalSize) * 100).toFixed(2)),
+                    totalSize,
+                    percentage: Number(((currentLoaded / totalSize) * 100).toFixed(2)),
+                    activeParts: Object.keys(partProgress).length,
+                    partProgressSnapshot: JSON.stringify(partProgress),
+                    retryCount: totalRetryCount,
+                    isOffline: !navigator.onLine,
+                    smoothedSpeed,
+                    elapsedSeconds: Number(((now - startTime) / 1000).toFixed(1)),
+                    encrypted,
+                    isMultiFile,
+                    isMultipart: !!(uploadInfo.multipart && uploadInfo.parts),
+                    partSize: uploadInfo.partSize ?? null,
+                    totalParts: uploadInfo.parts?.length ?? 1,
+                    userAgent: navigator.userAgent,
+                },
+                tags: {
+                    encrypted: String(encrypted),
+                    multipart: String(!!(uploadInfo.multipart && uploadInfo.parts)),
+                    connectionQuality: navigator.onLine
+                        ? smoothedSpeed === 0
+                            ? 'stalled'
+                            : smoothedSpeed < 1 * 1024 * 1024
+                              ? 'slow'
+                              : smoothedSpeed < 10 * 1024 * 1024
+                                ? 'fair'
+                                : 'good'
+                        : 'offline',
+                },
+            });
+            addBreadcrumb('Progress regression detected', {
+                category: 'upload',
+                level: 'warning',
+                data: {
+                    highWaterMark: progressHighWaterMark,
+                    currentLoaded,
+                    regressionBytes,
+                    retryCount: totalRetryCount,
+                },
+            });
+        }
+        progressHighWaterMark = Math.max(progressHighWaterMark, currentLoaded);
+    }, REGRESSION_CHECK_MS);
+
     const cleanupStatusPoll = () => {
         clearInterval(statusPollInterval);
+        clearInterval(regressionInterval);
         window.removeEventListener('online', onConnectivityChange);
         window.removeEventListener('offline', onConnectivityChange);
     };
