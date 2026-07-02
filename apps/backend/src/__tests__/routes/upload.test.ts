@@ -42,11 +42,19 @@ const mockStorage = {
     abortMultipartUpload: mock(() => Promise.resolve()),
     getStream: mock(() => Promise.resolve(null)),
     length: mock(() => Promise.resolve(0)),
+    getActiveProviderId: mock(() => 'default'),
 };
 
 mock.module('../../storage', () => ({ storage: mockStorage }));
 mock.module('../../storage/index', () => ({ storage: mockStorage }));
 mock.module('../../storage/redis', () => ({ redis: mockRedis, RedisStorage: class {} }));
+mock.module('../../storage/provider-registry', () => ({
+    providerRegistry: {
+        incrementFileCount: mock(() => Promise.resolve()),
+        decrementFileCount: mock(() => Promise.resolve()),
+        getActiveProviderId: mock(() => 'default'),
+    },
+}));
 mock.module('../../storage/s3', () => ({
     s3Storage: {
         ping: mock(() => Promise.resolve(true)),
@@ -342,6 +350,8 @@ describe('POST /upload/complete', () => {
         expect(body.success).toBe(true);
         expect(body.id).toBe('abc123');
         expect(body.url).toContain('/download/abc123');
+        // The owner token must never be embedded as a URL fragment
+        expect(body.url).not.toContain('#');
 
         // Should NOT have called completeMultipartUpload
         expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
@@ -386,15 +396,40 @@ describe('POST /upload/complete', () => {
         expect(mockRedis.hDel.mock.calls.length).toBe(1);
     });
 
-    it('should return error for encrypted file without authKey', async () => {
+    it('should return 400 for encrypted file without authKey', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: true }));
 
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Missing or invalid auth key');
+    });
+
+    it('should reject missing authKey BEFORE completing the S3 multipart upload', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({
+                encrypted: true,
+                multipart: true,
+                uploadId: 'mp-upload-id',
+                numParts: 2,
+            }),
+        );
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('Missing or invalid auth key');
+        // The object must not be finalized — it would be permanently 401
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
     });
 
     it('should store auth and nonce for encrypted file with authKey', async () => {
@@ -439,27 +474,87 @@ describe('POST /upload/complete', () => {
         expect(authCalls.length).toBe(1);
     });
 
-    it('should return error when file ID is missing', async () => {
+    it('should return 400 when file ID is missing', async () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: '' }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Missing file ID');
     });
 
-    it('should return error when file not found', async () => {
+    it('should return 404 when file not found', async () => {
         mockStorage.getMetadata.mockResolvedValue(null);
 
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'nonexistent' }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(404);
         const body = await res.json();
         expect(body.error).toContain('File not found');
+        // Legacy body status field is preserved for older clients
+        expect(body.status).toBe(404);
     });
 
-    it('should return error when too many parts are sent', async () => {
+    it('should return 400 when parts data is missing for a multipart upload', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({
+                multipart: true,
+                uploadId: 'mp-upload-id',
+                numParts: 2,
+            }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('Missing parts data');
+    });
+
+    it('should return 500 when upload ID is missing from metadata', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({
+                multipart: true,
+                uploadId: undefined,
+                numParts: 2,
+            }),
+        );
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(500);
+        const body = await res.json();
+        expect(body.error).toContain('Upload ID not found');
+    });
+
+    it('should store actualSize under the fileSize field', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', { id: 'abc123', actualSize: 12345678 }),
+        );
+
+        expect(res.status).toBe(200);
+        const fileSizeCalls = mockStorage.setField.mock.calls.filter(
+            (call: unknown[]) => call[1] === 'fileSize' && call[2] === '12345678',
+        );
+        expect(fileSizeCalls.length).toBe(1);
+        const staleSizeCalls = mockStorage.setField.mock.calls.filter(
+            (call: unknown[]) => call[1] === 'size',
+        );
+        expect(staleSizeCalls.length).toBe(0);
+    });
+
+    it('should return 400 when too many parts are sent', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({
                 multipart: true,
@@ -477,12 +572,12 @@ describe('POST /upload/complete', () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Too many parts');
     });
 
-    it('should return 404 message for NoSuchUpload error', async () => {
+    it('should return 404 for NoSuchUpload error', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({
                 multipart: true,
@@ -503,13 +598,14 @@ describe('POST /upload/complete', () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(404);
         const body = await res.json();
         expect(body.error).toContain('Upload not found or expired');
+        // Legacy body status field is preserved for older clients
         expect(body.status).toBe(404);
     });
 
-    it('should return 400 message for InvalidPart error', async () => {
+    it('should return 400 for InvalidPart error', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({
                 multipart: true,
@@ -530,13 +626,13 @@ describe('POST /upload/complete', () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Invalid upload parts');
         expect(body.status).toBe(400);
     });
 
-    it('should return 400 message for EntityTooSmall error', async () => {
+    it('should return 400 for EntityTooSmall error', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({
                 multipart: true,
@@ -557,7 +653,7 @@ describe('POST /upload/complete', () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('smaller than the 5MB minimum');
         expect(body.status).toBe(400);

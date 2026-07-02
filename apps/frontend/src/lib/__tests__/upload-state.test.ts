@@ -271,6 +271,118 @@ describe('upload-state (IndexedDB)', () => {
         });
     });
 
+    describe('version gating (poisoned pre-v2 encrypted resume state)', () => {
+        it('stamps new state with the current schema version', async () => {
+            const { saveUploadState, getAnyResumableUpload, UPLOAD_STATE_VERSION } =
+                await getModule();
+            await saveUploadState(makeUpload());
+
+            const result = await getAnyResumableUpload();
+            expect(result?.version).toBe(UPLOAD_STATE_VERSION);
+        });
+
+        it('deletes pre-v2 encrypted state with completed parts on discovery', async () => {
+            const { saveUploadState, getResumableUpload, getAnyResumableUpload } =
+                await getModule();
+            await saveUploadState(
+                makeUpload({
+                    version: 1,
+                    fileName: 'poisoned.bin',
+                    fileSize: 100,
+                    fileLastModified: 1000,
+                    encrypted: true,
+                    secretKeyB64: 'abcdef123456',
+                    completedParts: [{ PartNumber: 1, ETag: '"etag1"' }],
+                }),
+            );
+
+            const result = await getResumableUpload('poisoned.bin', 100, 1000);
+            expect(result).toBeNull();
+            // The poisoned entry must be gone entirely, not just skipped
+            expect(await getAnyResumableUpload()).toBeNull();
+        });
+
+        it('deletes pre-v2 encrypted state via getAnyResumableUpload too', async () => {
+            const { saveUploadState, getAnyResumableUpload } = await getModule();
+            await saveUploadState(
+                makeUpload({
+                    version: 1,
+                    encrypted: true,
+                    completedParts: [{ PartNumber: 1, ETag: '"etag1"' }],
+                }),
+            );
+
+            expect(await getAnyResumableUpload()).toBeNull();
+            expect(await getAnyResumableUpload()).toBeNull();
+        });
+
+        it('keeps pre-v2 unencrypted state with completed parts', async () => {
+            const { saveUploadState, getResumableUpload } = await getModule();
+            await saveUploadState(
+                makeUpload({
+                    version: 1,
+                    fileName: 'plain.bin',
+                    fileSize: 100,
+                    fileLastModified: 1000,
+                    encrypted: false,
+                    completedParts: [{ PartNumber: 1, ETag: '"etag1"' }],
+                }),
+            );
+
+            const result = await getResumableUpload('plain.bin', 100, 1000);
+            expect(result).not.toBeNull();
+        });
+
+        it('keeps pre-v2 encrypted state without completed parts', async () => {
+            const { saveUploadState, getResumableUpload } = await getModule();
+            await saveUploadState(
+                makeUpload({
+                    version: 1,
+                    fileName: 'no-parts.bin',
+                    fileSize: 100,
+                    fileLastModified: 1000,
+                    encrypted: true,
+                    completedParts: [],
+                }),
+            );
+
+            const result = await getResumableUpload('no-parts.bin', 100, 1000);
+            expect(result).not.toBeNull();
+        });
+
+        it('keeps v2 encrypted state with completed parts', async () => {
+            const { saveUploadState, getResumableUpload } = await getModule();
+            await saveUploadState(
+                makeUpload({
+                    fileName: 'v2.bin',
+                    fileSize: 100,
+                    fileLastModified: 1000,
+                    encrypted: true,
+                    completedParts: [{ PartNumber: 1, ETag: '"etag1"' }],
+                }),
+            );
+
+            const result = await getResumableUpload('v2.bin', 100, 1000);
+            expect(result).not.toBeNull();
+        });
+
+        it('skips a poisoned entry but returns a valid one', async () => {
+            const { saveUploadState, getAnyResumableUpload } = await getModule();
+            await saveUploadState(
+                makeUpload({
+                    fileId: 'aaa-poisoned',
+                    version: 1,
+                    encrypted: true,
+                    completedParts: [{ PartNumber: 1, ETag: '"etag1"' }],
+                }),
+            );
+            await saveUploadState(makeUpload({ fileId: 'zzz-valid' }));
+
+            const result = await getAnyResumableUpload();
+            expect(result?.fileId).toBe('zzz-valid');
+        });
+    });
+
     describe('cleanupExpiredUploads', () => {
         it('removes entries older than 7 days', async () => {
             const { saveUploadState, cleanupExpiredUploads, getAnyResumableUpload } =

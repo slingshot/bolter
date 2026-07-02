@@ -401,7 +401,7 @@ export const uploadRoutes = new Elysia()
     // Complete upload
     .post(
         '/upload/complete',
-        async ({ body, request }) => {
+        async ({ body, request, set }) => {
             const { id, metadata, authKey, actualSize, parts } = body;
             const requestId = randomBytes(4).toString('hex');
 
@@ -419,6 +419,7 @@ export const uploadRoutes = new Elysia()
 
             if (!id) {
                 logger.warn({ requestId }, 'Missing file ID');
+                set.status = 400;
                 return { error: 'Missing file ID' };
             }
 
@@ -427,10 +428,19 @@ export const uploadRoutes = new Elysia()
 
             if (!fileInfo) {
                 logger.warn({ requestId, id }, 'File not found in Redis');
+                set.status = 404;
                 return { error: 'File not found', status: 404 };
             }
 
             logger.debug({ requestId, id, fileInfo }, 'File metadata retrieved');
+
+            // Reject invalid encrypted-file requests before the S3 completion,
+            // otherwise the object gets finalized but is permanently 401
+            if (fileInfo.encrypted && (!authKey || typeof authKey !== 'string')) {
+                logger.warn({ requestId, id }, 'Missing or invalid auth key for encrypted file');
+                set.status = 400;
+                return { error: 'Missing or invalid auth key for encrypted file' };
+            }
 
             const isMultipart = fileInfo.multipart;
 
@@ -442,6 +452,7 @@ export const uploadRoutes = new Elysia()
 
                 if (!parts || !Array.isArray(parts)) {
                     logger.warn({ requestId, id }, 'Missing parts data for multipart upload');
+                    set.status = 400;
                     return { error: 'Missing parts data' };
                 }
 
@@ -457,6 +468,7 @@ export const uploadRoutes = new Elysia()
                         },
                         'Too many parts received',
                     );
+                    set.status = 400;
                     return {
                         error: `Too many parts: got ${parts.length}, expected at most ${expectedParts}`,
                     };
@@ -465,6 +477,7 @@ export const uploadRoutes = new Elysia()
                 const uploadId = fileInfo.uploadId;
                 if (!uploadId) {
                     logger.error({ requestId, id }, 'Upload ID not found in metadata');
+                    set.status = 500;
                     return { error: 'Upload ID not found' };
                 }
 
@@ -541,10 +554,13 @@ export const uploadRoutes = new Elysia()
                     // AWS SDK v3 uses err.name for S3 error codes (e.g. "EntityTooSmall"),
                     // while err.code may be undefined. Check both for compatibility.
                     if (errorCode === 'NoSuchUpload') {
+                        set.status = 404;
                         return { error: 'Upload not found or expired', status: 404 };
                     } else if (errorCode === 'InvalidPart' || errorCode === 'InvalidPartOrder') {
+                        set.status = 400;
                         return { error: 'Invalid upload parts', status: 400 };
                     } else if (errorCode === 'EntityTooSmall') {
+                        set.status = 400;
                         return {
                             error: 'One or more upload parts are smaller than the 5MB minimum. This can happen on iOS when the browser transcodes media files during upload. Please try again.',
                             status: 400,
@@ -570,11 +586,13 @@ export const uploadRoutes = new Elysia()
 
             // Set auth based on encryption
             if (fileInfo.encrypted) {
+                // Safety net — already validated before the S3 completion above
                 if (!authKey || typeof authKey !== 'string') {
                     logger.warn(
                         { requestId, id },
                         'Missing or invalid auth key for encrypted file',
                     );
+                    set.status = 400;
                     return { error: 'Missing or invalid auth key for encrypted file' };
                 }
                 await storage.setField(id, 'auth', authKey);
@@ -589,7 +607,7 @@ export const uploadRoutes = new Elysia()
 
             // Update file size if provided
             if (actualSize) {
-                await storage.setField(id, 'size', actualSize.toString());
+                await storage.setField(id, 'fileSize', actualSize.toString());
                 logger.debug({ requestId, id, actualSize }, 'Updated actual file size');
             }
 
@@ -603,10 +621,12 @@ export const uploadRoutes = new Elysia()
                 'Upload completed successfully',
             );
 
+            // No fragment here — the real key never leaves the client, and the
+            // owner token must not leak into a shareable URL
             return {
                 success: true,
                 id,
-                url: `${deriveBaseUrl(request)}/download/${id}#${fileInfo.owner}`,
+                url: `${deriveBaseUrl(request)}/download/${id}`,
             };
         },
         {
@@ -637,6 +657,17 @@ export const uploadRoutes = new Elysia()
                     url: t.Optional(t.String()),
                     error: t.Optional(t.String()),
                     status: t.Optional(t.Number()),
+                }),
+                400: t.Object({
+                    error: t.String(),
+                    status: t.Optional(t.Number()),
+                }),
+                404: t.Object({
+                    error: t.String(),
+                    status: t.Optional(t.Number()),
+                }),
+                500: t.Object({
+                    error: t.String(),
                 }),
             },
         },

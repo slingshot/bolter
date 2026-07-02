@@ -12,6 +12,7 @@ const decoder = new TextDecoder();
 export const ECE_RECORD_SIZE = 64 * 1024; // 64KB record size
 const TAG_LENGTH = 16; // AES-GCM tag length
 const NONCE_LENGTH = 12; // AES-GCM nonce length
+export const ECE_ENCRYPTED_RECORD_SIZE = ECE_RECORD_SIZE + TAG_LENGTH + 1;
 
 // Key derivation info strings
 const KEY_INFO = encoder.encode('Content-Encoding: aes128gcm');
@@ -268,11 +269,11 @@ export function createEncryptionStream(
         },
 
         async flush(controller) {
-            // Encrypt final record (may be less than ECE_RECORD_SIZE)
-            if (buffer.length > 0) {
-                const encrypted = await encryptRecord(encryptionKey, buffer, recordCount, true);
-                controller.enqueue(encrypted);
-            }
+            // Always emit a final-flagged record (empty when the plaintext is an
+            // exact record-size multiple) so truncation at a record boundary is
+            // detectable by the decryptor.
+            const encrypted = await encryptRecord(encryptionKey, buffer, recordCount, true);
+            controller.enqueue(encrypted);
         },
     });
 }
@@ -317,7 +318,7 @@ export function createDecryptionStream(
     let recordCount = 0;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
-    const encryptedRecordSize = ECE_RECORD_SIZE + TAG_LENGTH + 1;
+    let sawFinal = false;
 
     return new TransformStream({
         async start() {
@@ -332,11 +333,18 @@ export function createDecryptionStream(
             buffer = newBuffer;
 
             // Process complete encrypted records
-            while (buffer.length >= encryptedRecordSize) {
-                const record = buffer.slice(0, encryptedRecordSize);
-                buffer = buffer.slice(encryptedRecordSize);
+            while (buffer.length >= ECE_ENCRYPTED_RECORD_SIZE) {
+                const record = buffer.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
+                buffer = buffer.slice(ECE_ENCRYPTED_RECORD_SIZE);
 
-                const decrypted = await decryptRecord(encryptionKey, record, recordCount);
+                const { data: decrypted, isFinal } = await decryptRecord(
+                    encryptionKey,
+                    record,
+                    recordCount,
+                );
+                if (isFinal) {
+                    sawFinal = true;
+                }
                 if (decrypted.length > 0) {
                     controller.enqueue(decrypted);
                 }
@@ -348,7 +356,14 @@ export function createDecryptionStream(
             // Decrypt final record (may be less than full encrypted record size)
             if (buffer.length > 0) {
                 try {
-                    const decrypted = await decryptRecord(encryptionKey, buffer, recordCount);
+                    const { data: decrypted, isFinal } = await decryptRecord(
+                        encryptionKey,
+                        buffer,
+                        recordCount,
+                    );
+                    if (isFinal) {
+                        sawFinal = true;
+                    }
                     if (decrypted.length > 0) {
                         controller.enqueue(decrypted);
                     }
@@ -358,7 +373,17 @@ export function createDecryptionStream(
                         operation: 'crypto.decryptRecord',
                         extra: { recordCount, bufferLength: buffer.length },
                     });
+                    controller.error(e instanceof Error ? e : new Error(String(e)));
                 }
+            } else if (!sawFinal) {
+                // Legacy uploads with exact-record-multiple plaintexts have no
+                // final-flagged record, so this is not an error — but new uploads
+                // always end with one, so track occurrences for telemetry.
+                captureError(new Error('Encrypted stream ended without final record'), {
+                    operation: 'crypto.missingFinalRecord',
+                    level: 'warning',
+                    extra: { recordCount },
+                });
             }
         },
     });
@@ -371,16 +396,23 @@ async function decryptRecord(
     key: CryptoKey,
     data: Uint8Array,
     counter: number,
-): Promise<Uint8Array> {
-    // Generate nonce from counter (try both final and non-final)
+): Promise<{ data: Uint8Array; isFinal: boolean }> {
+    // Generate nonce from counter (try non-final first — most records are non-final)
     const nonce = new Uint8Array(NONCE_LENGTH);
     const view = new DataView(nonce.buffer);
     view.setUint32(0, counter, false);
 
     let decrypted: ArrayBuffer;
+    let isFinal = false;
 
     try {
-        // Try with final flag
+        decrypted = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: nonce, tagLength: TAG_LENGTH * 8 },
+            key,
+            data as BufferSource,
+        );
+    } catch {
+        // Fall back to the final-record nonce variant
         const finalNonce = new Uint8Array(nonce);
         finalNonce[0] |= 0x80;
         decrypted = await crypto.subtle.decrypt(
@@ -388,31 +420,31 @@ async function decryptRecord(
             key,
             data as BufferSource,
         );
-    } catch {
-        // Try without final flag
-        decrypted = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: nonce, tagLength: TAG_LENGTH * 8 },
-            key,
-            data as BufferSource,
-        );
+        isFinal = true;
     }
 
     const decryptedArray = new Uint8Array(decrypted);
 
-    // Remove delimiter byte
+    // The encryptor always appends a delimiter byte (1 or 2); anything else
+    // means a key/stream mismatch rather than a legitimate record.
     const delimiterIndex = decryptedArray.length - 1;
-    if (decryptedArray[delimiterIndex] === 1 || decryptedArray[delimiterIndex] === 2) {
-        return decryptedArray.slice(0, delimiterIndex);
+    const delimiter = decryptedArray[delimiterIndex];
+    if (delimiter !== 1 && delimiter !== 2) {
+        throw new Error('Invalid ECE record: missing delimiter byte');
     }
 
-    return decryptedArray;
+    return { data: decryptedArray.slice(0, delimiterIndex), isFinal };
 }
 
 /**
  * Calculate encrypted size from plaintext size
  */
 export function calculateEncryptedSize(plaintextSize: number): number {
-    const numRecords = Math.ceil(plaintextSize / ECE_RECORD_SIZE) || 1;
+    // Exact record-size multiples (including 0) carry an extra empty final record
+    const numRecords =
+        plaintextSize % ECE_RECORD_SIZE === 0
+            ? plaintextSize / ECE_RECORD_SIZE + 1
+            : Math.ceil(plaintextSize / ECE_RECORD_SIZE);
     const overhead = numRecords * (TAG_LENGTH + 1); // Tag + delimiter per record
     return plaintextSize + overhead;
 }

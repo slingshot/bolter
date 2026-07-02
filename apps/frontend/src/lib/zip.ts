@@ -14,7 +14,7 @@ export interface FileInfo {
 
 export interface FileSlice {
     name: string;
-    data: Uint8Array;
+    data: Blob | Uint8Array;
     type: string;
 }
 
@@ -218,16 +218,33 @@ function createProgressStream(
     });
 }
 
+export interface SliceOptions {
+    /**
+     * When false, a payload/metadata size mismatch warns and slices are
+     * clamped to the available bytes instead of throwing — legacy uploads
+     * (iOS lazy transcoding) can have drifted metadata sizes and best-effort
+     * delivery beats a permanently failing download.
+     */
+    strict?: boolean;
+}
+
 /**
  * Slice concatenated data back into individual files using metadata
  */
-export function sliceConcatenatedData(data: Uint8Array, files: FileInfo[]): FileSlice[] {
+export function sliceConcatenatedData(
+    data: Uint8Array,
+    files: FileInfo[],
+    options: SliceOptions = {},
+): FileSlice[] {
+    const { strict = true } = options;
     const totalExpectedSize = files.reduce((sum, f) => sum + f.size, 0);
 
     if (data.length !== totalExpectedSize) {
-        console.warn(
-            `[sliceConcatenatedData] Size mismatch: got ${data.length} bytes, expected ${totalExpectedSize}`,
-        );
+        const message = `[sliceConcatenatedData] Size mismatch: got ${data.length} bytes, expected ${totalExpectedSize}`;
+        if (strict) {
+            throw new Error(message);
+        }
+        console.warn(message);
     }
 
     const slices: FileSlice[] = [];
@@ -235,14 +252,48 @@ export function sliceConcatenatedData(data: Uint8Array, files: FileInfo[]): File
 
     for (const file of files) {
         const end = Math.min(offset + file.size, data.length);
-        const slice = data.slice(offset, end);
-
         slices.push({
             name: file.name,
-            data: slice,
+            data: data.slice(Math.min(offset, data.length), end),
             type: file.type,
         });
+        offset += file.size;
+    }
 
+    return slices;
+}
+
+/**
+ * Slice concatenated data held in a Blob back into individual files.
+ * Blob.slice is zero-copy, so this avoids materializing the payload in JS heap.
+ */
+export function sliceConcatenatedBlob(
+    data: Blob,
+    files: FileInfo[],
+    options: SliceOptions = {},
+): FileSlice[] {
+    const { strict = true } = options;
+    const totalExpectedSize = files.reduce((sum, f) => sum + f.size, 0);
+
+    if (data.size !== totalExpectedSize) {
+        const message = `[sliceConcatenatedData] Size mismatch: got ${data.size} bytes, expected ${totalExpectedSize}`;
+        if (strict) {
+            throw new Error(message);
+        }
+        console.warn(message);
+    }
+
+    const slices: FileSlice[] = [];
+    let offset = 0;
+
+    for (const file of files) {
+        // Blob.slice clamps out-of-range offsets natively
+        const end = offset + file.size;
+        slices.push({
+            name: file.name,
+            data: data.slice(offset, end, file.type),
+            type: file.type,
+        });
         offset = end;
     }
 

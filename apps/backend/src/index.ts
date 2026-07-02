@@ -13,6 +13,30 @@ import { logger } from './logger';
 import { storage } from './storage';
 import { providerRegistry } from './storage/provider-registry';
 
+// Connect to Redis and initialize the provider registry BEFORE accepting
+// traffic — a listening server with no storage backend would serve only errors
+try {
+    await storage.redis.connect();
+    logger.info('Connected to Redis');
+    console.log('Connected to Redis');
+} catch (err) {
+    captureError(err, { operation: 'redis.connect' });
+    logger.error({ error: err }, 'Failed to connect to Redis');
+    console.error('Failed to connect to Redis:', err);
+    process.exit(1);
+}
+
+try {
+    await providerRegistry.initialize();
+    logger.info('Provider registry initialized');
+    console.log('Provider registry initialized');
+} catch (err) {
+    captureError(err, { operation: 'provider-registry.initialize' });
+    logger.error({ error: err }, 'Failed to initialize provider registry');
+    console.error('Failed to initialize provider registry:', err);
+    process.exit(1);
+}
+
 // Start server
 app.listen(config.port);
 
@@ -35,22 +59,5 @@ console.log(`
   ║  Environment: ${config.env.padEnd(18)}  ║
   ╚══════════════════════════════════════╝
 `);
-
-// Connect to Redis and initialize provider registry
-storage.redis
-    .connect()
-    .then(async () => {
-        logger.info('Connected to Redis');
-        console.log('Connected to Redis');
-
-        await providerRegistry.initialize();
-        logger.info('Provider registry initialized');
-        console.log('Provider registry initialized');
-    })
-    .catch((err) => {
-        captureError(err, { operation: 'redis.connect' });
-        logger.error({ error: err }, 'Failed to connect to Redis');
-        console.error('Failed to connect to Redis:', err);
-    });
 
 export type { App } from './app';

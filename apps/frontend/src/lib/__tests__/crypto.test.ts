@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/lib/sentry', () => ({
     captureError: vi.fn(),
@@ -11,11 +11,13 @@ import {
     calculateEncryptedSize,
     createDecryptionStream,
     createEncryptionStream,
+    ECE_ENCRYPTED_RECORD_SIZE,
     ECE_RECORD_SIZE,
     generateIV,
     generateSecretKey,
     Keychain,
 } from '@/lib/crypto';
+import { captureError } from '@/lib/sentry';
 
 // Helper: pipe a Uint8Array through a TransformStream and collect output
 async function pipeThrough(
@@ -34,6 +36,8 @@ async function pipeThrough(
         }
         await writer.close();
     })();
+    // Avoid unhandled rejections when the readable side errors first
+    writePromise.catch(() => undefined);
 
     const chunks: Uint8Array[] = [];
     let done = false;
@@ -393,28 +397,121 @@ describe('Encryption/Decryption streams', () => {
         expect(decrypted).toEqual(plaintext);
     });
 
-    it('decryption with wrong key does not produce original plaintext', async () => {
+    it('decryption with wrong key rejects', async () => {
         const kc1 = new Keychain();
         const kc2 = new Keychain();
         const plaintext = makeData(1000);
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc1));
 
-        // The decryption stream catches errors in flush() and logs them via captureError,
-        // so it resolves with empty output rather than rejecting.
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc2));
-        // Either empty (error swallowed) or garbage -- definitely not the original plaintext
-        if (decrypted.length > 0) {
-            expect(arrayToB64(decrypted)).not.toBe(arrayToB64(plaintext));
-        } else {
-            expect(decrypted.length).toBe(0);
+        await expect(pipeThrough(encrypted, createDecryptionStream(kc2))).rejects.toThrow();
+    });
+
+    it('decryption with wrong key rejects for multi-record data', async () => {
+        const kc1 = new Keychain();
+        const kc2 = new Keychain();
+        const plaintext = makeData(150 * 1024);
+
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc1));
+
+        await expect(pipeThrough(encrypted, createDecryptionStream(kc2))).rejects.toThrow();
+    });
+});
+
+describe('Decryption stream integrity', () => {
+    beforeEach(() => {
+        vi.mocked(captureError).mockClear();
+    });
+
+    const roundtripSizes = [
+        0,
+        1,
+        ECE_RECORD_SIZE - 1,
+        ECE_RECORD_SIZE,
+        ECE_RECORD_SIZE + 1,
+        ECE_RECORD_SIZE * 2,
+        ECE_RECORD_SIZE * 3 + 12345,
+    ];
+
+    for (const size of roundtripSizes) {
+        it(`round-trips ${size} bytes`, async () => {
+            const kc = new Keychain();
+            const plaintext = makeData(size);
+
+            const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+            expect(encrypted.length).toBe(calculateEncryptedSize(size));
+
+            const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+            expect(decrypted).toEqual(plaintext);
+            expect(vi.mocked(captureError)).not.toHaveBeenCalled();
+        });
+    }
+
+    it('always emits a final record, even for empty input', async () => {
+        const kc = new Keychain();
+        const encrypted = await pipeThrough(new Uint8Array(0), createEncryptionStream(kc));
+        // Empty final record: delimiter byte + GCM tag
+        expect(encrypted.length).toBe(17);
+    });
+
+    it('rejects truncated ciphertext (single record)', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(1000);
+
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, encrypted.length - 10);
+
+        await expect(pipeThrough(truncated, createDecryptionStream(kc))).rejects.toThrow();
+        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ operation: 'crypto.decryptRecord' }),
+        );
+    });
+
+    it('rejects truncated ciphertext (multi-record)', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE * 2);
+
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, encrypted.length - 10);
+
+        await expect(pipeThrough(truncated, createDecryptionStream(kc))).rejects.toThrow();
+    });
+
+    it('decrypts legacy exact-multiple stream without trailing final record', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE);
+
+        // New encryptor appends an empty 17-byte final record; drop it to
+        // simulate a legacy upload with an exact-record-multiple plaintext
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        expect(encrypted.length).toBe(ECE_ENCRYPTED_RECORD_SIZE + 17);
+        const legacy = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
+
+        const decrypted = await pipeThrough(legacy, createDecryptionStream(kc));
+        expect(decrypted).toEqual(plaintext);
+
+        // Missing final record is reported as warning telemetry, not a failure
+        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+                operation: 'crypto.missingFinalRecord',
+                level: 'warning',
+            }),
+        );
+    });
+
+    it('calculateEncryptedSize matches actual encrypted output for all sizes', async () => {
+        const kc = new Keychain();
+        for (const size of roundtripSizes) {
+            const encrypted = await pipeThrough(makeData(size), createEncryptionStream(kc));
+            expect(encrypted.length).toBe(calculateEncryptedSize(size));
         }
     });
 });
 
 describe('calculateEncryptedSize', () => {
-    it('returns overhead for zero-length input (1 record minimum)', () => {
-        // 0 bytes -> ceil(0/64K) = 0, but || 1 makes it 1 record
+    it('returns overhead for zero-length input (single empty final record)', () => {
         const result = calculateEncryptedSize(0);
         expect(result).toBe(0 + 1 * 17); // 17 bytes overhead for 1 record
     });
@@ -430,10 +527,10 @@ describe('calculateEncryptedSize', () => {
         expect(result).toBe(1000 + 17);
     });
 
-    it('handles exact record boundary (64KB)', () => {
+    it('handles exact record boundary (64KB) with extra empty final record', () => {
         const result = calculateEncryptedSize(ECE_RECORD_SIZE);
-        // ceil(65536/65536) = 1 record
-        expect(result).toBe(ECE_RECORD_SIZE + 17);
+        // 1 full record + 1 empty final record
+        expect(result).toBe(ECE_RECORD_SIZE + 2 * 17);
     });
 
     it('handles one byte over record boundary', () => {
@@ -449,16 +546,16 @@ describe('calculateEncryptedSize', () => {
         expect(calculateEncryptedSize(size)).toBe(size + 3 * 17);
     });
 
-    it('handles 1MB', () => {
+    it('handles 1MB (exact multiple adds empty final record)', () => {
         const size = 1024 * 1024;
-        const numRecords = Math.ceil(size / ECE_RECORD_SIZE);
-        expect(numRecords).toBe(16);
-        expect(calculateEncryptedSize(size)).toBe(size + 16 * 17);
+        const numRecords = size / ECE_RECORD_SIZE + 1;
+        expect(numRecords).toBe(17);
+        expect(calculateEncryptedSize(size)).toBe(size + 17 * 17);
     });
 
-    it('handles 1GB', () => {
+    it('handles 1GB (exact multiple adds empty final record)', () => {
         const size = 1024 * 1024 * 1024;
-        const numRecords = Math.ceil(size / ECE_RECORD_SIZE);
+        const numRecords = size / ECE_RECORD_SIZE + 1;
         expect(calculateEncryptedSize(size)).toBe(size + numRecords * 17);
     });
 });

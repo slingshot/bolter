@@ -12,15 +12,21 @@ export class RedisStorage {
         }
         this.connecting = true;
 
-        this.client = createClient({ url: config.redisUrl });
+        try {
+            this.client = createClient({ url: config.redisUrl });
 
-        this.client.on('error', (err) => {
-            captureError(err, { operation: 'redis.connection', level: 'error' });
-            console.error('Redis Client Error:', err);
-        });
+            this.client.on('error', (err) => {
+                captureError(err, { operation: 'redis.connection', level: 'error' });
+                console.error('Redis Client Error:', err);
+            });
 
-        await this.client.connect();
-        this.connecting = false;
+            await this.client.connect();
+        } catch (err) {
+            this.client = null;
+            throw err;
+        } finally {
+            this.connecting = false;
+        }
     }
 
     private async getClient(): Promise<RedisClientType> {
@@ -132,6 +138,20 @@ export class RedisStorage {
     async set(key: string, value: string): Promise<void> {
         const client = await this.getClient();
         await client.set(key, value);
+    }
+
+    // The EXISTS guard prevents resurrecting a just-expired key as a
+    // TTL-less hash containing only the nonce field
+    async rotateNonce(key: string, nonce: string): Promise<boolean> {
+        const client = await this.getClient();
+        const result = await client.eval(
+            "if redis.call('EXISTS', KEYS[1]) == 1 then redis.call('HSET', KEYS[1], 'nonce', ARGV[1]) return 1 else return 0 end",
+            {
+                keys: [key],
+                arguments: [nonce],
+            },
+        );
+        return result === 1;
     }
 }
 

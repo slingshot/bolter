@@ -3,7 +3,12 @@
  * Allows uploads to survive page reloads.
  */
 
+// Version 2: encrypted parts are cut on ECE record boundaries. Pre-v2 encrypted
+// state with completed parts was cut mid-record and cannot be resumed safely.
+export const UPLOAD_STATE_VERSION = 2;
+
 export interface PersistedUpload {
+    version?: number; // Schema version (missing = 1, pre record-aligned cuts)
     fileId: string; // Bolter file ID
     uploadId: string; // S3 multipart upload ID
     ownerToken: string; // For completion/abort
@@ -40,11 +45,24 @@ function openDB(): Promise<IDBDatabase> {
     });
 }
 
+// Encrypted pre-v2 state with completed parts was cut mid-ECE-record, so a
+// resume would duplicate a record fragment and produce an undecryptable file.
+function isPoisonedUploadState(state: PersistedUpload): boolean {
+    return (
+        state.encrypted &&
+        state.completedParts.length >= 1 &&
+        (state.version ?? 1) < UPLOAD_STATE_VERSION
+    );
+}
+
 export async function saveUploadState(state: PersistedUpload): Promise<void> {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
-        tx.objectStore(STORE_NAME).put(state);
+        tx.objectStore(STORE_NAME).put({
+            ...state,
+            version: state.version ?? UPLOAD_STATE_VERSION,
+        });
         tx.oncomplete = () => {
             db.close();
             resolve();
@@ -92,24 +110,30 @@ export async function getResumableUpload(
     lastModified: number,
 ): Promise<PersistedUpload | null> {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    const { found, poisonedIds } = await new Promise<{
+        found: PersistedUpload | null;
+        poisonedIds: string[];
+    }>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const request = store.openCursor();
-        let found: PersistedUpload | null = null;
+        let match: PersistedUpload | null = null;
+        const poisoned: string[] = [];
 
         request.onsuccess = () => {
             const cursor = request.result;
             if (cursor) {
                 const state = cursor.value as PersistedUpload;
-                if (
+                if (isPoisonedUploadState(state)) {
+                    poisoned.push(state.fileId);
+                } else if (
                     state.fileName === fileName &&
                     state.fileSize === fileSize &&
                     state.fileLastModified === lastModified
                 ) {
                     // Keep the most recent match (by createdAt)
-                    if (!found || state.createdAt > found.createdAt) {
-                        found = state;
+                    if (!match || state.createdAt > match.createdAt) {
+                        match = state;
                     }
                 }
                 cursor.continue();
@@ -117,38 +141,61 @@ export async function getResumableUpload(
         };
         tx.oncomplete = () => {
             db.close();
-            resolve(found);
+            resolve({ found: match, poisonedIds: poisoned });
         };
         tx.onerror = () => {
             db.close();
             reject(tx.error);
         };
     });
+
+    for (const fileId of poisonedIds) {
+        await deleteUploadState(fileId);
+    }
+    return found;
 }
 
 export async function getAnyResumableUpload(): Promise<PersistedUpload | null> {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    const { found, poisonedIds } = await new Promise<{
+        found: PersistedUpload | null;
+        poisonedIds: string[];
+    }>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const request = store.openCursor();
+        let match: PersistedUpload | null = null;
+        const poisoned: string[] = [];
 
         request.onsuccess = () => {
             const cursor = request.result;
             if (cursor) {
-                resolve(cursor.value as PersistedUpload);
-                return; // Return first found
+                const state = cursor.value as PersistedUpload;
+                if (isPoisonedUploadState(state)) {
+                    poisoned.push(state.fileId);
+                    cursor.continue();
+                    return;
+                }
+                if (!match) {
+                    match = state; // Return first resumable entry
+                }
+                cursor.continue();
             }
-            resolve(null);
         };
         tx.oncomplete = () => {
             db.close();
+            resolve({ found: match, poisonedIds: poisoned });
         };
         tx.onerror = () => {
             db.close();
             reject(tx.error);
         };
     });
+
+    for (const fileId of poisonedIds) {
+        await deleteUploadState(fileId);
+    }
+    return found;
 }
 
 export async function deleteUploadState(fileId: string): Promise<void> {

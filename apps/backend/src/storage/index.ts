@@ -1,6 +1,6 @@
 import type { CompletedPart } from '@aws-sdk/client-s3';
 import { captureError } from '../lib/sentry';
-import { providerRegistry } from './provider-registry';
+import { ProviderNotFoundError, providerRegistry } from './provider-registry';
 import { redis } from './redis';
 
 export interface FileMetadata {
@@ -23,16 +23,21 @@ export interface FileMetadata {
 
 /**
  * Resolve the S3Storage instance for an existing file.
- * Reads the file's `providerId` from Redis and looks it up in the registry.
- * Falls back to the default provider for pre-migration files (no providerId).
+ * Reads the file's `providerId` from Redis and looks it up in the registry,
+ * loading it from Redis on a cache miss. Falls back to the default provider
+ * only for pre-migration files (no providerId) or when the provider record
+ * was genuinely deleted; any other load failure propagates so callers never
+ * silently sign against the wrong bucket.
  */
 async function resolveProviderForFile(id: string) {
     const providerId = await redis.hGet(id, 'providerId');
     if (providerId) {
         try {
-            return providerRegistry.getProvider(providerId);
-        } catch {
-            // Provider removed or not loaded — fall back to default
+            return await providerRegistry.getOrLoadProvider(providerId);
+        } catch (e) {
+            if (!(e instanceof ProviderNotFoundError)) {
+                throw e;
+            }
             console.warn(
                 `Provider "${providerId}" not found for file ${id}, falling back to default`,
             );
@@ -138,17 +143,11 @@ export const storage = {
     // --- Delete (resolve provider, clean up counter) ---
 
     async del(id: string): Promise<void> {
-        // Read providerId before deleting metadata
+        // Read providerId before deleting metadata; resolve like
+        // resolveProviderForFile so a registry cache miss can never delete
+        // metadata while leaving the object behind in the real bucket
         const providerId = await redis.hGet(id, 'providerId');
-        const provider = providerId
-            ? (() => {
-                  try {
-                      return providerRegistry.getProvider(providerId);
-                  } catch {
-                      return providerRegistry.getDefaultProvider();
-                  }
-              })()
-            : providerRegistry.getDefaultProvider();
+        const provider = await resolveProviderForFile(id);
 
         await Promise.all([
             provider.del(id).catch((e) => {
@@ -212,6 +211,10 @@ export const storage = {
 
     incrementDownloadCount(id: string): Promise<number> {
         return redis.hIncrBy(id, 'dl', 1);
+    },
+
+    rotateNonce(id: string, nonce: string): Promise<boolean> {
+        return redis.rotateNonce(id, nonce);
     },
 
     getTTL(id: string): Promise<number> {

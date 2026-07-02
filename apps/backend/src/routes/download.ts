@@ -4,6 +4,48 @@ import { downloadLogger as logger } from '../logger';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
 import { storage } from '../storage';
 
+/**
+ * Schedule deletion of a limit-reached file after a 5-minute grace window.
+ * The timer re-checks the limit at fire time (the owner may have raised
+ * dlimit via /params meanwhile). As a restart-surviving backstop the metadata
+ * TTL is capped to the same window, preserving the original expiry in an
+ * `expiresAt` field so /params can restore it.
+ */
+function scheduleLimitDeletion(id: string): void {
+    setTimeout(() => {
+        storage
+            .getMetadata(id)
+            .then((current) => {
+                if (!current || current.dl < current.dlimit) {
+                    return;
+                }
+                return storage.del(id);
+            })
+            .catch((e) => {
+                captureError(e, {
+                    operation: 'download.delayed-delete',
+                    extra: { id },
+                    level: 'warning',
+                });
+            });
+    }, 300000); // 5 min delay
+    storage
+        .getTTL(id)
+        .then(async (ttl) => {
+            if (ttl > 300) {
+                await storage.setField(
+                    id,
+                    'expiresAt',
+                    String(Math.floor(Date.now() / 1000) + ttl),
+                );
+                await storage.redis.expire(id, 300);
+            }
+        })
+        .catch(() => {
+            // Non-critical — natural TTL still applies
+        });
+}
+
 export const downloadRoutes = new Elysia()
     // Direct download for unencrypted single files (redirects to S3)
     .get(
@@ -63,10 +105,21 @@ export const downloadRoutes = new Elysia()
                 return { error: 'Download limit reached' };
             }
 
+            // Sign before incrementing so a signing failure doesn't burn a credit
+            const signedUrl = await storage.getSignedDownloadUrl(id, filename);
+            if (!signedUrl) {
+                captureError(new Error('Failed to generate signed download URL'), {
+                    operation: 'download.sign-url',
+                    extra: { id, filename },
+                });
+                set.status = 500;
+                return { error: 'Failed to generate download URL' };
+            }
+
             // Increment counter before redirect
             const newDl = await storage.incrementDownloadCount(id);
 
-            // Check if limit exceeded after increment
+            // Check if limit exceeded after increment (concurrent downloads)
             if (newDl > metadata.dlimit) {
                 set.status = 410;
                 return { error: 'Download limit reached' };
@@ -78,18 +131,7 @@ export const downloadRoutes = new Elysia()
                     { id, dl: newDl, dlimit: metadata.dlimit },
                     'Download limit reached, scheduling deletion',
                 );
-                setTimeout(() => storage.del(id), 300000); // 5 min delay
-            }
-
-            // Get signed URL with filename for Content-Disposition
-            const signedUrl = await storage.getSignedDownloadUrl(id, filename);
-            if (!signedUrl) {
-                captureError(new Error('Failed to generate signed download URL'), {
-                    operation: 'download.sign-url',
-                    extra: { id, filename },
-                });
-                set.status = 500;
-                return { error: 'Failed to generate download URL' };
+                scheduleLimitDeletion(id);
             }
 
             // Redirect to S3
@@ -127,6 +169,17 @@ export const downloadRoutes = new Elysia()
                     set.status = 401;
                     return { error: 'Authentication required' };
                 }
+            }
+
+            // At the limit, return counts without minting a URL (200, not 410):
+            // clients old and new gate on dl >= dlimit themselves, and older
+            // deployed frontends treat any non-ok response as "status unknown"
+            if (metadata.dl >= metadata.dlimit) {
+                return {
+                    useSignedUrl: false,
+                    dl: metadata.dl,
+                    dlimit: metadata.dlimit,
+                };
             }
 
             // Get pre-signed download URL
@@ -195,6 +248,11 @@ export const downloadRoutes = new Elysia()
                 }
             }
 
+            if (metadata.dl >= metadata.dlimit) {
+                set.status = 410;
+                return { error: 'Download limit reached' };
+            }
+
             const stream = await storage.getStream(id);
             if (!stream) {
                 set.status = 404;
@@ -235,6 +293,11 @@ export const downloadRoutes = new Elysia()
                     set.status = 401;
                     return { error: 'Authentication required' };
                 }
+            }
+
+            if (metadata.dl >= metadata.dlimit) {
+                set.status = 410;
+                return { error: 'Download limit reached' };
             }
 
             const stream = await storage.getStream(id);
@@ -285,11 +348,10 @@ export const downloadRoutes = new Elysia()
 
             // Check if download limit reached
             if (newDl >= metadata.dlimit) {
-                console.log('Download limit reached, deleting file:', {
-                    id,
-                    dl: newDl,
-                    dlimit: metadata.dlimit,
-                });
+                logger.info(
+                    { id, dl: newDl, dlimit: metadata.dlimit },
+                    'Download limit reached, deleting file',
+                );
                 try {
                     await storage.del(id);
                 } catch (e) {
@@ -298,6 +360,11 @@ export const downloadRoutes = new Elysia()
                         extra: { id, dl: newDl, dlimit: metadata.dlimit },
                     });
                 }
+                // Backstop: if the delete failed, cap the metadata TTL so
+                // consumed metadata cannot outlive the failure by days
+                storage.redis.expire(id, 300).catch(() => {
+                    // Non-critical — natural TTL still applies
+                });
                 return { deleted: true, dl: newDl, dlimit: metadata.dlimit };
             }
 
@@ -499,6 +566,20 @@ export const downloadRoutes = new Elysia()
 
             if (dlimit !== undefined) {
                 await storage.setField(id, 'dlimit', dlimit.toString());
+
+                // If the limit-reached TTL backstop was applied and this raise
+                // makes the file downloadable again, restore the original expiry
+                const metadata = await storage.getMetadata(id);
+                if (metadata && metadata.dl < dlimit) {
+                    const expiresAt = await storage.getField(id, 'expiresAt');
+                    if (expiresAt) {
+                        const remaining = parseInt(expiresAt, 10) - Math.floor(Date.now() / 1000);
+                        if (remaining > 0) {
+                            await storage.redis.expire(id, remaining);
+                        }
+                        await storage.redis.hDel(id, 'expiresAt');
+                    }
+                }
             }
 
             return { success: true };
@@ -581,6 +662,12 @@ export const downloadRoutes = new Elysia()
                 return { error: 'Invalid owner token' };
             }
 
+            const metadata = await storage.getMetadata(id);
+            if (!metadata?.encrypted) {
+                set.status = 400;
+                return { error: 'Password protection is only supported for encrypted files' };
+            }
+
             await storage.setField(id, 'auth', auth);
 
             return { success: true };
@@ -590,7 +677,7 @@ export const downloadRoutes = new Elysia()
                 tags: ['File Management'],
                 summary: 'Set file password',
                 description:
-                    'Sets or updates the authentication password for a file. Requires the owner token.',
+                    'Sets or updates the authentication password for a file. Only supported for encrypted files — unencrypted files skip auth entirely, so a password would never be enforced. Requires the owner token.',
             },
             body: t.Object({
                 owner_token: t.String(),
@@ -598,6 +685,7 @@ export const downloadRoutes = new Elysia()
             }),
             response: {
                 200: t.Object({ success: t.Boolean() }),
+                400: t.Object({ error: t.String() }),
                 401: t.Object({ error: t.String() }),
             },
         },

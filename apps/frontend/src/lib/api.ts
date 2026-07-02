@@ -10,6 +10,7 @@ import {
     calculateEncryptedSize,
     createDecryptionStream,
     createEncryptionStream,
+    ECE_ENCRYPTED_RECORD_SIZE,
     ECE_RECORD_SIZE,
     Keychain,
 } from './crypto';
@@ -27,7 +28,7 @@ import {
     createZipFromUploadFiles,
     type FileInfo,
     generateZipFilename,
-    sliceConcatenatedData,
+    sliceConcatenatedBlob,
 } from './zip';
 
 export { FileReadError } from './errors';
@@ -43,6 +44,11 @@ const MAX_RETRIES = 10;
 const RETRY_DELAY_BASE = 2000; // 2 seconds
 const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
+
+// Download retry configuration
+const DOWNLOAD_MAX_RETRIES = 5;
+const DOWNLOAD_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
+const DOWNLOAD_STALL_TIMEOUT = 60_000; // Abort download attempt if no bytes for 60 seconds
 
 // Preflight speed test configuration
 const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
@@ -392,6 +398,21 @@ async function uploadMultipartSliced(
     };
 }
 
+/**
+ * Part size actually used when cutting the stream into parts.
+ * Encrypted parts are cut on ECE record boundaries so every non-trailing part
+ * holds a whole number of records — required for resume to re-encrypt the
+ * remainder with a consistent record counter. The backend allocates parts
+ * based on the raw partSize; since the effective size is <= partSize the last
+ * allocated part absorbs the residual bytes.
+ */
+export function getEffectivePartSize(partSize: number, encrypted: boolean): number {
+    if (!encrypted) {
+        return partSize;
+    }
+    return Math.floor(partSize / ECE_ENCRYPTED_RECORD_SIZE) * ECE_ENCRYPTED_RECORD_SIZE;
+}
+
 function getPreferredPartSize(speed: number): number | undefined {
     if (speed === 0) {
         return undefined;
@@ -579,30 +600,32 @@ export async function getMetadata(id: string, keychain?: Keychain) {
     // biome-ignore lint/suspicious/noImplicitAnyLet: metadata shape is dynamic (decrypted JSON or parsed base64)
     let metadata;
 
-    console.log('[getMetadata] Response:', {
-        encrypted: data.encrypted,
-        hasKeychain: !!keychain,
-        metadataLength: data.metadata?.length,
-        metadataPreview: data.metadata?.substring(0, 50),
-    });
+    if (data.encrypted !== false && !keychain) {
+        const err = new Error(
+            'This file is encrypted, but the link is missing its decryption key. Ask the sender for the complete link (including everything after #).',
+        );
+        err.name = 'MissingKeyError';
+        throw err;
+    }
 
     if (data.encrypted !== false && keychain) {
         // Encrypted metadata - decrypt it
-        console.log('[getMetadata] Decrypting metadata');
         try {
             metadata = await keychain.decryptMetadata(b64ToArray(data.metadata));
-            console.log('[getMetadata] Decryption successful:', metadata);
         } catch (e) {
             console.error('[getMetadata] Decryption failed:', e);
             captureError(e, {
                 operation: 'metadata.decrypt',
                 extra: { fileId: id, metadataLength: data.metadata?.length },
             });
-            throw e;
+            const err = new Error(
+                'The decryption key in this link is incorrect or incomplete. Ask the sender to re-copy the full link.',
+            );
+            err.name = 'InvalidKeyError';
+            throw err;
         }
     } else {
         // Unencrypted metadata - decode from base64
-        console.log('[getMetadata] Decoding unencrypted metadata');
         try {
             // Handle URL-safe base64 by converting to standard base64
             const standardB64 = data.metadata.replace(/-/g, '+').replace(/_/g, '/');
@@ -617,7 +640,6 @@ export async function getMetadata(id: string, keychain?: Keychain) {
                 // Fallback to direct parse
                 metadata = JSON.parse(decoded);
             }
-            console.log('[getMetadata] Decode successful:', metadata);
         } catch (e) {
             console.error('[getMetadata] Decode failed:', e, 'metadata:', data.metadata);
             captureError(e, {
@@ -685,14 +707,19 @@ export async function getFileInfo(id: string, ownerToken: string): Promise<FileI
 /**
  * Get download status (dl, dlimit).
  * Encrypted files require a keychain for authentication.
+ * 'gone' means the file no longer exists (404/410); 'error' covers network
+ * failures and other non-ok responses so the UI can distinguish transient
+ * failures from an exhausted download limit.
  */
+export type DownloadStatusResult =
+    | { status: 'ok'; dl: number; dlimit: number }
+    | { status: 'gone' }
+    | { status: 'error' };
+
 export async function getDownloadStatus(
     id: string,
     keychain?: Keychain | null,
-): Promise<{
-    dl: number;
-    dlimit: number;
-} | null> {
+): Promise<DownloadStatusResult> {
     try {
         const headers: Record<string, string> = {};
         if (keychain) {
@@ -714,13 +741,25 @@ export async function getDownloadStatus(
             }
         }
 
+        // Harvest the rotated nonce from the final response (successful or not)
+        if (keychain) {
+            const wwwAuth = response.headers.get('WWW-Authenticate');
+            const nonce = wwwAuth?.split(' ')[1];
+            if (nonce) {
+                keychain.nonce = nonce;
+            }
+        }
+
+        if (response.status === 404 || response.status === 410) {
+            return { status: 'gone' };
+        }
         if (!response.ok) {
-            return null;
+            return { status: 'error' };
         }
         const data = await response.json();
-        return { dl: data.dl, dlimit: data.dlimit };
+        return { status: 'ok', dl: data.dl, dlimit: data.dlimit };
     } catch {
-        return null;
+        return { status: 'error' };
     }
 }
 
@@ -1033,11 +1072,13 @@ export async function uploadFiles(
             // reconstructed from the original files on resume.
             const canResume = !isMultiFile;
             if (canResume) {
-                // Calculate plaintext bytes per encrypted part
-                // Each ECE record: plaintext ECE_RECORD_SIZE → encrypted ECE_RECORD_SIZE + 17 (tag + delimiter)
-                const encryptedRecordSize = ECE_RECORD_SIZE + 17;
+                // Calculate plaintext bytes per encrypted part. Encrypted parts are
+                // cut on ECE record boundaries (see getEffectivePartSize), so each
+                // non-trailing part holds exactly this many plaintext bytes.
                 const plaintextPartSize = encrypted
-                    ? Math.floor((uploadInfo.partSize || 0) / encryptedRecordSize) * ECE_RECORD_SIZE
+                    ? (getEffectivePartSize(uploadInfo.partSize || 0, true) /
+                          ECE_ENCRYPTED_RECORD_SIZE) *
+                      ECE_RECORD_SIZE
                     : uploadInfo.partSize || 0;
                 const persistState: PersistedUpload = {
                     fileId: uploadInfo.id,
@@ -1096,6 +1137,7 @@ export async function uploadFiles(
                         updateProgress(1, part1Bytes);
                     },
                     canResume ? uploadInfo.id : undefined,
+                    encrypted,
                 );
             }
 
@@ -1261,8 +1303,15 @@ export async function resumeUpload(
     }
     const trulyCompletedParts = sortedCompleted.slice(0, contiguousCount);
 
-    // Use plaintext part size for file offset (encrypted part size includes ECE overhead)
-    const plaintextPartSize = state.plaintextPartSize || state.partSize;
+    // Use plaintext part size for file offset (encrypted part size includes ECE
+    // overhead). Derive from the effective (record-aligned) part size so the skip
+    // math is exactly consistent with how the parts were originally cut.
+    const recordsPerPart = state.encrypted
+        ? getEffectivePartSize(state.partSize, true) / ECE_ENCRYPTED_RECORD_SIZE
+        : 0;
+    const plaintextPartSize = state.encrypted
+        ? recordsPerPart * ECE_RECORD_SIZE
+        : state.plaintextPartSize || state.partSize;
     const skipBytes = contiguousCount * plaintextPartSize;
 
     // Request new pre-signed URLs for remaining parts
@@ -1291,10 +1340,9 @@ export async function resumeUpload(
     const remainingBlob = file.slice(skipBytes);
     let stream: ReadableStream<Uint8Array> = remainingBlob.stream();
 
-    // If encrypted, wrap with encryption stream starting at the correct counter
+    // If encrypted, wrap with encryption stream starting at the correct counter.
+    // Each completed part held exactly recordsPerPart whole ECE records.
     if (state.encrypted && keychain) {
-        // Each plaintext part contains ceil(plaintextPartSize / ECE_RECORD_SIZE) records
-        const recordsPerPart = Math.ceil(plaintextPartSize / ECE_RECORD_SIZE);
         const initialCounter = contiguousCount * recordsPerPart;
         stream = stream.pipeThrough(createEncryptionStream(keychain, initialCounter));
     }
@@ -1397,6 +1445,7 @@ export async function resumeUpload(
             totalRetryCount++;
         },
         state.fileId,
+        state.encrypted,
     );
 
     if ('fallbackBlob' in multipartResult) {
@@ -1610,11 +1659,16 @@ async function uploadMultipartStream(
     totalFileSize?: number,
     onRetry?: () => void,
     fileId?: string,
+    encrypted = false,
 ): Promise<MultipartStreamResult> {
     const { parts, partSize } = uploadInfo;
     if (!parts || !partSize) {
         throw new Error('Invalid upload info');
     }
+
+    // Cut encrypted parts on ECE record boundaries so resume can skip whole
+    // records; the last allocated part absorbs the residual bytes.
+    const effectivePartSize = getEffectivePartSize(partSize, encrypted);
 
     const MIN_PART = UPLOAD_LIMITS.MIN_PART_SIZE;
     // Safety cap: S3 max single-part size (5GB) — prevents unbounded memory if stream far exceeds estimate
@@ -1766,23 +1820,23 @@ async function uploadMultipartStream(
                 bufferedItem = { blob, partNum, url };
                 return;
             }
-            // Validate: all non-trailing parts must be exactly partSize for R2 compliance
-            if (bufferedItem.blob.size !== partSize) {
+            // Validate: all non-trailing parts must be exactly effectivePartSize for R2 compliance
+            if (bufferedItem.blob.size !== effectivePartSize) {
                 const diagnostic = {
                     partNumber: bufferedItem.partNum,
                     actualSize: bufferedItem.blob.size,
-                    expectedSize: partSize,
+                    expectedSize: effectivePartSize,
                     uploadId: uploadInfo.uploadId,
                     totalParts: parts.length,
                     totalFileSize,
                 };
                 console.error(
-                    `[Upload] Non-trailing part ${bufferedItem.partNum} size mismatch: ${bufferedItem.blob.size} !== ${partSize}`,
+                    `[Upload] Non-trailing part ${bufferedItem.partNum} size mismatch: ${bufferedItem.blob.size} !== ${effectivePartSize}`,
                     diagnostic,
                 );
                 captureError(
                     new Error(
-                        `Non-trailing part size mismatch: part ${bufferedItem.partNum} is ${bufferedItem.blob.size} bytes, expected ${partSize}`,
+                        `Non-trailing part size mismatch: part ${bufferedItem.partNum} is ${bufferedItem.blob.size} bytes, expected ${effectivePartSize}`,
                     ),
                     {
                         operation: 'upload.part-size-validation',
@@ -1822,7 +1876,7 @@ async function uploadMultipartStream(
             // Read data for this part
             // For the last allocated part, drain ALL remaining stream data (trailing part absorbs excess)
             const isLastAllocatedPart = currentPartIndex >= parts.length - 1;
-            while (!streamDone && (isLastAllocatedPart || currentPartSize < partSize)) {
+            while (!streamDone && (isLastAllocatedPart || currentPartSize < effectivePartSize)) {
                 // Safety cap: prevent unbounded memory on the trailing part
                 if (isLastAllocatedPart && currentPartSize >= MAX_PART_SIZE) {
                     console.error(
@@ -1848,10 +1902,10 @@ async function uploadMultipartStream(
                     continue;
                 }
 
-                const wouldExceed = currentPartSize + value.length > partSize;
+                const wouldExceed = currentPartSize + value.length > effectivePartSize;
 
                 if (wouldExceed && !isLastAllocatedPart) {
-                    const remainingSpace = partSize - currentPartSize;
+                    const remainingSpace = effectivePartSize - currentPartSize;
                     if (remainingSpace > 0) {
                         currentPartData.push(value.slice(0, remainingSpace));
                         currentPartSize += remainingSpace;
@@ -2347,6 +2401,331 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
 }
 
 /**
+ * Report a completed download to the server so download limits are enforced.
+ * Mirrors getMetadata's 401 challenge-response pattern, retries once on pure
+ * network errors, and never throws — returns false on failure.
+ */
+export async function reportDownloadComplete(
+    id: string,
+    keychain: Keychain | null,
+): Promise<boolean> {
+    const post = async (): Promise<Response> => {
+        const headers: Record<string, string> = {};
+        if (keychain) {
+            headers.Authorization = await keychain.authHeader();
+        }
+        return fetch(`${API_BASE_URL}/download/complete/${id}`, { method: 'POST', headers });
+    };
+
+    let response: Response;
+    try {
+        // No blind retry on network error: the server may have processed the
+        // increment before the response was lost, and /download/complete is
+        // not idempotent — a retry could double-count the download.
+        response = await post();
+
+        // Handle 401 challenge-response: harvest nonce, re-sign, retry once
+        // (safe: a 401 response proves the counter was not incremented)
+        if (response.status === 401 && keychain) {
+            const wwwAuth = response.headers.get('WWW-Authenticate');
+            const nonce = wwwAuth?.split(' ')[1];
+            if (nonce) {
+                keychain.nonce = nonce;
+                response = await post();
+            }
+        }
+    } catch (e) {
+        captureError(e, {
+            operation: 'download.complete',
+            extra: { fileId: id },
+            level: 'warning',
+        });
+        return false;
+    }
+
+    // Harvest the rotated nonce from the final response
+    if (keychain) {
+        const wwwAuth = response.headers.get('WWW-Authenticate');
+        const nonce = wwwAuth?.split(' ')[1];
+        if (nonce) {
+            keychain.nonce = nonce;
+        }
+    }
+
+    if (!response.ok) {
+        captureError(new Error(`Failed to report download complete: HTTP ${response.status}`), {
+            operation: 'download.complete',
+            extra: { fileId: id, httpStatus: response.status },
+            level: 'warning',
+        });
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Fetch the download URL info for a file, handling the 401 challenge-response
+ * pattern for encrypted files. Throws on non-ok responses.
+ */
+async function fetchDownloadUrlInfo(
+    id: string,
+    keychain: Keychain | null,
+): Promise<{ useSignedUrl: boolean; url: string; dl?: number; dlimit?: number }> {
+    const headers: Record<string, string> = {};
+    if (keychain) {
+        headers.Authorization = await keychain.authHeader();
+    }
+
+    let response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+
+    // Handle 401 challenge-response: extract nonce and retry
+    if (response.status === 401 && keychain) {
+        const authHeader = response.headers.get('WWW-Authenticate');
+        if (authHeader) {
+            const nonce = authHeader.split(' ')[1];
+            if (nonce) {
+                keychain.nonce = nonce;
+                headers.Authorization = await keychain.authHeader();
+                response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+            }
+        }
+    }
+
+    // Extract nonce for future requests
+    if (keychain) {
+        const authHeader = response.headers.get('WWW-Authenticate');
+        if (authHeader) {
+            const nonce = authHeader.split(' ')[1];
+            if (nonce) {
+                keychain.nonce = nonce;
+            }
+        }
+    }
+
+    if (!response.ok) {
+        const err = new Error(`HTTP ${response.status}`);
+        captureError(err, {
+            operation: 'download.url-fetch',
+            extra: { fileId: id, httpStatus: response.status, encrypted: !!keychain },
+        });
+        throw err;
+    }
+
+    return response.json();
+}
+
+class PermanentDownloadError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'PermanentDownloadError';
+    }
+}
+
+export interface ResilientDownloadRequest {
+    url: string;
+    headers?: Record<string, string>;
+}
+
+export interface ResilientDownloadOptions {
+    /**
+     * Returns the URL + headers for the object body. Called with
+     * refreshUrl=true when the current signed URL was rejected as
+     * expired (403) and a fresh one should be requested.
+     */
+    getRequest: (refreshUrl: boolean) => Promise<ResilientDownloadRequest>;
+    /**
+     * Invoked with every response received while (re)opening an attempt,
+     * before status handling — lets the caller harvest rotated auth nonces
+     * from WWW-Authenticate so re-signed retries stay valid.
+     */
+    onResponse?: (response: Response) => void;
+    /** Already-fetched response to consume for the first attempt */
+    firstResponse?: Response;
+    maxRetries?: number;
+    retryDelays?: number[];
+    stallTimeout?: number;
+}
+
+/**
+ * Produce a continuous ReadableStream over a remote object that survives
+ * mid-stream network failures. On failure it retries with exponential backoff
+ * (waiting for connectivity when offline) and resumes from the total bytes
+ * already delivered via a Range request. Servers without range support (200
+ * response) have the already-received prefix discarded. A stall detector
+ * aborts the in-flight fetch if no bytes arrive within stallTimeout.
+ * The retry budget resets whenever an attempt delivers new bytes.
+ */
+export function createResilientDownloadStream(
+    options: ResilientDownloadOptions,
+): ReadableStream<Uint8Array> {
+    const maxRetries = options.maxRetries ?? DOWNLOAD_MAX_RETRIES;
+    const retryDelays = options.retryDelays ?? DOWNLOAD_RETRY_DELAYS;
+    const stallTimeout = options.stallTimeout ?? DOWNLOAD_STALL_TIMEOUT;
+
+    let received = 0;
+    let failures = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let abortController: AbortController | null = null;
+    let discardRemaining = 0;
+    let firstResponse = options.firstResponse ?? null;
+
+    const dropAttempt = () => {
+        reader?.cancel().catch(() => {
+            // Intentionally ignored — attempt is being discarded
+        });
+        reader = null;
+        abortController?.abort();
+        abortController = null;
+    };
+
+    const classifyResponse = (response: Response): void => {
+        if (response.status === 404 || response.status === 410) {
+            throw new PermanentDownloadError(`Download failed: HTTP ${response.status}`);
+        }
+    };
+
+    const openAttempt = async (): Promise<void> => {
+        discardRemaining = 0;
+        abortController = new AbortController();
+
+        if (received === 0 && firstResponse) {
+            const response = firstResponse;
+            firstResponse = null;
+            if (!response.body) {
+                throw new Error('No response body');
+            }
+            reader = response.body.getReader();
+            return;
+        }
+
+        const doFetch = async (refreshUrl: boolean): Promise<Response> => {
+            const request = await options.getRequest(refreshUrl);
+            const headers: Record<string, string> = { ...request.headers };
+            if (received > 0) {
+                headers.Range = `bytes=${received}-`;
+            }
+            return fetch(request.url, { headers, signal: abortController?.signal });
+        };
+
+        let response = await doFetch(false);
+        options.onResponse?.(response);
+        if (response.status === 403) {
+            // Signed URL expired — request a fresh one and retry immediately
+            response = await doFetch(true);
+            options.onResponse?.(response);
+        } else if (response.status === 401) {
+            // Stale auth nonce on the authenticated fallback path — the
+            // challenge was just harvested by onResponse; re-sign and retry
+            response = await doFetch(false);
+            options.onResponse?.(response);
+        }
+        classifyResponse(response);
+
+        if (received > 0) {
+            if (response.status === 206) {
+                const contentRange = response.headers.get('Content-Range') || '';
+                const startMatch = /^bytes (\d+)-/.exec(contentRange);
+                const start = startMatch ? parseInt(startMatch[1], 10) : -1;
+                if (start !== received) {
+                    throw new Error(
+                        `Range resume mismatch: requested offset ${received}, got Content-Range "${contentRange}"`,
+                    );
+                }
+            } else if (response.status === 200) {
+                // Server ignored the Range header — discard the prefix we already have
+                discardRemaining = received;
+            } else {
+                throw new Error(`Range resume failed: HTTP ${response.status}`);
+            }
+        } else if (!response.ok) {
+            throw new Error(`Download failed: HTTP ${response.status}`);
+        }
+
+        if (!response.body) {
+            throw new Error('No response body');
+        }
+        reader = response.body.getReader();
+    };
+
+    // Race a read against the stall timer; on stall, abort the in-flight
+    // fetch so the read rejects and the attempt is retried.
+    const readWithStallGuard = async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+        if (!reader) {
+            throw new Error('No active download attempt');
+        }
+        const controller = abortController;
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([
+                reader.read(),
+                new Promise<never>((_, reject) => {
+                    stallTimer = setTimeout(() => {
+                        controller?.abort();
+                        reject(new Error('Download stalled'));
+                    }, stallTimeout);
+                }),
+            ]);
+        } finally {
+            clearTimeout(stallTimer);
+        }
+    };
+
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            while (true) {
+                try {
+                    if (!reader) {
+                        await openAttempt();
+                    }
+                    const { done, value } = await readWithStallGuard();
+                    if (done || !value) {
+                        controller.close();
+                        return;
+                    }
+
+                    let chunk = value;
+                    if (discardRemaining > 0) {
+                        if (chunk.length <= discardRemaining) {
+                            discardRemaining -= chunk.length;
+                            continue;
+                        }
+                        chunk = chunk.subarray(discardRemaining);
+                        discardRemaining = 0;
+                    }
+                    if (chunk.length === 0) {
+                        continue;
+                    }
+
+                    received += chunk.length;
+                    failures = 0; // Reset the retry budget on forward progress
+                    controller.enqueue(chunk);
+                    return;
+                } catch (e) {
+                    dropAttempt();
+                    if (e instanceof PermanentDownloadError) {
+                        throw e;
+                    }
+                    if (failures >= maxRetries) {
+                        throw e instanceof Error ? e : new Error(String(e));
+                    }
+                    const delay = retryDelays[Math.min(failures, retryDelays.length - 1)];
+                    failures++;
+                    console.warn(
+                        `[Download] Stream attempt failed (${failures}/${maxRetries}), resuming from byte ${received} in ${delay}ms:`,
+                        e,
+                    );
+                    await waitForOnline();
+                    await new Promise((resolve) => setTimeout(resolve, delay));
+                }
+            }
+        },
+        cancel() {
+            dropAttempt();
+        },
+    });
+}
+
+/**
  * Download a file
  */
 export type DownloadPhase = 'downloading' | 'decrypting' | 'finalizing';
@@ -2381,47 +2760,7 @@ export async function downloadFile(
     });
 
     // Get download URL
-    const headers: Record<string, string> = {};
-    if (keychain) {
-        headers.Authorization = await keychain.authHeader();
-    }
-
-    let urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
-
-    // Handle 401 challenge-response: extract nonce and retry
-    if (urlResponse.status === 401 && keychain) {
-        const authHeader = urlResponse.headers.get('WWW-Authenticate');
-        if (authHeader) {
-            const nonce = authHeader.split(' ')[1];
-            if (nonce) {
-                keychain.nonce = nonce;
-                headers.Authorization = await keychain.authHeader();
-                urlResponse = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
-            }
-        }
-    }
-
-    // Extract nonce for future requests
-    if (keychain) {
-        const authHeader = urlResponse.headers.get('WWW-Authenticate');
-        if (authHeader) {
-            const nonce = authHeader.split(' ')[1];
-            if (nonce) {
-                keychain.nonce = nonce;
-            }
-        }
-    }
-
-    if (!urlResponse.ok) {
-        const err = new Error(`HTTP ${urlResponse.status}`);
-        captureError(err, {
-            operation: 'download.url-fetch',
-            extra: { fileId: id, httpStatus: urlResponse.status, encrypted: !!keychain },
-        });
-        throw err;
-    }
-
-    const urlData = await urlResponse.json();
+    const urlData = await fetchDownloadUrlInfo(id, keychain);
 
     dlLog('Got download URL', {
         useSignedUrl: urlData.useSignedUrl,
@@ -2429,7 +2768,8 @@ export async function downloadFile(
     });
 
     // Download from signed URL or stream
-    const downloadUrl = urlData.useSignedUrl ? urlData.url : `${API_BASE_URL}/download/${id}`;
+    let downloadUrl = urlData.useSignedUrl ? urlData.url : `${API_BASE_URL}/download/${id}`;
+    let usingSignedUrl = urlData.useSignedUrl;
     const downloadHeaders: Record<string, string> = {};
 
     if (!urlData.useSignedUrl && keychain) {
@@ -2484,7 +2824,14 @@ export async function downloadFile(
         throw new Error('No response body');
     }
 
-    const total = contentLength || metadata.size || 0;
+    // Progress total is in wire bytes: prefer Content-Length; otherwise derive
+    // the encrypted wire size from the plaintext size rather than conflating them.
+    const total =
+        contentLength > 0
+            ? contentLength
+            : metadata.encrypted
+              ? calculateEncryptedSize(metadata.size)
+              : metadata.size;
     const files = metadata.files as FileInfo[] | undefined;
     const isLegacyMultiFile = !metadata.zipped && files && files.length > 1;
 
@@ -2519,7 +2866,9 @@ export async function downloadFile(
     const progressStream = new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
             loaded += chunk.length;
-            onProgress?.(loaded, total);
+            if (total > 0) {
+                onProgress?.(Math.min(loaded, total), total);
+            }
 
             const now = Date.now();
             if (now - lastLogTime > 5000) {
@@ -2538,6 +2887,32 @@ export async function downloadFile(
         },
     });
 
+    // Resilient body transfer: survives mid-stream network failures by
+    // resuming from the received offset (refreshing the signed URL if expired).
+    const bodyStream = createResilientDownloadStream({
+        firstResponse: response,
+        getRequest: async (refreshUrl) => {
+            if (refreshUrl) {
+                const fresh = await fetchDownloadUrlInfo(id, keychain);
+                usingSignedUrl = fresh.useSignedUrl;
+                downloadUrl = fresh.useSignedUrl ? fresh.url : `${API_BASE_URL}/download/${id}`;
+            }
+            const requestHeaders: Record<string, string> = {};
+            if (!usingSignedUrl && keychain) {
+                requestHeaders.Authorization = await keychain.authHeader();
+            }
+            return { url: downloadUrl, headers: requestHeaders };
+        },
+        onResponse: (res) => {
+            if (!usingSignedUrl && keychain) {
+                const nonce = res.headers.get('WWW-Authenticate')?.split(' ')[1];
+                if (nonce) {
+                    keychain.nonce = nonce;
+                }
+            }
+        },
+    });
+
     let outputStream: ReadableStream<Uint8Array>;
 
     // In the streaming path, decryption happens concurrently with download —
@@ -2545,9 +2920,9 @@ export async function downloadFile(
     // emitted by the legacy multi-file fallback where buffered decryption is required.
     if (metadata.encrypted && keychain) {
         const decryptStream = createDecryptionStream(keychain);
-        outputStream = response.body.pipeThrough(progressStream).pipeThrough(decryptStream);
+        outputStream = bodyStream.pipeThrough(progressStream).pipeThrough(decryptStream);
     } else {
-        outputStream = response.body.pipeThrough(progressStream);
+        outputStream = bodyStream.pipeThrough(progressStream);
     }
 
     // Collect decrypted output into intermediate Blobs every 64MB.
@@ -2607,20 +2982,44 @@ export async function downloadFile(
         speed: `${(loaded / (1024 * 1024) / (streamElapsed / 1000)).toFixed(1)} MB/s`,
     });
 
+    // Integrity checks: fail loudly on truncation instead of returning a
+    // partial file and burning a download credit.
+    if (contentLength > 0 && loaded !== contentLength) {
+        throw new Error(
+            `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
+        );
+    }
+    // Plaintext size can legitimately differ from metadata (iOS lazily
+    // transcodes HEIC/HEVC after File.size is read), so a mismatch here is
+    // telemetry, not failure — real truncation is caught by the
+    // Content-Length check above and by ECE record authentication.
+    const isSinglePayload = !metadata.zipped && (!files || files.length <= 1);
+    if (isSinglePayload && metadata.size > 0) {
+        const expectedPlaintext = metadata.size;
+        const actualPlaintext = metadata.encrypted ? decryptedSize : loaded;
+        if (actualPlaintext !== expectedPlaintext) {
+            captureError(
+                new Error(
+                    `Download size mismatch: metadata says ${expectedPlaintext} bytes, received ${actualPlaintext}`,
+                ),
+                {
+                    operation: 'download.size-mismatch',
+                    extra: {
+                        fileId: id,
+                        expectedPlaintext,
+                        actualPlaintext,
+                        encrypted: metadata.encrypted,
+                    },
+                    level: 'warning',
+                },
+            );
+        }
+    }
+
     // Report download complete
     onPhase?.('finalizing');
     dlLog('Reporting download complete to server...');
-    await fetch(`${API_BASE_URL}/download/complete/${id}`, {
-        method: 'POST',
-        headers: keychain ? { Authorization: await keychain.authHeader() } : {},
-    }).catch((e) => {
-        console.warn('[Download] Failed to report download complete:', e);
-        captureError(e, {
-            operation: 'download.complete',
-            extra: { fileId: id },
-            level: 'warning',
-        });
-    });
+    await reportDownloadComplete(id, keychain);
 
     if (metadata.zipped) {
         dlLog('Returning zipped file', {
@@ -2647,8 +3046,45 @@ export async function downloadFile(
 }
 
 /**
+ * Consolidate a stream into one Blob via intermediate 64MB Blobs so only a
+ * bounded window of Uint8Array chunks is live in JS heap at a time (browsers
+ * back large Blobs with disk).
+ */
+async function collectStreamToBlob(
+    stream: ReadableStream<Uint8Array>,
+    onChunk?: (bytes: number) => void,
+): Promise<Blob> {
+    const CONSOLIDATION_SIZE = 64 * 1024 * 1024;
+    const blobs: Blob[] = [];
+    let pending: Uint8Array[] = [];
+    let pendingSize = 0;
+
+    const reader = stream.getReader();
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+            break;
+        }
+        pending.push(value);
+        pendingSize += value.length;
+        onChunk?.(value.length);
+
+        if (pendingSize >= CONSOLIDATION_SIZE) {
+            blobs.push(new Blob(pending as BlobPart[]));
+            pending = [];
+            pendingSize = 0;
+        }
+    }
+    if (pending.length > 0) {
+        blobs.push(new Blob(pending as BlobPart[]));
+    }
+    return new Blob(blobs);
+}
+
+/**
  * Legacy fallback for multi-file downloads that weren't zipped at upload time.
- * Requires full buffering because sliceConcatenatedData needs the complete data.
+ * The concatenated payload is consolidated into disk-backed Blobs and sliced
+ * per-file with zero-copy Blob.slice to avoid multi-x heap peaks.
  */
 async function downloadFileLegacyMultiFile(
     id: string,
@@ -2677,66 +3113,52 @@ async function downloadFileLegacyMultiFile(
         throw new Error('No response body');
     }
 
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
+    const expectedPlaintext = files.reduce((sum, f) => sum + f.size, 0);
+    const total =
+        contentLength > 0
+            ? contentLength
+            : metadata.encrypted
+              ? calculateEncryptedSize(expectedPlaintext)
+              : expectedPlaintext;
+
     let loaded = 0;
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-            break;
+    const wireBlob = await collectStreamToBlob(response.body, (bytes) => {
+        loaded += bytes;
+        if (total > 0) {
+            onProgress?.(Math.min(loaded, total), total);
         }
-        chunks.push(value);
-        loaded += value.length;
-        onProgress?.(loaded, contentLength || metadata.size || loaded);
-    }
+    });
 
-    // Combine chunks
-    const data = new Uint8Array(loaded);
-    let offset = 0;
-    for (const chunk of chunks) {
-        data.set(chunk, offset);
-        offset += chunk.length;
+    if (contentLength > 0 && loaded !== contentLength) {
+        throw new Error(
+            `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
+        );
     }
 
     // Decrypt if needed
-    let decryptedData: Uint8Array;
+    let payloadBlob: Blob;
     if (metadata.encrypted && keychain) {
         onPhase?.('decrypting');
-        dlLog('Decrypting legacy multi-file data...', { size: data.length });
+        dlLog('Decrypting legacy multi-file data...', { size: wireBlob.size });
         const decryptStream = createDecryptionStream(keychain);
-        const decryptedResponse = new Response(
-            new ReadableStream({
-                start(controller) {
-                    controller.enqueue(data);
-                    controller.close();
-                },
-            }).pipeThrough(decryptStream),
-        );
-        decryptedData = new Uint8Array(await decryptedResponse.arrayBuffer());
+        payloadBlob = await collectStreamToBlob(wireBlob.stream().pipeThrough(decryptStream));
     } else {
-        decryptedData = data;
+        payloadBlob = wireBlob;
     }
-
-    onPhase?.('finalizing');
-    dlLog('Reporting download complete to server...');
-    await fetch(`${API_BASE_URL}/download/complete/${id}`, {
-        method: 'POST',
-        headers: keychain ? { Authorization: await keychain.authHeader() } : {},
-    }).catch((e) => {
-        console.warn('[Download] Failed to report download complete:', e);
-        captureError(e, {
-            operation: 'download.complete',
-            extra: { fileId: id },
-            level: 'warning',
-        });
-    });
 
     dlLog('Creating zip from legacy multi-file download', { fileCount: files.length });
     const zipStart = Date.now();
-    const fileSlices = sliceConcatenatedData(decryptedData, files);
+    // Legacy uploads can carry drifted metadata sizes (iOS lazy transcoding);
+    // deliver best-effort instead of failing the whole download.
+    const fileSlices = sliceConcatenatedBlob(payloadBlob, files, { strict: false });
     const zipBlob = await createZipFromFiles(fileSlices);
     dlLog('Legacy zip created', { elapsed: Date.now() - zipStart, zipSize: zipBlob.size });
+
+    // Report completion only after the failure-prone zip step succeeds so a
+    // zip failure doesn't burn a download credit.
+    onPhase?.('finalizing');
+    dlLog('Reporting download complete to server...');
+    await reportDownloadComplete(id, keychain);
 
     return {
         blob: zipBlob,

@@ -8,11 +8,20 @@ const mockRedis = {
     hGet: mock(() => Promise.resolve(null as string | null)),
     hGetAll: mock(() => Promise.resolve(null as Record<string, string> | null)),
     hDel: mock(() => Promise.resolve()),
+    hSetMultiple: mock(() => Promise.resolve()),
     expire: mock(() => Promise.resolve()),
     del: mock(() => Promise.resolve()),
     exists: mock(() => Promise.resolve(false)),
     ttl: mock(() => Promise.resolve(-1)),
     hIncrBy: mock(() => Promise.resolve(0)),
+    sAdd: mock(() => Promise.resolve()),
+    sMembers: mock(() => Promise.resolve([] as string[])),
+    sRem: mock(() => Promise.resolve()),
+    get: mock(() => Promise.resolve(null as string | null)),
+    set: mock(() => Promise.resolve()),
+    incrBy: mock(() => Promise.resolve(0)),
+    decrBy: mock(() => Promise.resolve(0)),
+    rotateNonce: mock(() => Promise.resolve(true)),
 };
 
 // --- Mock s3Storage ---
@@ -175,6 +184,9 @@ mock.module('../storage', () => ({
 mock.module('../storage/index', () => ({
     storage,
 }));
+
+// Real registry class, backed by the mocked redis/s3 modules above
+import { ProviderNotFoundError, ProviderRegistry } from '../storage/provider-registry';
 
 describe('storage.del', () => {
     beforeEach(() => {
@@ -502,6 +514,81 @@ describe('storage.ping', () => {
         const result = await storage.ping();
 
         expect(result).toEqual({ redis: false, s3: false });
+    });
+});
+
+describe('providerRegistry.getOrLoadProvider', () => {
+    const providerHash: Record<string, string> = {
+        id: 'r2-eu',
+        name: 'R2 EU',
+        bucket: 'bucket-eu',
+        endpoint: 'https://eu.example.com',
+        accessKeyId: 'AKIA1234EXAMPLE',
+        secretAccessKey: 'super-secret',
+        region: 'auto',
+        pathStyle: 'false',
+        isActive: 'false',
+        isDefault: 'false',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+
+    beforeEach(() => {
+        mockRedis.hGetAll.mockReset();
+        mockRedis.sRem.mockReset();
+        mockRedis.sRem.mockResolvedValue(undefined);
+    });
+
+    it('should load an uncached provider from Redis on miss', async () => {
+        const registry = new ProviderRegistry();
+        mockRedis.hGetAll.mockResolvedValue(providerHash);
+
+        const instance = await registry.getOrLoadProvider('r2-eu');
+
+        expect(instance).toBeDefined();
+        expect(mockRedis.hGetAll).toHaveBeenCalledWith('provider:r2-eu');
+        expect(registry.getProvider('r2-eu')).toBe(instance);
+    });
+
+    it('should return the cached instance without hitting Redis', async () => {
+        const registry = new ProviderRegistry();
+        mockRedis.hGetAll.mockResolvedValue(providerHash);
+        const first = await registry.getOrLoadProvider('r2-eu');
+
+        mockRedis.hGetAll.mockReset();
+        mockRedis.hGetAll.mockRejectedValue(new Error('redis down'));
+
+        const second = await registry.getOrLoadProvider('r2-eu');
+
+        expect(second).toBe(first);
+        expect(mockRedis.hGetAll).not.toHaveBeenCalled();
+    });
+
+    it('should throw ProviderNotFoundError when the record is absent from Redis', async () => {
+        const registry = new ProviderRegistry();
+        mockRedis.hGetAll.mockResolvedValue(null);
+
+        try {
+            await registry.getOrLoadProvider('ghost');
+            expect.unreachable('expected getOrLoadProvider to throw');
+        } catch (e) {
+            expect(e).toBeInstanceOf(ProviderNotFoundError);
+            // storage falls back to the default provider on this code only
+            expect((e as { code?: string }).code).toBe('PROVIDER_NOT_FOUND');
+        }
+    });
+
+    it('should propagate load errors instead of masking them as not-found', async () => {
+        const registry = new ProviderRegistry();
+        mockRedis.hGetAll.mockRejectedValue(new Error('WRONGTYPE Operation'));
+
+        try {
+            await registry.getOrLoadProvider('corrupt');
+            expect.unreachable('expected getOrLoadProvider to throw');
+        } catch (e) {
+            expect(e).not.toBeInstanceOf(ProviderNotFoundError);
+            expect((e as Error).message).toContain('WRONGTYPE Operation');
+        }
     });
 });
 

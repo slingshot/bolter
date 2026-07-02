@@ -116,7 +116,8 @@ export function triggerDownload(blob: Blob, filename: string): void {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    // Revoking synchronously lets WebKit cancel the not-yet-started blob navigation
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 /**

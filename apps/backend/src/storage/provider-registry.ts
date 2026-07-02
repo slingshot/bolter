@@ -38,6 +38,15 @@ export interface AddProviderInput {
 
 export type UpdateProviderInput = Partial<Omit<AddProviderInput, 'name'>> & { name?: string };
 
+export class ProviderNotFoundError extends Error {
+    readonly code = 'PROVIDER_NOT_FOUND';
+
+    constructor(providerId: string) {
+        super(`Storage provider "${providerId}" not found`);
+        this.name = 'ProviderNotFoundError';
+    }
+}
+
 // --- Redis key helpers ---
 
 const PROVIDER_KEY_PREFIX = 'provider:';
@@ -188,14 +197,30 @@ export class ProviderRegistry {
         if (ids.length === 0) {
             await this.registerDefaultFromEnv();
         } else {
+            let firstLoadError: unknown = null;
             for (const id of ids) {
-                await this.loadProvider(id);
+                try {
+                    await this.loadProvider(id);
+                } catch (err) {
+                    firstLoadError = firstLoadError ?? err;
+                    logger.error(
+                        { providerId: id, error: err },
+                        'Failed to load provider during initialization, skipping',
+                    );
+                }
             }
-        }
 
-        // Ensure we have a default
-        if (!this.defaultId) {
-            await this.registerDefaultFromEnv();
+            // Ensure we have a default — but never overwrite a stored record
+            // that merely failed to load (e.g. rotated PROVIDER_ENCRYPTION_KEY):
+            // registerDefaultFromEnv would clobber the admin's config in Redis
+            if (!this.defaultId) {
+                if (firstLoadError) {
+                    throw firstLoadError instanceof Error
+                        ? firstLoadError
+                        : new Error(String(firstLoadError));
+                }
+                await this.registerDefaultFromEnv();
+            }
         }
 
         // Start cache refresh timer
@@ -295,7 +320,14 @@ export class ProviderRegistry {
 
         // Load new or updated providers
         for (const id of ids) {
-            await this.loadProvider(id);
+            try {
+                await this.loadProvider(id);
+            } catch (err) {
+                logger.error(
+                    { providerId: id, error: err },
+                    'Failed to load provider during cache refresh, skipping',
+                );
+            }
         }
     }
 
@@ -307,6 +339,28 @@ export class ProviderRegistry {
             throw new Error(`Storage provider "${providerId}" not found`);
         }
         return instance;
+    }
+
+    /**
+     * Get a provider from the cache, attempting a one-shot load from Redis on miss.
+     * Throws ProviderNotFoundError (code PROVIDER_NOT_FOUND) when the provider
+     * record does not exist in Redis at all; load/decrypt failures propagate as-is.
+     */
+    async getOrLoadProvider(providerId: string): Promise<S3Storage> {
+        const cached = this.instances.get(providerId);
+        if (cached) {
+            return cached;
+        }
+
+        // loadProvider throws on load/decrypt failure and returns without
+        // caching an instance only when the record is absent from Redis
+        await this.loadProvider(providerId);
+
+        const loaded = this.instances.get(providerId);
+        if (!loaded) {
+            throw new ProviderNotFoundError(providerId);
+        }
+        return loaded;
     }
 
     getActiveProvider(): S3Storage {

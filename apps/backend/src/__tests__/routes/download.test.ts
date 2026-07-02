@@ -40,7 +40,7 @@ const mockStorage = {
     ),
     completeMultipartUpload: mock(() => Promise.resolve()),
     abortMultipartUpload: mock(() => Promise.resolve()),
-    getStream: mock(() => Promise.resolve(null)),
+    getStream: mock(() => Promise.resolve(null as ReadableStream<Uint8Array> | null)),
     length: mock(() => Promise.resolve(0)),
 };
 
@@ -221,7 +221,7 @@ describe('GET /download/direct/:id', () => {
         expect(mockStorage.incrementDownloadCount.mock.calls[0][0]).toBe('abc123');
     });
 
-    it('should return 500 when signed URL generation fails', async () => {
+    it('should return 500 when signed URL generation fails without burning a download credit', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 0, dlimit: 10 }));
         mockStorage.getSignedDownloadUrl.mockResolvedValue(null);
 
@@ -231,6 +231,21 @@ describe('GET /download/direct/:id', () => {
         expect(res.status).toBe(500);
         const body = await res.json();
         expect(body.error).toContain('Failed to generate download URL');
+        // Signing happens BEFORE incrementing — the counter must be untouched
+        expect(mockStorage.incrementDownloadCount.mock.calls.length).toBe(0);
+    });
+
+    it('should cap metadata TTL as a backstop when scheduling deletion at the limit', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 9, dlimit: 10 }));
+        mockStorage.incrementDownloadCount.mockResolvedValue(10);
+        mockRedis.expire.mockReset();
+        mockRedis.expire.mockResolvedValue(undefined);
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
+
+        expect(res.status).toBe(302);
+        expect(mockRedis.expire).toHaveBeenCalledWith('abc123', 300);
     });
 
     it('should return 410 when incremented counter exceeds limit', async () => {
@@ -332,6 +347,106 @@ describe('GET /download/url/:id', () => {
         expect(body.dl).toBe(1);
         expect(body.dlimit).toBe(10);
     });
+
+    it('should return 200 with counts and no URL when download limit is reached', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, dl: 10, dlimit: 10 }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/url/abc123'));
+
+        // Soft response: old and new frontends both gate on dl >= dlimit
+        // themselves; a 410 here would read as "status unknown" to old clients
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.useSignedUrl).toBe(false);
+        expect(body.url).toBeUndefined();
+        expect(body.dl).toBe(10);
+        expect(body.dlimit).toBe(10);
+        expect(mockStorage.getSignedDownloadUrl.mock.calls.length).toBe(0);
+    });
+
+    it('should return 401 (not 410) for unauthenticated encrypted file at the limit', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: true, dl: 10, dlimit: 10 }),
+        );
+        mockVerifyAuth.mockResolvedValue({ valid: false, nonce: 'challenge-nonce' });
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/url/abc123'));
+
+        // Auth (and the WWW-Authenticate nonce flow) runs before the limit gate
+        expect(res.status).toBe(401);
+        expect(res.headers.get('WWW-Authenticate')).toContain('send-v1');
+    });
+});
+
+describe('GET /download/:id (stream)', () => {
+    beforeEach(() => {
+        mockStorage.getMetadata.mockReset();
+        mockStorage.getStream.mockReset();
+        mockStorage.getStream.mockResolvedValue(null);
+        mockVerifyAuth.mockReset();
+        mockVerifyAuth.mockResolvedValue({ valid: true, nonce: 'test-nonce' });
+    });
+
+    it('should return 410 when download limit is reached', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, dl: 10, dlimit: 10 }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/abc123'));
+
+        expect(res.status).toBe(410);
+        const body = await res.json();
+        expect(body.error).toContain('Download limit reached');
+        expect(mockStorage.getStream.mock.calls.length).toBe(0);
+    });
+
+    it('should stream the file when under the limit', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, dl: 0, dlimit: 10 }),
+        );
+        mockStorage.getStream.mockResolvedValue(
+            new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array([1, 2, 3]));
+                    controller.close();
+                },
+            }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/abc123'));
+
+        expect(res.status).toBe(200);
+    });
+});
+
+describe('GET /download/blob/:id', () => {
+    beforeEach(() => {
+        mockStorage.getMetadata.mockReset();
+        mockStorage.getStream.mockReset();
+        mockStorage.getStream.mockResolvedValue(null);
+        mockVerifyAuth.mockReset();
+        mockVerifyAuth.mockResolvedValue({ valid: true, nonce: 'test-nonce' });
+    });
+
+    it('should return 410 when download limit is reached', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, dl: 10, dlimit: 10 }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/blob/abc123'));
+
+        expect(res.status).toBe(410);
+        const body = await res.json();
+        expect(body.error).toContain('Download limit reached');
+        expect(mockStorage.getStream.mock.calls.length).toBe(0);
+    });
 });
 
 describe('POST /download/complete/:id', () => {
@@ -371,6 +486,8 @@ describe('POST /download/complete/:id', () => {
             makeMetadata({ encrypted: false, dl: 9, dlimit: 10 }),
         );
         mockStorage.incrementDownloadCount.mockResolvedValue(10);
+        mockRedis.expire.mockReset();
+        mockRedis.expire.mockResolvedValue(undefined);
 
         const app = createApp();
         const res = await app.handle(
@@ -384,6 +501,8 @@ describe('POST /download/complete/:id', () => {
         expect(body.dlimit).toBe(10);
 
         expect(mockStorage.del.mock.calls.length).toBe(1);
+        // TTL backstop caps consumed metadata if the delete failed
+        expect(mockRedis.expire).toHaveBeenCalledWith('abc123', 300);
     });
 
     it('should return 404 when file not found', async () => {
@@ -697,9 +816,11 @@ describe('POST /password/:id', () => {
         mockVerifyOwner.mockResolvedValue(true);
         mockStorage.setField.mockReset();
         mockStorage.setField.mockResolvedValue(undefined);
+        mockStorage.getMetadata.mockReset();
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: true }));
     });
 
-    it('should set auth field for valid owner', async () => {
+    it('should set auth field for valid owner of an encrypted file', async () => {
         const app = createApp();
         const res = await app.handle(
             jsonPost('/password/abc123', {
@@ -734,6 +855,38 @@ describe('POST /password/:id', () => {
         expect(res.status).toBe(401);
         const body = await res.json();
         expect(body.error).toContain('Invalid owner token');
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should return 400 for unencrypted files without touching auth', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/password/abc123', {
+                owner_token: 'valid-owner-token',
+                auth: 'new-password-hash',
+            }),
+        );
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('only supported for encrypted files');
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should return 400 when metadata is missing', async () => {
+        mockStorage.getMetadata.mockResolvedValue(null);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/password/abc123', {
+                owner_token: 'valid-owner-token',
+                auth: 'new-password-hash',
+            }),
+        );
+
+        expect(res.status).toBe(400);
         expect(mockStorage.setField.mock.calls.length).toBe(0);
     });
 });

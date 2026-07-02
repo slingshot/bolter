@@ -100,7 +100,8 @@ export interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
     // Theme
     theme:
-        (typeof window !== 'undefined' && (localStorage.getItem('theme') as AppState['theme'])) ||
+        (typeof localStorage !== 'undefined' &&
+            (localStorage.getItem('theme') as AppState['theme'])) ||
         'system',
     setTheme: (theme) => {
         localStorage.setItem('theme', theme);
@@ -274,7 +275,7 @@ function generateUUID(): string {
 }
 
 // Initialize theme
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
     const theme = (localStorage.getItem('theme') as AppState['theme']) || 'system';
     applyTheme(theme);
 }

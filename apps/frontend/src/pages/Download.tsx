@@ -53,7 +53,10 @@ export function DownloadPage() {
     const [canDownloadAgain, setCanDownloadAgain] = useState(true);
     const [downloadsLeft, setDownloadsLeft] = useState<number | null>(null);
     const [downloadPhase, setDownloadPhase] = useState<DownloadPhase>('downloading');
-    const loadingRef = useRef(false);
+    const [isKeyError, setIsKeyError] = useState(false);
+    const loadedKeyRef = useRef<string | null>(null);
+    const iframeRef = useRef<HTMLIFrameElement | null>(null);
+    const directPendingRef = useRef(false);
 
     // Compute document meta based on state and metadata
     const documentMeta = useMemo(() => {
@@ -88,6 +91,15 @@ export function DownloadPage() {
     // Update document title and meta description
     useDocumentMeta(documentMeta);
 
+    // Keep the download iframe attached until the page unmounts — removing it
+    // early cancels slow redirects after the server has already counted the download
+    useEffect(() => {
+        return () => {
+            iframeRef.current?.remove();
+            iframeRef.current = null;
+        };
+    }, []);
+
     // Extract secret key from URL hash
     useEffect(() => {
         if (!id) {
@@ -95,12 +107,29 @@ export function DownloadPage() {
             return;
         }
         const fileId = id;
+        const requestKey = fileId + location.hash;
 
         // Prevent duplicate requests from StrictMode double-render
-        if (loadingRef.current) {
+        if (loadedKeyRef.current === requestKey) {
             return;
         }
-        loadingRef.current = true;
+        const keyChanged = loadedKeyRef.current !== null;
+        loadedKeyRef.current = requestKey;
+
+        if (keyChanged) {
+            setState('loading');
+            setMetadata(null);
+            setKeychain(null);
+            setDownloadsLeft(null);
+            setError(null);
+            setIsKeyError(false);
+            setProgress(0);
+            setCanDownloadAgain(true);
+        }
+
+        // A newer navigation replaces loadedKeyRef, so a slow response for an
+        // older key must not commit state (StrictMode re-runs keep the same key)
+        const isStale = () => loadedKeyRef.current !== requestKey;
 
         const secretKey = location.hash.slice(1); // Remove the # prefix
 
@@ -108,9 +137,15 @@ export function DownloadPage() {
             try {
                 // Check if file exists
                 const exists = await fileExists(fileId);
+                if (isStale()) {
+                    return;
+                }
                 if (!exists) {
                     // Check legacy system before showing not found
                     const legacyUrl = await checkLegacyFile(fileId);
+                    if (isStale()) {
+                        return;
+                    }
                     if (legacyUrl) {
                         window.location.href = legacyUrl;
                         return;
@@ -124,26 +159,45 @@ export function DownloadPage() {
                 const kc = secretKey && crypto?.subtle ? new Keychain(secretKey) : null;
                 setKeychain(kc);
 
-                // Check if download limit already reached
+                // Check if download limit already reached; a transient status
+                // error must not block loading — getMetadata decides then
                 const status = await getDownloadStatus(fileId, kc);
-                if (status && status.dl >= status.dlimit) {
+                if (isStale()) {
+                    return;
+                }
+                if (status.status === 'gone') {
                     setState('not-found');
                     return;
                 }
-
-                // Store downloads left for display
-                if (status) {
+                if (status.status === 'ok') {
+                    if (status.dl >= status.dlimit) {
+                        setState('not-found');
+                        return;
+                    }
                     setDownloadsLeft(status.dlimit - status.dl);
                 }
 
                 // Fetch metadata
                 const meta = await getMetadata(fileId, kc || undefined);
+                if (isStale()) {
+                    return;
+                }
                 setMetadata(meta as FileMetadata);
                 setState('ready');
             } catch (e: unknown) {
+                if (isStale()) {
+                    return;
+                }
                 const message = e instanceof Error ? e.message : String(e);
                 console.error('Failed to load metadata:', e);
-                if (message.includes('404') || message.includes('401')) {
+                if (
+                    e instanceof Error &&
+                    (e.name === 'MissingKeyError' || e.name === 'InvalidKeyError')
+                ) {
+                    setError(e.message);
+                    setIsKeyError(true);
+                    setState('error');
+                } else if (message.includes('404') || message.includes('401')) {
                     setState('not-found');
                 } else {
                     captureError(e, {
@@ -169,6 +223,11 @@ export function DownloadPage() {
             return;
         }
 
+        // Continuations below outlive user navigation; snapshot the page key
+        // so a finished download for file A never writes state onto file B
+        const requestKey = loadedKeyRef.current;
+        const isStale = () => loadedKeyRef.current !== requestKey;
+
         // Direct download for unencrypted files (uses native browser download)
         // Works for: single files, or multi-file zips (zipped at upload time)
         const canDirectDownload =
@@ -177,25 +236,78 @@ export function DownloadPage() {
             (metadata.zipped || !metadata.files || metadata.files.length <= 1);
 
         if (canDirectDownload) {
-            // Use hidden iframe to trigger download without leaving the page
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.src = `${API_BASE_URL}/download/direct/${id}`;
-            document.body.appendChild(iframe);
+            // A second click while the iframe navigation is committing would
+            // abort the first request after the server already counted it
+            if (directPendingRef.current) {
+                return;
+            }
+            directPendingRef.current = true;
+            const fromCompleteScreen = state === 'complete';
 
-            // Clean up iframe and check if download limit was reached
-            setTimeout(async () => {
-                document.body.removeChild(iframe);
-                // Check download count vs limit to determine if more downloads available
-                const status = await getDownloadStatus(id, keychain);
-                const hasMoreDownloads = status ? status.dl < status.dlimit : false;
-                setCanDownloadAgain(hasMoreDownloads);
-                if (status) {
-                    setDownloadsLeft(status.dlimit - status.dl);
+            // Validate before navigating the iframe — the iframe itself cannot
+            // surface server errors, so a failed pre-check must not burn a click
+            const status = await getDownloadStatus(id, keychain);
+            if (isStale()) {
+                directPendingRef.current = false;
+                return;
+            }
+            if (
+                status.status === 'gone' ||
+                (status.status === 'ok' && status.dl >= status.dlimit)
+            ) {
+                directPendingRef.current = false;
+                if (fromCompleteScreen) {
+                    // The file was already delivered to this user — show the
+                    // limit-reached copy instead of replacing it with "not found"
+                    setCanDownloadAgain(false);
+                    setDownloadsLeft(0);
+                } else {
+                    setState('not-found');
                 }
+                return;
+            }
+            if (status.status === 'error') {
+                directPendingRef.current = false;
+                setIsKeyError(false);
+                setError(
+                    'Could not reach the server to start the download. Check your connection and try again.',
+                );
+                setState('error');
+                return;
+            }
+
+            // Use hidden iframe to trigger download without leaving the page;
+            // reuse a single iframe across clicks and keep it attached until
+            // unmount so slow redirects are not cancelled mid-flight
+            let iframe = iframeRef.current;
+            if (!iframe) {
+                iframe = document.createElement('iframe');
+                iframe.style.display = 'none';
+                document.body.appendChild(iframe);
+                iframeRef.current = iframe;
+            }
+            iframe.src = `${API_BASE_URL}/download/direct/${id}`;
+
+            // Refresh download counts once the server has likely burned the credit
+            setTimeout(async () => {
+                directPendingRef.current = false;
                 trackDownload({ fileId: id });
+                if (isStale()) {
+                    return;
+                }
+                const after = await getDownloadStatus(id, keychain);
+                if (isStale()) {
+                    return;
+                }
+                if (after.status === 'ok') {
+                    setDownloadsLeft(after.dlimit - after.dl);
+                    setCanDownloadAgain(after.dl < after.dlimit);
+                } else if (after.status === 'gone') {
+                    setCanDownloadAgain(false);
+                }
+                // 'error' is transient — leave canDownloadAgain untouched
                 setState('complete');
-            }, 1500);
+            }, 3000);
             return;
         }
 
@@ -224,21 +336,41 @@ export function DownloadPage() {
                 },
             );
 
-            // Trigger browser download
+            // Trigger browser download — the file is delivered even if the
+            // user has navigated to a different download page meanwhile
             triggerDownload(result.blob, result.filename);
-
-            // Check download count vs limit to determine if more downloads available
-            const status = await getDownloadStatus(id, keychain);
-            const hasMoreDownloads = status ? status.dl < status.dlimit : false;
-            setCanDownloadAgain(hasMoreDownloads);
-            if (status) {
-                setDownloadsLeft(status.dlimit - status.dl);
-            }
             trackDownload({ fileId: id });
+            if (isStale()) {
+                return;
+            }
+
+            // Check download count vs limit to determine if more downloads available;
+            // a transient status error must not claim the limit was reached
+            const status = await getDownloadStatus(id, keychain);
+            if (isStale()) {
+                return;
+            }
+            if (status.status === 'ok') {
+                setCanDownloadAgain(status.dl < status.dlimit);
+                setDownloadsLeft(status.dlimit - status.dl);
+            } else if (status.status === 'gone') {
+                setCanDownloadAgain(false);
+            }
             setState('complete');
         } catch (e: unknown) {
             const message = e instanceof Error ? e.message : String(e);
             console.error('Download failed:', e);
+            if (
+                e instanceof Error &&
+                (e.name === 'MissingKeyError' || e.name === 'InvalidKeyError')
+            ) {
+                if (!isStale()) {
+                    setError(e.message);
+                    setIsKeyError(true);
+                    setState('error');
+                }
+                return;
+            }
             captureError(e, {
                 operation: 'download',
                 extra: {
@@ -251,8 +383,11 @@ export function DownloadPage() {
                     errorMessage: message,
                 },
             });
-            setError(message);
-            setState('error');
+            if (!isStale()) {
+                setIsKeyError(false);
+                setError(message);
+                setState('error');
+            }
         }
     };
 
@@ -329,13 +464,15 @@ export function DownloadPage() {
                                 </p>
                             </div>
 
-                            {/* Actions */}
+                            {/* Actions — retrying cannot fix a missing/invalid key */}
                             <div className="w-full flex flex-col gap-3">
-                                <Button className="w-full" onClick={() => setState('ready')}>
-                                    Try again
-                                </Button>
+                                {!isKeyError && (
+                                    <Button className="w-full" onClick={() => setState('ready')}>
+                                        Try again
+                                    </Button>
+                                )}
                                 <Button
-                                    variant="outline"
+                                    variant={isKeyError ? 'default' : 'outline'}
                                     className="w-full"
                                     onClick={() => navigate('/')}
                                 >
@@ -396,6 +533,10 @@ export function DownloadPage() {
     }
 
     // Ready state (default) and Downloading state
+    // progress can briefly be NaN when the total is unknown (0)
+    const hasProgress = Number.isFinite(progress);
+    const clampedProgress = hasProgress ? Math.min(100, Math.max(0, Math.round(progress))) : 0;
+
     return (
         <div className="pt-24 pb-16 px-6">
             <div className="max-w-main-card mx-auto">
@@ -479,7 +620,7 @@ export function DownloadPage() {
                         {state === 'downloading' ? (
                             <div className="w-full space-y-3">
                                 <Progress
-                                    value={downloadPhase === 'downloading' ? progress : 100}
+                                    value={downloadPhase === 'downloading' ? clampedProgress : 100}
                                     className="h-2"
                                 />
                                 <p className="text-center text-paragraph-xs text-content-secondary">
@@ -487,7 +628,9 @@ export function DownloadPage() {
                                         ? 'Decrypting...'
                                         : downloadPhase === 'finalizing'
                                           ? 'Finalizing...'
-                                          : `Downloading... ${Math.round(progress)}%`}
+                                          : hasProgress
+                                            ? `Downloading... ${clampedProgress}%`
+                                            : 'Downloading...'}
                                 </p>
                             </div>
                         ) : (
@@ -503,7 +646,11 @@ export function DownloadPage() {
                                     {downloadsLeft} download{downloadsLeft !== 1 ? 's' : ''} left ·{' '}
                                 </>
                             )}
-                            Expires in {metadata?.ttl ? formatTimeLimit(metadata.ttl) : '7 days'}
+                            {/* Redis reports -1/-2 for keys without a TTL */}
+                            Expires in{' '}
+                            {metadata && metadata.ttl > 0
+                                ? formatTimeLimit(metadata.ttl)
+                                : '7 days'}
                         </p>
                     </div>
                 </div>

@@ -27,26 +27,30 @@ export async function verifyAuth(
         return { valid: true, nonce: '' };
     }
 
-    // Generate new nonce for next request
-    const newNonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64');
-    await storage.setField(id, 'nonce', newNonce);
+    // Legacy records may lack a nonce — issue and persist one as the challenge
+    let storedNonce = metadata.nonce;
+    if (!storedNonce) {
+        storedNonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64');
+        await storage.rotateNonce(id, storedNonce);
+    }
 
+    // Invalid attempts echo the current nonce without rotating, so concurrent
+    // viewers holding the same challenge are not invalidated by each other
     if (!authHeader) {
-        return { valid: false, nonce: newNonce };
+        return { valid: false, nonce: storedNonce };
     }
 
     // Parse authorization header
     const match = authHeader.match(/^send-v1\s+(.+)$/);
     if (!match) {
-        return { valid: false, nonce: newNonce };
+        return { valid: false, nonce: storedNonce };
     }
 
     const providedSig = match[1];
     const storedAuth = metadata.auth;
-    const storedNonce = metadata.nonce;
 
-    if (!storedAuth || !storedNonce) {
-        return { valid: false, nonce: newNonce };
+    if (!storedAuth) {
+        return { valid: false, nonce: storedNonce };
     }
 
     try {
@@ -65,11 +69,19 @@ export async function verifyAuth(
         const expectedBuffer = Buffer.from(expectedSig, 'base64');
 
         if (providedBuffer.length !== expectedBuffer.length) {
-            return { valid: false, nonce: newNonce };
+            return { valid: false, nonce: storedNonce };
         }
 
         const valid = timingSafeEqual(providedBuffer, expectedBuffer);
-        return { valid, nonce: newNonce };
+        if (!valid) {
+            return { valid: false, nonce: storedNonce };
+        }
+
+        // Rotate only after a successful verification — the used nonce is
+        // consumed immediately, preserving replay protection
+        const newNonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64');
+        await storage.rotateNonce(id, newNonce);
+        return { valid: true, nonce: newNonce };
     } catch (e) {
         captureError(e, {
             operation: 'auth.verify',
@@ -77,7 +89,7 @@ export async function verifyAuth(
             level: 'warning',
         });
         console.error('Auth verification error:', e);
-        return { valid: false, nonce: newNonce };
+        return { valid: false, nonce: storedNonce };
     }
 }
 

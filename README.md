@@ -23,6 +23,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **Self-destructing links** — configurable expiration (5 min to 6 months) and download limits
 - **No accounts required** — generate a link, share it, done
 - **Resilient uploads** — stall detection, offline awareness, progress-based retries, IndexedDB-backed resume on page reload, and Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility
+- **Resilient downloads** — mid-stream failures resume via HTTP Range requests with stall detection and signed-URL refresh; every download is verified for completeness (and decryption integrity when encrypted) before it is reported successful
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
 - **Multi-provider S3** — dynamic storage provider management via API; seamlessly migrate between S3-compatible services (Cloudflare R2, Railway, AWS S3, etc.) while existing files remain accessible on their original provider
 - **Self-hostable** — Docker Compose, or run directly with Bun
@@ -213,7 +214,7 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `POST` | `/upload/multipart/:id/resume` | List completed parts (for resuming uploads) |
 | `POST` | `/upload/speedtest` | Generate pre-signed URLs for speed test |
 | `POST` | `/upload/speedtest/cleanup` | Clean up speed test objects |
-| `GET` | `/download/url/:id` | Get a pre-signed download URL |
+| `GET` | `/download/url/:id` | Get a pre-signed download URL (`410` once the download limit is reached) |
 | `GET` | `/providers` | List all storage providers (admin) |
 | `GET` | `/providers/:id` | Get storage provider details (admin) |
 | `POST` | `/providers` | Add a new storage provider (admin) |
