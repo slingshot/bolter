@@ -1197,12 +1197,9 @@ export async function uploadFiles(
         }
 
         if (canceller.cancelled) {
-            if (uploadInfo.multipart && uploadInfo.uploadId) {
-                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
-                deleteUploadState(uploadInfo.id).catch(() => {
-                    // Intentionally ignored — best-effort cleanup
-                });
-            }
+            // Cleanup (abort + persisted state) happens in the finally block,
+            // which also covers cancellations that surface as throws from the
+            // part uploaders instead of reaching this check.
             throw new Error('Upload cancelled');
         }
 
@@ -1261,9 +1258,15 @@ export async function uploadFiles(
         };
     } finally {
         cleanupStatusPoll();
-        // If cancelled, always clean up persisted state — the user
-        // intentionally cancelled, so don't offer resume on next visit
+        // If cancelled, abort the server-side multipart upload (S3 parts +
+        // Redis metadata would otherwise linger until TTL) and clean up
+        // persisted state — the user intentionally cancelled, so don't offer
+        // resume on next visit. A cancel usually surfaces as a throw from the
+        // part uploaders, so this must live here rather than on the happy path.
         if (canceller.cancelled && uploadInfo.multipart) {
+            if (uploadInfo.uploadId) {
+                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+            }
             deleteUploadState(uploadInfo.id).catch(() => {
                 // Intentionally ignored — best-effort cleanup
             });
@@ -1434,22 +1437,31 @@ export async function resumeUpload(
         url: '',
     };
 
-    const multipartResult = await uploadMultipartStream(
-        stream,
-        uploadInfoForResume,
-        updateProgress,
-        cancel,
-        onError,
-        totalSize,
-        () => {
-            totalRetryCount++;
-        },
-        state.fileId,
-        state.encrypted,
-    );
+    // When the interruption happened between the last part upload and
+    // /upload/complete, every part already exists at S3 — there is nothing to
+    // stream, so skip straight to completion. (uploadMultipartStream cannot
+    // handle an empty part list: its read loop would never drain the stream.)
+    let newlyUploadedParts: { PartNumber: number; ETag: string }[] = [];
+    if (resumeInfo.parts.length > 0) {
+        const multipartResult = await uploadMultipartStream(
+            stream,
+            uploadInfoForResume,
+            updateProgress,
+            cancel,
+            onError,
+            totalSize,
+            () => {
+                totalRetryCount++;
+            },
+            state.fileId,
+            state.encrypted,
+            true, // isResume: prior parts exist, never fall back to single-part
+        );
 
-    if ('fallbackBlob' in multipartResult) {
-        throw new Error('Resume failed: unexpected fallback');
+        if ('fallbackBlob' in multipartResult) {
+            throw new Error('Resume failed: unexpected fallback');
+        }
+        newlyUploadedParts = multipartResult.parts || [];
     }
 
     if (cancel.cancelled) {
@@ -1462,7 +1474,7 @@ export async function resumeUpload(
     for (const p of trulyCompletedParts) {
         partMap.set(p.PartNumber, p);
     }
-    for (const p of multipartResult.parts || []) {
+    for (const p of newlyUploadedParts) {
         partMap.set(p.PartNumber, p);
     }
     const allParts = [...partMap.values()].sort((a, b) => a.PartNumber - b.PartNumber);
@@ -1660,6 +1672,7 @@ async function uploadMultipartStream(
     onRetry?: () => void,
     fileId?: string,
     encrypted = false,
+    isResume = false,
 ): Promise<MultipartStreamResult> {
     const { parts, partSize } = uploadInfo;
     if (!parts || !partSize) {
@@ -1975,8 +1988,10 @@ async function uploadMultipartStream(
         // (bufferedItem is reassigned inside the queueOrBuffer closure, so TS can't narrow it)
         const finalBuffered = bufferedItem as { blob: Blob; partNum: number; url: string } | null;
         if (finalBuffered) {
-            // Check if we only have 1 part total and it's too small for multipart
-            const noPriorParts = totalPartsQueued === 0 && activeUploads === 0;
+            // Check if we only have 1 part total and it's too small for multipart.
+            // On resume, parts from the previous session already exist at S3, so a
+            // small blob here is a legal trailing part — never fall back.
+            const noPriorParts = !isResume && totalPartsQueued === 0 && activeUploads === 0;
 
             if (noPriorParts && finalBuffered.blob.size < MIN_PART) {
                 // Entire stream output is a single tiny blob — fallback to single-part upload
@@ -1997,6 +2012,16 @@ async function uploadMultipartStream(
                 );
                 lastPending.blob = mergedBlob;
                 // Don't queue the tiny buffered item separately
+
+                // The merged part no longer holds exactly effectivePartSize bytes,
+                // so the persisted resume math (skip offset = completed parts ×
+                // part size) would resume from the wrong file offset and corrupt
+                // the object. Drop resumability for this upload.
+                if (fileId) {
+                    deleteUploadState(fileId).catch(() => {
+                        // Intentionally ignored — best-effort cleanup
+                    });
+                }
             } else {
                 // Final part is large enough, or no pending parts to merge with — queue it normally
                 totalUploadedSize += finalBuffered.blob.size;
@@ -2835,11 +2860,38 @@ export async function downloadFile(
     const files = metadata.files as FileInfo[] | undefined;
     const isLegacyMultiFile = !metadata.zipped && files && files.length > 1;
 
+    // Resilient body transfer: survives mid-stream network failures by
+    // resuming from the received offset (refreshing the signed URL if expired).
+    // Created before the legacy branch so both paths get the same resilience.
+    const bodyStream = createResilientDownloadStream({
+        firstResponse: response,
+        getRequest: async (refreshUrl) => {
+            if (refreshUrl) {
+                const fresh = await fetchDownloadUrlInfo(id, keychain);
+                usingSignedUrl = fresh.useSignedUrl;
+                downloadUrl = fresh.useSignedUrl ? fresh.url : `${API_BASE_URL}/download/${id}`;
+            }
+            const requestHeaders: Record<string, string> = {};
+            if (!usingSignedUrl && keychain) {
+                requestHeaders.Authorization = await keychain.authHeader();
+            }
+            return { url: downloadUrl, headers: requestHeaders };
+        },
+        onResponse: (res) => {
+            if (!usingSignedUrl && keychain) {
+                const nonce = res.headers.get('WWW-Authenticate')?.split(' ')[1];
+                if (nonce) {
+                    keychain.nonce = nonce;
+                }
+            }
+        },
+    });
+
     // Legacy multi-file path requires full buffer for slicing concatenated data
     if (isLegacyMultiFile && files) {
         return downloadFileLegacyMultiFile(
             id,
-            response,
+            bodyStream,
             contentLength,
             metadata,
             keychain,
@@ -2884,32 +2936,6 @@ export async function downloadFile(
             }
 
             controller.enqueue(chunk);
-        },
-    });
-
-    // Resilient body transfer: survives mid-stream network failures by
-    // resuming from the received offset (refreshing the signed URL if expired).
-    const bodyStream = createResilientDownloadStream({
-        firstResponse: response,
-        getRequest: async (refreshUrl) => {
-            if (refreshUrl) {
-                const fresh = await fetchDownloadUrlInfo(id, keychain);
-                usingSignedUrl = fresh.useSignedUrl;
-                downloadUrl = fresh.useSignedUrl ? fresh.url : `${API_BASE_URL}/download/${id}`;
-            }
-            const requestHeaders: Record<string, string> = {};
-            if (!usingSignedUrl && keychain) {
-                requestHeaders.Authorization = await keychain.authHeader();
-            }
-            return { url: downloadUrl, headers: requestHeaders };
-        },
-        onResponse: (res) => {
-            if (!usingSignedUrl && keychain) {
-                const nonce = res.headers.get('WWW-Authenticate')?.split(' ')[1];
-                if (nonce) {
-                    keychain.nonce = nonce;
-                }
-            }
         },
     });
 
@@ -3088,7 +3114,7 @@ async function collectStreamToBlob(
  */
 async function downloadFileLegacyMultiFile(
     id: string,
-    response: Response,
+    bodyStream: ReadableStream<Uint8Array>,
     contentLength: number,
     metadata: {
         name: string;
@@ -3109,10 +3135,6 @@ async function downloadFileLegacyMultiFile(
     onPhase?.('downloading');
     dlLog('Legacy multi-file download (buffered)', { fileCount: files.length });
 
-    if (!response.body) {
-        throw new Error('No response body');
-    }
-
     const expectedPlaintext = files.reduce((sum, f) => sum + f.size, 0);
     const total =
         contentLength > 0
@@ -3122,7 +3144,7 @@ async function downloadFileLegacyMultiFile(
               : expectedPlaintext;
 
     let loaded = 0;
-    const wireBlob = await collectStreamToBlob(response.body, (bytes) => {
+    const wireBlob = await collectStreamToBlob(bodyStream, (bytes) => {
         loaded += bytes;
         if (total > 0) {
             onProgress?.(Math.min(loaded, total), total);

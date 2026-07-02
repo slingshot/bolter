@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { Elysia, t } from 'elysia';
 import { config, deriveBaseUrl } from '../config';
@@ -46,7 +46,7 @@ export function calculateOptimalPartSize(
         numParts = Math.ceil(fileSize / partSize);
     }
 
-    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MB)
+    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MiB)
     // This prevents R2 EntityTooSmall errors when compressed/encrypted size
     // lands just above a multiple of partSize
     if (numParts > 1) {
@@ -434,6 +434,34 @@ export const uploadRoutes = new Elysia()
 
             logger.debug({ requestId, id, fileInfo }, 'File metadata retrieved');
 
+            // A stored auth field means this upload already completed. The file ID
+            // becomes public once the link is shared, so an unauthenticated
+            // re-completion must never overwrite auth/metadata (an attacker could
+            // lock recipients out or deface the file). A retry carrying the same
+            // authKey is the uploader recovering from a lost response — idempotent.
+            if (fileInfo.auth) {
+                if (fileInfo.encrypted) {
+                    const provided = Buffer.from(typeof authKey === 'string' ? authKey : '');
+                    const stored = Buffer.from(fileInfo.auth);
+                    const sameKey =
+                        provided.length === stored.length && timingSafeEqual(provided, stored);
+                    if (!sameKey) {
+                        logger.warn(
+                            { requestId, id },
+                            'Rejected re-completion with mismatched auth key',
+                        );
+                        set.status = 401;
+                        return { error: 'Upload already completed' };
+                    }
+                }
+                logger.info({ requestId, id }, 'Upload already completed — idempotent retry');
+                return {
+                    success: true,
+                    id,
+                    url: `${deriveBaseUrl(request)}/download/${id}`,
+                };
+            }
+
             // Reject invalid encrypted-file requests before the S3 completion,
             // otherwise the object gets finalized but is permanently 401
             if (fileInfo.encrypted && (!authKey || typeof authKey !== 'string')) {
@@ -662,6 +690,9 @@ export const uploadRoutes = new Elysia()
                     error: t.String(),
                     status: t.Optional(t.Number()),
                 }),
+                401: t.Object({
+                    error: t.String(),
+                }),
                 404: t.Object({
                     error: t.String(),
                     status: t.Optional(t.Number()),
@@ -691,7 +722,9 @@ export const uploadRoutes = new Elysia()
             try {
                 const fileInfo = await storage.getMetadata(id);
                 await storage.abortMultipartUpload(id, uploadId, fileInfo?.providerId);
-                await storage.redis.del(id);
+                // storage.del (not redis.del) so the provider file counter
+                // incremented at /upload/url is decremented again
+                await storage.del(id);
                 logger.info({ requestId, id, uploadId }, 'Upload aborted successfully');
                 return { success: true };
             } catch (e) {

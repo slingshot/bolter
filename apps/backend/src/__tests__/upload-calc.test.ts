@@ -100,9 +100,9 @@ describe('calculateOptimalPartSize', () => {
 
     it('should auto-adjust when number of parts exceeds MAX_PARTS', () => {
         // Use a very large file with a small preferred part size to force >10000 parts
-        // 100GB file with 5MB parts = 20000 parts > MAX_PARTS
+        // 100GB file with 5MiB parts = ~19000 parts > MAX_PARTS
         const fileSize = 100_000_000_000; // 100GB
-        const preferred = 5_000_000; // 5MB = MIN_PART_SIZE
+        const preferred = MIN_PART_SIZE;
 
         const result = calculateOptimalPartSize(fileSize, preferred);
 
@@ -154,12 +154,13 @@ describe('calculateOptimalPartSize', () => {
     });
 
     it('should use exact MIN_PART_SIZE as preferred without issues', () => {
-        const fileSize = 50_000_000; // 50MB
+        // Exact multiple of MIN_PART_SIZE so the last-part adjustment stays out of play
+        const fileSize = MIN_PART_SIZE * 10;
 
         const result = calculateOptimalPartSize(fileSize, MIN_PART_SIZE);
 
         expect(result.partSize).toBe(MIN_PART_SIZE);
-        expect(result.numParts).toBe(Math.ceil(fileSize / MIN_PART_SIZE));
+        expect(result.numParts).toBe(10);
     });
 
     it('should use exact MAX_PART_SIZE as preferred without issues', () => {

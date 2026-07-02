@@ -474,6 +474,70 @@ describe('POST /upload/complete', () => {
         expect(authCalls.length).toBe(1);
     });
 
+    it('should reject re-completion of an encrypted file with a different authKey', async () => {
+        // Simulates an attacker who learned the file ID from a shared link and
+        // tries to overwrite the auth key (locking out recipients) or metadata
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: true, auth: 'original-auth-key', nonce: 'nonce' }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', {
+                id: 'abc123',
+                authKey: 'attacker-auth-key',
+                metadata: 'attacker-metadata',
+            }),
+        );
+
+        expect(res.status).toBe(401);
+        const body = await res.json();
+        expect(body.error).toContain('already completed');
+        // Nothing may be overwritten
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should treat re-completion with the same authKey as an idempotent retry', async () => {
+        // A client that lost the response to its first /upload/complete POST
+        // retries with identical payload — must succeed without rewriting state
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: true, auth: 'original-auth-key', nonce: 'nonce' }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', {
+                id: 'abc123',
+                authKey: 'original-auth-key',
+                metadata: 'same-metadata',
+            }),
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.success).toBe(true);
+        expect(body.url).toContain('/download/abc123');
+        // Idempotent: no fields rewritten, no nonce rotation
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should treat re-completion of an unencrypted file as an idempotent retry', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, auth: 'unencrypted', metadata: 'original' }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', { id: 'abc123', metadata: 'attacker-metadata' }),
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.success).toBe(true);
+        // Stored metadata must not be overwritten
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
     it('should return 400 when file ID is missing', async () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/complete', { id: '' }));
@@ -664,11 +728,11 @@ describe('POST /upload/abort/:id', () => {
     beforeEach(() => {
         mockStorage.abortMultipartUpload.mockReset();
         mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
-        mockRedis.del.mockReset();
-        mockRedis.del.mockResolvedValue(undefined);
+        mockStorage.del.mockReset();
+        mockStorage.del.mockResolvedValue(undefined);
     });
 
-    it('should abort upload and clean up redis', async () => {
+    it('should abort upload and clean up storage (decrementing provider counter)', async () => {
         const app = createApp();
         const res = await app.handle(
             jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }),
@@ -682,8 +746,10 @@ describe('POST /upload/abort/:id', () => {
         expect(mockStorage.abortMultipartUpload.mock.calls[0][0]).toBe('abc123');
         expect(mockStorage.abortMultipartUpload.mock.calls[0][1]).toBe('mp-upload-id');
 
-        expect(mockRedis.del.mock.calls.length).toBe(1);
-        expect(mockRedis.del.mock.calls[0][0]).toBe('abc123');
+        // storage.del handles redis cleanup AND the provider file-count
+        // decrement that balances the increment made at /upload/url
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+        expect(mockStorage.del.mock.calls[0][0]).toBe('abc123');
     });
 
     it('should return error when abort fails', async () => {
