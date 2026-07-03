@@ -97,6 +97,7 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 
 **Key Frontend Components**:
 - `apps/frontend/src/lib/crypto.ts` - AES-GCM encryption, HKDF key derivation
+- `apps/frontend/src/lib/plausible.ts` - Analytics entry point: `trackUpload`/`trackDownload` fan out to both Plausible (via the backend proxy) and Vercel Web Analytics (fallback provider; pageviews via `<Analytics />` in `App.tsx`). Each provider is wrapped independently so one failing never blocks the other
 - `apps/frontend/src/lib/api.ts` - Direct S3 multipart uploads, download logic, stall detection, adaptive part sizing
 - `apps/frontend/src/lib/upload-state.ts` - IndexedDB persistence for multipart upload resumability
 - `apps/frontend/src/stores/app.ts` - Zustand store (config, upload state, files)
