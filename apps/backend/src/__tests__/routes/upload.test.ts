@@ -170,6 +170,10 @@ describe('POST /upload/url', () => {
         );
         mockStorage.setField.mockReset();
         mockStorage.setField.mockResolvedValue(undefined);
+        mockStorage.del.mockReset();
+        mockStorage.del.mockResolvedValue(undefined);
+        mockStorage.abortMultipartUpload.mockReset();
+        mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
         mockRedis.expire.mockReset();
         mockRedis.expire.mockResolvedValue(undefined);
     });
@@ -319,6 +323,69 @@ describe('POST /upload/url', () => {
         // Then createMultipartUpload fails, so it returns useSignedUrl: false.
         expect(body.useSignedUrl).toBe(false);
     });
+
+    it('should roll back metadata (storage.del) when multipart creation fails', async () => {
+        mockStorage.createMultipartUpload.mockResolvedValueOnce(null);
+
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        // storage.del decrements the provider file counter incremented earlier —
+        // without it the counter drifts and orphan metadata lingers until TTL
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+    });
+
+    it('should abort the upload and roll back when part URL signing fails', async () => {
+        mockStorage.getSignedMultipartUploadUrl.mockRejectedValue(new Error('S3 down'));
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.useSignedUrl).toBe(false);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+    });
+
+    it('should return useSignedUrl=false and roll back when single-part signing returns null', async () => {
+        // First call is the presign health test (succeeds), second is the real URL
+        mockStorage.getSignedUploadUrl
+            .mockResolvedValueOnce('https://s3.example.com/upload?signed=true')
+            .mockResolvedValueOnce(null);
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        // Must never respond with { useSignedUrl: true, url: null }
+        expect(body.useSignedUrl).toBe(false);
+        expect(body.url ?? null).toBeNull();
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+    });
+
+    it('should pin every multipart operation to the provider captured at request start', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        // createMultipartUpload(id, objectExpires, providerId)
+        expect(mockStorage.createMultipartUpload.mock.calls[0][2]).toBe('default');
+        // getSignedMultipartUploadUrl(id, uploadId, partNumber, expiresIn, providerId)
+        for (const call of mockStorage.getSignedMultipartUploadUrl.mock.calls) {
+            expect(call[4]).toBe('default');
+        }
+    });
+
+    it('should sign the single-part URL with the 7-day expiry and pinned provider', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
+
+        // Second call is the real upload URL (first is the presign health test)
+        const call = mockStorage.getSignedUploadUrl.mock.calls[1] as unknown[];
+        expect(call[1]).toBe(7 * 24 * 60 * 60); // expiresIn, not the 1h default
+        expect(call[3]).toBe('default'); // providerId pinned
+    });
 });
 
 describe('POST /upload/complete', () => {
@@ -328,6 +395,8 @@ describe('POST /upload/complete', () => {
         mockStorage.setField.mockResolvedValue(undefined);
         mockStorage.completeMultipartUpload.mockReset();
         mockStorage.completeMultipartUpload.mockResolvedValue(undefined);
+        mockStorage.length.mockReset();
+        mockStorage.length.mockResolvedValue(0);
         mockRedis.hDel.mockReset();
         mockRedis.hDel.mockResolvedValue(undefined);
     });
@@ -639,6 +708,127 @@ describe('POST /upload/complete', () => {
         expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Too many parts');
+    });
+
+    it('should return 400 when part numbers have a gap (missing data)', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 4 }),
+        );
+
+        // Part 3 missing — S3 would complete this into a silently corrupt object
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+            { PartNumber: 4, ETag: '"etag4"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('contiguous');
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should return 400 when part numbers contain duplicates', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 3 }),
+        );
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2a"' },
+            { PartNumber: 2, ETag: '"etag2b"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(400);
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should return 400 when part numbers do not start at 1', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 3 }),
+        );
+
+        const parts = [
+            { PartNumber: 2, ETag: '"etag2"' },
+            { PartNumber: 3, ETag: '"etag3"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(400);
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should return 400 for an empty parts array instead of a cryptic S3 error', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 2 }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts: [] }));
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toContain('Missing parts data');
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should allow completion with fewer parts than allocated (stream ended early)', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
+        );
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+            { PartNumber: 3, ETag: '"etag3"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.success).toBe(true);
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(1);
+    });
+
+    it('should finish completion when NoSuchUpload hides an already-finalized object', async () => {
+        // CompleteMultipartUpload committed on a previous attempt (lost response
+        // or SDK-internal retry) — S3 reports the uploadId as gone, but the
+        // object exists. The route must finalize auth/metadata, not 404, or
+        // the fully-uploaded file is permanently dead.
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 2 }),
+        );
+        const err = new Error('NoSuchUpload');
+        err.name = 'NoSuchUpload';
+        mockStorage.completeMultipartUpload.mockRejectedValue(err);
+        mockStorage.length.mockResolvedValue(12_345_678); // object exists
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.success).toBe(true);
+        // auth must have been stored so the file becomes downloadable
+        const authCalls = mockStorage.setField.mock.calls.filter(
+            (call: unknown[]) => call[1] === 'auth',
+        );
+        expect(authCalls.length).toBe(1);
     });
 
     it('should return 404 for NoSuchUpload error', async () => {

@@ -128,20 +128,16 @@ async function measureUploadSpeed(): Promise<number> {
                     }
                 });
 
+                // loadend fires after load, error, AND abort — it is the single
+                // terminal event. Counting 'error' separately would double-count
+                // failed parts and finish() early while other parts are still
+                // in flight (leaving them running unmeasured and unaborted).
                 xhr.addEventListener('loadend', () => {
                     if (xhr.status >= 200 && xhr.status < 300) {
                         partBytes[i] = SPEEDTEST_PART_SIZE;
                     }
                     completedCount++;
                     // All parts done before timeout
-                    if (completedCount === data.parts.length) {
-                        clearTimeout(timeout);
-                        finish();
-                    }
-                });
-
-                xhr.addEventListener('error', () => {
-                    completedCount++;
                     if (completedCount === data.parts.length) {
                         clearTimeout(timeout);
                         finish();
@@ -499,11 +495,14 @@ export class Canceller {
 
     cancel() {
         this.cancelled = true;
-        this.xhrs.forEach((xhr) => {
+        // Iterate a snapshot: xhr.abort() fires loadend synchronously, whose
+        // handlers call removeXhr() and would mutate this.xhrs mid-iteration,
+        // skipping every other in-flight request
+        for (const xhr of [...this.xhrs]) {
             if (xhr.readyState !== XMLHttpRequest.DONE) {
                 xhr.abort();
             }
-        });
+        }
     }
 
     addXhr(xhr: XMLHttpRequest) {
@@ -1064,6 +1063,7 @@ export async function uploadFiles(
     };
 
     let uploadResult: { actualSize: number; parts?: { PartNumber: number; ETag: string }[] };
+    let uploadSucceeded = false;
 
     try {
         if (uploadInfo.multipart && uploadInfo.parts) {
@@ -1173,6 +1173,13 @@ export async function uploadFiles(
                     throw new Error('Pre-signed URLs not available for fallback');
                 }
 
+                // The persisted resume state points at the multipart upload we
+                // just aborted — remove it so the next visit doesn't offer a
+                // resume that can only fail with "session expired"
+                deleteUploadState(uploadInfo.id).catch(() => {
+                    // Intentionally ignored — best-effort cleanup
+                });
+
                 // Use the new file ID and owner from the fallback response
                 uploadInfo = fallbackInfo;
 
@@ -1238,6 +1245,7 @@ export async function uploadFiles(
         }
 
         await completeResponse.json();
+        uploadSucceeded = true;
 
         // Clean up persisted upload state
         if (uploadInfo.multipart) {
@@ -1270,6 +1278,16 @@ export async function uploadFiles(
             deleteUploadState(uploadInfo.id).catch(() => {
                 // Intentionally ignored — best-effort cleanup
             });
+        } else if (!uploadSucceeded && uploadInfo.multipart && isMultiFile) {
+            // Terminal failure of a non-resumable upload (multi-file zips are
+            // never persisted for resume): nothing will ever pick these parts
+            // up again, so abort the server-side multipart instead of leaving
+            // S3 parts + Redis metadata + the provider file counter dangling.
+            // Single-file uploads are left intact — their persisted state
+            // powers the resume prompt on the next visit.
+            if (uploadInfo.uploadId) {
+                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+            }
         }
     }
 }
@@ -2307,7 +2325,22 @@ function uploadPart(
             canceller.removeXhr(xhr);
 
             if (xhr.status >= 200 && xhr.status < 300) {
-                const etag = xhr.getResponseHeader('ETag') || '';
+                const etag = xhr.getResponseHeader('ETag');
+                if (!etag) {
+                    // Without the ETag, CompleteMultipartUpload is guaranteed to
+                    // fail with InvalidPart after every byte has been uploaded.
+                    // This is a bucket CORS misconfiguration (ETag missing from
+                    // ExposeHeaders) — fail fast with an actionable error.
+                    const err = new Error(
+                        `Part ${partNumber} uploaded but the ETag response header is not visible — check the bucket CORS ExposeHeaders configuration`,
+                    );
+                    captureError(err, {
+                        operation: 'upload.part.missing-etag',
+                        extra: { partNumber, blobSize: blob.size },
+                    });
+                    reject(err);
+                    return;
+                }
                 // Use progressTotal as the definitive byte count — if the browser
                 // determined a different Content-Length than blob.size (e.g. iOS
                 // transcoding changed actual file bytes), progressTotal reflects

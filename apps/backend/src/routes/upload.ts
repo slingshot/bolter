@@ -198,10 +198,15 @@ export const uploadRoutes = new Elysia()
                     'Multipart upload plan calculated',
                 );
 
-                // Create multipart upload
+                // Create multipart upload (pinned to the provider captured above —
+                // re-resolving "active" here could race a concurrent activation)
                 logger.info({ requestId, id }, 'Creating multipart upload');
                 const multipartStartTime = Date.now();
-                const uploadId = await storage.createMultipartUpload(id, objectExpires);
+                const uploadId = await storage.createMultipartUpload(
+                    id,
+                    objectExpires,
+                    activeProviderId,
+                );
                 const multipartDuration = Date.now() - multipartStartTime;
 
                 if (!uploadId) {
@@ -213,6 +218,9 @@ export const uploadRoutes = new Elysia()
                         { requestId, id, multipartDuration },
                         'Failed to create multipart upload',
                     );
+                    // Roll back the metadata written above — storage.del also
+                    // decrements the provider file counter
+                    await storage.del(id);
                     return { useSignedUrl: false };
                 }
 
@@ -231,46 +239,68 @@ export const uploadRoutes = new Elysia()
                     'Starting URL generation',
                 );
 
-                for (let batchStart = 1; batchStart <= numParts; batchStart += BATCH_SIZE) {
-                    const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, numParts);
-                    const batchPromises: Promise<PartInfo>[] = [];
+                try {
+                    for (let batchStart = 1; batchStart <= numParts; batchStart += BATCH_SIZE) {
+                        const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, numParts);
+                        const batchPromises: Promise<PartInfo>[] = [];
 
-                    logger.debug({ requestId, id, batchStart, batchEnd }, 'Processing URL batch');
+                        logger.debug(
+                            { requestId, id, batchStart, batchEnd },
+                            'Processing URL batch',
+                        );
 
-                    for (let i = batchStart; i <= batchEnd; i++) {
-                        batchPromises.push(
-                            storage
-                                .getSignedMultipartUploadUrl(
+                        for (let i = batchStart; i <= batchEnd; i++) {
+                            batchPromises.push(
+                                storage
+                                    .getSignedMultipartUploadUrl(
+                                        id,
+                                        uploadId,
+                                        i,
+                                        URL_EXPIRATION_SECONDS,
+                                        activeProviderId,
+                                    )
+                                    .then((url) => ({
+                                        partNumber: i,
+                                        url,
+                                        minSize: i === numParts ? 0 : partSize,
+                                        maxSize: partSize,
+                                    })),
+                            );
+                        }
+
+                        const batchParts = await Promise.all(batchPromises);
+                        parts.push(...batchParts);
+
+                        if (numParts > 100 || batchStart === 1) {
+                            logger.info(
+                                {
+                                    requestId,
                                     id,
-                                    uploadId,
-                                    i,
-                                    URL_EXPIRATION_SECONDS,
-                                )
-                                .then((url) => ({
-                                    partNumber: i,
-                                    url,
-                                    minSize: i === numParts ? 0 : partSize,
-                                    maxSize: partSize,
-                                })),
-                        );
+                                    generated: parts.length,
+                                    total: numParts,
+                                    percentage: Math.round((parts.length / numParts) * 100),
+                                    elapsed: Date.now() - urlGenStartTime,
+                                },
+                                'URL generation progress',
+                            );
+                        }
                     }
-
-                    const batchParts = await Promise.all(batchPromises);
-                    parts.push(...batchParts);
-
-                    if (numParts > 100 || batchStart === 1) {
-                        logger.info(
-                            {
-                                requestId,
-                                id,
-                                generated: parts.length,
-                                total: numParts,
-                                percentage: Math.round((parts.length / numParts) * 100),
-                                elapsed: Date.now() - urlGenStartTime,
-                            },
-                            'URL generation progress',
-                        );
-                    }
+                } catch (e) {
+                    captureError(e, {
+                        operation: 'upload.multipart-sign',
+                        extra: { requestId, id, uploadId, numParts, generated: parts.length },
+                    });
+                    logger.error(
+                        { requestId, id, uploadId, error: e },
+                        'Failed to generate multipart upload URLs',
+                    );
+                    // Roll back so the S3 upload, Redis metadata, and provider
+                    // file counter don't leak until TTL/lifecycle
+                    await storage.abortMultipartUpload(id, uploadId, activeProviderId).catch(() => {
+                        // Best-effort — the upload may already be gone
+                    });
+                    await storage.del(id);
+                    return { useSignedUrl: false };
                 }
 
                 const urlGenDuration = Date.now() - urlGenStartTime;
@@ -317,12 +347,15 @@ export const uploadRoutes = new Elysia()
 
                 return response;
             } else {
-                // Single part upload
+                // Single part upload — same 7-day URL validity as multipart parts
+                // (the previous 1-hour default could expire mid-upload on slow links)
                 logger.info({ requestId, id }, 'Generating single upload URL');
                 const singleUrlStartTime = Date.now();
                 const uploadUrl = await storage.getSignedUploadUrl(
                     id,
-                    new Date(Date.now() + URL_EXPIRATION_SECONDS * 1000),
+                    URL_EXPIRATION_SECONDS,
+                    objectExpires,
+                    activeProviderId,
                 );
                 const singleUrlDuration = Date.now() - singleUrlStartTime;
 
@@ -336,6 +369,14 @@ export const uploadRoutes = new Elysia()
                     },
                     'Single upload URL generated',
                 );
+
+                if (!uploadUrl) {
+                    // Never hand the client { useSignedUrl: true, url: null } —
+                    // roll back the metadata + provider counter and signal fallback
+                    logger.error({ requestId, id }, 'Failed to sign single upload URL');
+                    await storage.del(id);
+                    return { useSignedUrl: false };
+                }
 
                 const response = {
                     useSignedUrl: true,
@@ -517,6 +558,32 @@ export const uploadRoutes = new Elysia()
                         ETag: p.ETag,
                     }));
 
+                // Every legitimate client path produces parts numbered 1..k with no
+                // gaps (fewer than allocated is fine — the stream may end early).
+                // S3 would happily complete a gapped list, producing a silently
+                // corrupt object with missing byte ranges, so reject it here.
+                if (sortedParts.length === 0) {
+                    logger.warn({ requestId, id }, 'Empty parts list for multipart upload');
+                    set.status = 400;
+                    return { error: 'Missing parts data' };
+                }
+                const nonContiguous = sortedParts.some((p, idx) => p.PartNumber !== idx + 1);
+                if (nonContiguous) {
+                    logger.warn(
+                        {
+                            requestId,
+                            id,
+                            partNumbers: sortedParts.map((p) => p.PartNumber),
+                        },
+                        'Non-contiguous or duplicate part numbers in completion request',
+                    );
+                    set.status = 400;
+                    return {
+                        error: 'Invalid parts list: part numbers must be contiguous starting at 1',
+                        status: 400,
+                    };
+                }
+
                 logger.info(
                     {
                         requestId,
@@ -582,8 +649,24 @@ export const uploadRoutes = new Elysia()
                     // AWS SDK v3 uses err.name for S3 error codes (e.g. "EntityTooSmall"),
                     // while err.code may be undefined. Check both for compatibility.
                     if (errorCode === 'NoSuchUpload') {
-                        set.status = 404;
-                        return { error: 'Upload not found or expired', status: 404 };
+                        // NoSuchUpload can mean the completion already committed: the
+                        // SDK may retry a CompleteMultipartUpload whose response was
+                        // lost, or an earlier request may have crashed after the S3
+                        // call but before the auth write. If the object exists, keep
+                        // going and finalize metadata/auth — returning 404 here would
+                        // strand a fully-uploaded object as a permanently dead file.
+                        const alreadyFinalized = await storage
+                            .length(id)
+                            .then((len) => len > 0)
+                            .catch(() => false);
+                        if (!alreadyFinalized) {
+                            set.status = 404;
+                            return { error: 'Upload not found or expired', status: 404 };
+                        }
+                        logger.warn(
+                            { requestId, id, uploadId },
+                            'Multipart upload already finalized at S3 — continuing completion',
+                        );
                     } else if (errorCode === 'InvalidPart' || errorCode === 'InvalidPartOrder') {
                         set.status = 400;
                         return { error: 'Invalid upload parts', status: 400 };
@@ -593,9 +676,9 @@ export const uploadRoutes = new Elysia()
                             error: 'One or more upload parts are smaller than the 5MB minimum. This can happen on iOS when the browser transcodes media files during upload. Please try again.',
                             status: 400,
                         };
+                    } else {
+                        throw e;
                     }
-
-                    throw e;
                 }
 
                 // Clean up multipart metadata
