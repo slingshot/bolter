@@ -22,3 +22,4 @@ export const uploadLogger = logger.child({ module: 'upload' });
 export const downloadLogger = logger.child({ module: 'download' });
 export const storageLogger = logger.child({ module: 'storage' });
 export const providerLogger = logger.child({ module: 'provider' });
+export const plausibleLogger = logger.child({ module: 'plausible' });

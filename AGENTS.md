@@ -88,6 +88,7 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 - `apps/backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints
 - `apps/backend/src/routes/download.ts` - URL signing, download count enforcement
 - `apps/backend/src/routes/providers.ts` - Provider CRUD API (admin-only, protected by `ADMIN_API_KEY`)
+- `apps/backend/src/routes/plausible.ts` - Analytics proxy (`/pl/api/event` → plausible.io). Visitor IP comes from `cf-connecting-ip` first — Cloudflare sets it to the real visitor and it survives Railway's edge/CDN rewrites of `x-forwarded-for`. Plausible silently bot-filters events whose leftmost forwarded IP is a datacenter IP (202 + `x-plausible-dropped: 1` response header), so the proxy logs dropped events and propagates the header to the browser
 - `apps/backend/src/storage/s3.ts` - S3 client with explicit config (supports multiple instances per provider)
 - `apps/backend/src/storage/provider-registry.ts` - Provider registry with Redis persistence and in-memory caching
 - `apps/backend/src/storage/index.ts` - Storage facade routing operations to the correct provider
