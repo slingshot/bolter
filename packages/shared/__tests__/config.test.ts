@@ -50,8 +50,8 @@ describe('UPLOAD_LIMITS', () => {
         expect(UPLOAD_LIMITS.MAX_PART_SIZE).toBe(5 * BYTES.GB);
     });
 
-    it('should set MIN_PART_SIZE to 5 MB', () => {
-        expect(UPLOAD_LIMITS.MIN_PART_SIZE).toBe(5 * BYTES.MB);
+    it('should set MIN_PART_SIZE to 5 MiB (S3/R2 enforce MiB, not decimal MB)', () => {
+        expect(UPLOAD_LIMITS.MIN_PART_SIZE).toBe(5 * 1024 * 1024);
     });
 
     it('should set MAX_PARTS to 10000 (R2 limit)', () => {

@@ -67,10 +67,15 @@ export const storage = {
 
     // --- Upload operations (target active provider) ---
 
-    async getSignedUploadUrl(id: string, objectExpires?: Date): Promise<string | null> {
+    async getSignedUploadUrl(
+        id: string,
+        expiresIn = 3600,
+        objectExpires?: Date,
+        providerId?: string,
+    ): Promise<string | null> {
         try {
-            const provider = providerRegistry.getActiveProvider();
-            return await provider.getSignedUploadUrl(id, 3600, objectExpires);
+            const provider = resolveProviderById(providerId);
+            return await provider.getSignedUploadUrl(id, expiresIn, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.sign-upload', extra: { id } });
             console.error('Failed to get signed upload URL:', e);
@@ -78,9 +83,13 @@ export const storage = {
         }
     },
 
-    async createMultipartUpload(id: string, objectExpires?: Date): Promise<string | null> {
+    async createMultipartUpload(
+        id: string,
+        objectExpires?: Date,
+        providerId?: string,
+    ): Promise<string | null> {
         try {
-            const provider = providerRegistry.getActiveProvider();
+            const provider = resolveProviderById(providerId);
             return await provider.createMultipartUpload(id, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.create-multipart', extra: { id } });
