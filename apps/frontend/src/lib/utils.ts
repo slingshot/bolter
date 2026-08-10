@@ -106,9 +106,44 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * Marker for placeholder Blobs standing in for a payload that has already been
+ * streamed to disk (File System Access / service-worker download stream).
+ *
+ * `Symbol.for` keeps the marker stable even if this module is instantiated
+ * twice (duplicated chunk, test module registry).
+ */
+const SAVED_TO_DISK = Symbol.for('bolter.saved-to-disk');
+
+/**
+ * Tag a placeholder Blob as "already written to disk" so `triggerDownload`
+ * does not save a second, empty copy on top of the streamed file.
+ */
+export function markSavedToDisk<T extends Blob>(blob: T): T {
+    Object.defineProperty(blob, SAVED_TO_DISK, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+    });
+    return blob;
+}
+
+/** True when the Blob is a placeholder for a payload already saved to disk. */
+export function isSavedToDisk(blob: Blob): boolean {
+    return (blob as unknown as Record<symbol, unknown>)[SAVED_TO_DISK] === true;
+}
+
+/**
  * Trigger file download
  */
 export function triggerDownload(blob: Blob, filename: string): void {
+    // Streaming saves (File System Access API / service-worker download
+    // stream) have already delivered the bytes; the returned Blob is an empty
+    // placeholder and object-URL-saving it would overwrite the real file with
+    // 0 bytes.
+    if (isSavedToDisk(blob)) {
+        return;
+    }
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;

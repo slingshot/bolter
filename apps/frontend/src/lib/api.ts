@@ -16,6 +16,7 @@ import {
 } from './crypto';
 import { FileReadError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
+import { createDownloadWriter, savedToDiskPlaceholder } from './stream-saver';
 import {
     deleteUploadState,
     type PersistedUpload,
@@ -2984,16 +2985,24 @@ export async function downloadFile(
         outputStream = bodyStream.pipeThrough(progressStream);
     }
 
-    // Collect decrypted output into intermediate Blobs every 64MB.
-    // This keeps JS heap usage low — browsers back Blobs with disk for
-    // large data, so only ~64MB of Uint8Array chunks are live at a time
-    // instead of the entire file buffered 3-4x.
-    const CONSOLIDATION_SIZE = 64 * 1024 * 1024;
-    const blobs: Blob[] = [];
-    let pending: Uint8Array[] = [];
-    let pendingSize = 0;
-    let decryptedSize = 0;
+    // Write decrypted output straight to disk as it arrives. Accumulating it
+    // into Blobs bounded JS heap but not total retained bytes, so an encrypted
+    // file far below the advertised maximum could crash the tab before the
+    // save even started. The writer streams via the File System Access API or
+    // a service-worker download stream; buffering in memory is a last resort
+    // that is size-capped and warns first.
+    const outputFilename = metadata.zipped
+        ? metadata.zipFilename || generateZipFilename(files || [])
+        : metadata.name || 'download';
+    const outputMimeType = metadata.zipped ? 'application/zip' : undefined;
+    const writer = await createDownloadWriter({
+        filename: outputFilename,
+        mimeType: outputMimeType,
+        expectedSize: metadata.size > 0 ? metadata.size : total,
+    });
+    dlLog('Save target ready', { strategy: writer.strategy, filename: outputFilename });
 
+    let decryptedSize = 0;
     const reader = outputStream.getReader();
 
     try {
@@ -3003,17 +3012,17 @@ export async function downloadFile(
                 break;
             }
 
-            pending.push(value);
-            pendingSize += value.length;
-            decryptedSize += value.length;
-
-            if (pendingSize >= CONSOLIDATION_SIZE) {
-                blobs.push(new Blob(pending as BlobPart[]));
-                pending = [];
-                pendingSize = 0;
+            if (value.length === 0) {
+                continue;
             }
+
+            decryptedSize += value.length;
+            await writer.write(value);
         }
     } catch (e) {
+        // Discard the partially written file so a failed transfer never leaves
+        // a truncated download behind.
+        await writer.abort(e);
         const message = e instanceof Error ? e.message : String(e);
         captureError(e, {
             operation: 'download.stream',
@@ -3022,24 +3031,28 @@ export async function downloadFile(
                 encrypted: metadata.encrypted,
                 bytesDownloaded: loaded,
                 bytesDecrypted: decryptedSize,
+                saveStrategy: writer.strategy,
                 errorMessage: message,
             },
         });
         throw new Error(`Download stream failed: ${message}`);
     }
 
-    if (pending.length > 0) {
-        blobs.push(new Blob(pending as BlobPart[]));
-    }
-
     const streamElapsed = Math.max(Date.now() - streamStart, 1);
     dlLog('Streaming download complete', {
         downloadedBytes: loaded,
         decryptedBytes: decryptedSize,
-        blobParts: blobs.length,
+        saveStrategy: writer.strategy,
         elapsed: `${(streamElapsed / 1000).toFixed(1)}s`,
         speed: `${(loaded / (1024 * 1024) / (streamElapsed / 1000)).toFixed(1)} MB/s`,
     });
+
+    // The integrity guards below throw before the file is committed. Nothing
+    // else would then tear the writer down, so a short watchdog discards the
+    // partially written file; it is cleared the moment we reach the commit.
+    const commitWatchdog = setTimeout(() => {
+        void writer.abort(new Error('Download failed integrity validation'));
+    }, 5_000);
 
     // Integrity checks: fail loudly on truncation instead of returning a
     // partial file and burning a download credit.
@@ -3075,32 +3088,32 @@ export async function downloadFile(
         }
     }
 
-    // Report download complete
+    clearTimeout(commitWatchdog);
+
+    // Commit the save BEFORE burning a download credit. Reporting completion
+    // first meant an OOM or a failed save consumed one of the file's limited
+    // downloads while delivering nothing.
     onPhase?.('finalizing');
+    dlLog('Committing save', { strategy: writer.strategy, filename: outputFilename });
+    await writer.close();
+
     dlLog('Reporting download complete to server...');
     await reportDownloadComplete(id, keychain);
 
-    if (metadata.zipped) {
-        dlLog('Returning zipped file', {
-            filename: metadata.zipFilename,
-            size: decryptedSize,
-        });
-        return {
-            blob: new Blob(blobs, { type: 'application/zip' }),
-            filename: metadata.zipFilename || generateZipFilename(files || []),
-        };
-    }
-
     const totalElapsed = Date.now() - dlStart;
     dlLog('Download complete', {
-        filename: metadata.name,
+        filename: outputFilename,
         size: decryptedSize,
         sizeMB: Math.round((decryptedSize / (1024 * 1024)) * 10) / 10,
+        saveStrategy: writer.strategy,
         totalElapsed: `${(totalElapsed / 1000).toFixed(1)}s`,
     });
+    // The bytes are already on disk (or, for the buffered fallback, already
+    // handed to the browser). The placeholder tells triggerDownload not to
+    // save an empty second copy over the real file.
     return {
-        blob: new Blob(blobs),
-        filename: metadata.name || 'download',
+        blob: savedToDiskPlaceholder(),
+        filename: outputFilename,
     };
 }
 
