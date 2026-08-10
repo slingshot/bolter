@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chunkedFile, FakeXhr, multipartUploadInfo } from '@/lib/__tests__/upload-xhr-fake';
 import type { PersistedUpload } from '@/lib/upload-state';
-import { setWorkerFactory } from '../client';
+import { currentUploadAttempt, setWorkerFactory } from '../client';
 import type { ClientToWorker, EngineProbeResult, WorkerToClient } from '../protocol';
 import { openEngineState } from '../state';
 
@@ -272,6 +272,44 @@ describe('engine delegation in uploadFiles', () => {
         // The legacy multipart path did the work: part PUTs + main-thread complete
         expect(FakeXhr.sends.filter((s) => s.url.includes('s3.example.com/part')).length).toBe(11);
         expect(fetchCalls.some((u) => u.includes('/upload/complete'))).toBe(true);
+    });
+
+    it("re-labels the attempt 'legacy' when the backend declines multipart", async () => {
+        // Declared input passes the engine gate, but the allocation comes
+        // back non-multipart (realistic for compressible multi-file batches
+        // whose DEFLATE zip shrinks under the backend threshold). The legacy
+        // pipeline performs the upload — the attempt and success telemetry
+        // must say so, with the fallback reason recorded [R16].
+        const { trackUploadAttempt } = await import('@/lib/plausible');
+        vi.mocked(trackUploadAttempt).mockClear();
+        uploadUrlResponse = {
+            useSignedUrl: true,
+            multipart: false,
+            id: 'file-id',
+            owner: 'owner-token',
+            url: 'https://s3.example.com/single',
+        };
+
+        const result = await uploadFiles(
+            { files: [makeFile(1024, 150 * MB)], encrypted: false },
+            new Keychain(),
+            new Canceller(),
+        );
+
+        expect(result.id).toBe('file-id');
+        // The legacy pipeline did the work (single PUT from the main thread).
+        expect(FakeXhr.sends.length).toBe(1);
+        // The unused engine allocation was released.
+        expect(fetchCalls.some((u) => u.includes('/delete/file-id'))).toBe(true);
+
+        const attempts = vi.mocked(trackUploadAttempt).mock.calls.map(([props]) => props);
+        expect(attempts[0]).toMatchObject({ engine: 'worker' });
+        expect(attempts[attempts.length - 1]).toMatchObject({
+            engine: 'legacy',
+            reason: 'backend-declined-multipart',
+        });
+        // Home stamps the success event from this — it must credit legacy.
+        expect(currentUploadAttempt()?.engine).toBe('legacy');
     });
 
     it('uses the legacy pipeline for small uploads without probing', async () => {

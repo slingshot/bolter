@@ -29,6 +29,7 @@ import {
     getEngineLease,
     hasEngineLease,
     probeEligibility,
+    recordEngineFallback,
     resumeEngineUploadInWorker,
     runEngineInWorker,
 } from './upload-engine/client';
@@ -1666,8 +1667,11 @@ async function uploadFilesViaEngine(
     if (!uploadInfo.multipart || !uploadInfo.parts || !uploadInfo.uploadId) {
         // The backend sized this allocation below its multipart threshold and
         // the engine only runs multipart. Release the allocation and fall
-        // through to the legacy pipeline (which allocates afresh).
+        // through to the legacy pipeline (which allocates afresh) — and
+        // re-label the telemetry attempt, or the success event would credit
+        // the worker engine for a legacy-performed upload [R16].
         console.log('[Upload] Backend declined multipart — using legacy pipeline');
+        recordEngineFallback('backend-declined-multipart');
         await releaseUploadAllocation(uploadInfo.id, uploadInfo.owner);
         return undefined;
     }

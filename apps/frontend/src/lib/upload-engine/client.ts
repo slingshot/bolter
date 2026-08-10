@@ -157,6 +157,20 @@ onStoragePersistResult((result) => {
     }
 });
 
+/**
+ * Record that an upload the probe already labeled `worker` fell back to the
+ * legacy pipeline after the delegation decision (e.g. the backend sized the
+ * allocation below its multipart threshold and declined). Without the
+ * re-label the attempt — and the success event Home stamps from it — would
+ * credit the worker engine for an upload the legacy path performed,
+ * corrupting the evidence base for deleting the legacy pipeline [R16].
+ */
+export function recordEngineFallback(reason: string): void {
+    const attempt = beginTelemetryAttempt('legacy');
+    trackUploadAttempt({ engine: 'legacy', reason, attemptId: attempt.attemptId });
+    flushPendingPersistResult();
+}
+
 function killSwitchOn(): boolean {
     try {
         return (
