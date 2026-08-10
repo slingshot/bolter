@@ -10,8 +10,10 @@
  * worker aborts its XHRs, performs the authenticated server-side abort, and
  * acks with `cancelled` before running its local cleanup. If no ack arrives
  * within 10s wall-clock (worker crashed or suspended), the client terminates
- * the worker and performs the authenticated abort itself — preserving the
- * guarantees of the legacy synchronous `Canceller.cancel()`.
+ * the worker and performs the authenticated abort *and the worker's local
+ * teardown* (engine records + OPFS staging) itself — preserving the
+ * guarantees of the legacy synchronous `Canceller.cancel()`, which also
+ * deletes its persisted resume state on cancel.
  */
 
 import { newUploadAttemptId, trackEngineEvent, trackUploadAttempt } from '../plausible';
@@ -373,18 +375,12 @@ function runWorkerJob(
             post({ type: 'cancel' });
             // Escalation [R6]: no ack within the window means the worker is
             // crashed or suspended — kill it and run the authenticated abort
-            // from the main thread instead.
+            // plus the worker's local teardown from the main thread instead.
             escalationTimer = setTimeout(() => {
                 settle(() => {
                     worker.terminate();
                     engineEvent('cancel', 'escalated');
-                    void abortEngineUpload(
-                        identity.fileId,
-                        identity.uploadId,
-                        identity.uploadToken,
-                    ).catch(
-                        () => undefined, // best-effort — the bucket lifecycle rule reaps leftovers
-                    );
+                    void escalatedCancelCleanup(identity);
                     reject(new Error('Upload cancelled'));
                 });
             }, CANCEL_ACK_TIMEOUT_MS);
@@ -392,6 +388,36 @@ function runWorkerJob(
 
         post(initial);
     });
+}
+
+/**
+ * The escalation path's replacement for the worker's `cancelCleanup`: after
+ * the terminate, run the authenticated server-side abort and then the same
+ * local teardown the acked path performs (engine records + OPFS staging).
+ * Without it a cancelled upload leaves a phantom "Finish upload" resume card,
+ * the staged ciphertext + `secretKeyB64` survive indefinitely behind the
+ * lease, and — if the abort also failed — clicking Finish could genuinely
+ * publish the upload the user cancelled. Every step is best-effort: the
+ * bucket lifecycle rule and startup GC reap whatever a failed step leaves.
+ */
+async function escalatedCancelCleanup(identity: WorkerAbortIdentity): Promise<void> {
+    // Server-side abort first — mirrors the worker's cancelCleanup order, so
+    // the local records survive until the abort has had its chance.
+    await abortEngineUpload(identity.fileId, identity.uploadId, identity.uploadToken).catch(
+        () => undefined,
+    );
+    await clearEngineUploadLocally(identity.fileId);
+}
+
+/** Local half of a discard: engine DB records + the OPFS staging directory. */
+async function clearEngineUploadLocally(fileId: string): Promise<void> {
+    try {
+        const state = await openEngineState();
+        await state.clearUpload(fileId);
+    } catch {
+        // best-effort — lease-expiry GC covers leftovers
+    }
+    await new OpfsPartStore(fileId).destroy().catch(() => undefined);
 }
 
 /**
@@ -544,11 +570,10 @@ export async function discardEngineUpload(fileId: string): Promise<void> {
                 () => undefined,
             );
         }
-        await state.clearUpload(fileId);
     } catch {
         // best-effort — startup GC covers leftovers
     }
-    await new OpfsPartStore(fileId).destroy().catch(() => undefined);
+    await clearEngineUploadLocally(fileId);
 }
 
 // Minimal structural OPFS surface (directory iteration works on the main

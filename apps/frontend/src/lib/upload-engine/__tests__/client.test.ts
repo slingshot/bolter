@@ -10,7 +10,7 @@ vi.mock('@/lib/plausible', () => ({
 
 import { probeEligibility, runEngineInWorker, setWorkerFactory } from '../client';
 import type { ClientToWorker, EngineJob, WorkerToClient } from '../protocol';
-import type { CompletionEnvelope } from '../state';
+import { type CompletionEnvelope, openEngineState } from '../state';
 
 /**
  * Fake Worker installed via `setWorkerFactory` — implements the surface the
@@ -215,5 +215,66 @@ describe('upload-engine client facade', () => {
             uploadToken: 'tok',
         });
         await rejection;
+    });
+
+    it('escalated cancel clears engine state so no phantom resume survives', async () => {
+        // A cancelled upload whose worker never acks (suspended/crashed) must
+        // not leave the lease + envelope + parts behind: they would surface a
+        // "Finish upload" card for an upload the user explicitly cancelled,
+        // and the surviving lease would shield the staged ciphertext (and
+        // secretKeyB64) from GC indefinitely.
+        const fetchSpy = vi.fn().mockResolvedValue(new Response('{"success":true}'));
+        vi.stubGlobal('fetch', fetchSpy);
+        // Seed with real timers — fake-indexeddb schedules its transactions
+        // through them; fake timers go on only around the escalation window.
+        const state = await openEngineState();
+        await state.putLease({
+            fileId: 'f1',
+            uploadId: 'u1',
+            uploadToken: 'tok',
+            ownerToken: 'own',
+            createdAt: Date.now(),
+            engineVersion: 1,
+        });
+        await state.putEnvelope({
+            fileId: 'f1',
+            metadata: 'meta-b64',
+            authKeyB64: 'auth-b64',
+            manifest: [{ name: 'a.bin', size: 4, type: 'application/octet-stream' }],
+            expectedSize: 4,
+            encrypted: true,
+            secretKeyB64: 'secret-b64',
+            timeLimit: 86_400,
+            downloadLimit: 10,
+        });
+        await state.putPart({
+            fileId: 'f1',
+            partNumber: 1,
+            size: 4,
+            staged: true,
+            uploaded: false,
+        });
+        const { hooks } = makeHooks();
+        const { canceller, cancel } = makeCanceller();
+
+        // Fake only setTimeout (the escalation window) — fake-indexeddb needs
+        // its own scheduling primitives real for the cleanup to run.
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const run = runEngineInWorker(makeJob(), makeEnvelope(), hooks, canceller);
+        const rejection = expect(run).rejects.toThrow('Upload cancelled');
+        cancel();
+        await vi.advanceTimersByTimeAsync(10_000);
+        await rejection;
+
+        // The abort ran first, then the local teardown — poll with real
+        // timers since the cleanup floats behind the rejection.
+        vi.useRealTimers();
+        await expect
+            .poll(async () => (await state.getLease('f1')) === undefined, { timeout: 2000 })
+            .toBe(true);
+        expect(await state.getEnvelope('f1')).toBeUndefined();
+        expect(await state.getParts('f1')).toEqual([]);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(String(fetchSpy.mock.calls[0][0])).toContain('/upload/abort/f1');
     });
 });
