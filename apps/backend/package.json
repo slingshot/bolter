@@ -9,7 +9,7 @@
         "build": "bun build src/index.ts --outdir ./dist --target bun --sourcemap=external",
         "build:prod": "bun run build && sentry-cli --url https://glitch.slingshot.fm sourcemaps inject ./dist && sentry-cli --url https://glitch.slingshot.fm sourcemaps upload ./dist",
         "typecheck": "tsc --noEmit",
-        "test": "bun test",
+        "test": "bun test src/__tests__ && bun test src/__isolated_tests__",
         "test:watch": "bun test --watch"
     },
     "dependencies": {

@@ -35,15 +35,13 @@ mock.module('../lib/sentry', () => ({
 // facade in the test is precisely what would let the tracking write silently
 // go missing while the tests stayed green.
 //
-// Earlier test files in the same process register a `mock.module` for
-// `../storage` (which resolves to storage/index.ts), and those registrations
-// are global and permanent. A query-suffixed specifier resolves past the mock
-// registry to the real file; its own imports (./provider-registry, ./redis)
-// still resolve normally, so it shares the real registry singleton and the
-// mocked redis above.
-const { storage, resolveProviderById } = (await import(
-    '../storage/index.ts?real=provider-storage'
-)) as typeof import('../storage/index');
+// This file runs in its own `bun test` process (see `src/__isolated_tests__/README.md`),
+// so no sibling's `mock.module` registration for `../storage`, `../storage/redis`
+// or `../storage/provider-registry` exists here and a plain import resolves the
+// real module graph — facade, registry singleton and the fake S3Storage above all
+// consistently wired. It stays a dynamic import so it is evaluated *after* the
+// `mock.module` calls above rather than being hoisted above them.
+const { storage, resolveProviderById } = await import('../storage/index');
 
 // --- Mock S3Storage so provider instances are identifiable by bucket ---
 
