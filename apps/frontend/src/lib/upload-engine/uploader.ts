@@ -9,8 +9,15 @@
  * the true delta, so cadence is never trusted. Retryable failures back off via
  * the injected `retryDelayMs`, and while `isOnline()` reports offline the
  * retry parks on a 1s wall-clock connectivity poll instead of burning
- * attempts on a dead link. A 403-style pre-signed-URL expiry triggers one
- * `refreshUrls()` per part. On success the uploaded+ETag record is persisted
+ * attempts on a dead link. The relay flag alone is not trusted [R14]: the
+ * worker additionally infers offline from consecutive immediate
+ * connection-shaped failures (instant rejection, zero bytes transferred, no
+ * HTTP status) — once inferred, retries stop consuming the per-part attempt
+ * budget and keep probing at the backoff interval, so a missed `offline`
+ * relay can neither park the upload forever nor burn it to a terminal
+ * failure during an outage the legacy pipeline would have ridden out. Any
+ * transferred byte resets the inference. A 403-style pre-signed-URL expiry
+ * triggers one `refreshUrls()` per part. On success the uploaded+ETag record is persisted
  * **before** the staged bytes are deleted [R11], so a crash between the two
  * re-deletes rather than re-uploads.
  *
@@ -43,6 +50,12 @@ export interface UploaderOpts {
     isOnline(): boolean; // fed by connectivity relay
     stallMs?: number; // default 60_000 wall-clock without progress
     maxAttemptsPerPart?: number; // default 6
+    /** Consecutive immediate connection failures that flip the run to
+     * inferred-offline probing [R14]; default 3. */
+    offlineInferenceThreshold?: number;
+    /** A failure faster than this with zero bytes transferred counts as
+     * "immediate" for offline inference; default 5_000 wall-clock ms. */
+    immediateFailureMs?: number;
     retryDelayMs(attempt: number): number; // from upload-shared (Task 1)
     onProgress(totalBytesSent: number): void;
     onRetry(): void;
@@ -53,6 +66,8 @@ export interface UploaderOpts {
 
 const DEFAULT_STALL_MS = 60_000;
 const DEFAULT_MAX_ATTEMPTS = 6;
+const DEFAULT_OFFLINE_INFERENCE_THRESHOLD = 3;
+const DEFAULT_IMMEDIATE_FAILURE_MS = 5_000;
 /** Coarse stall-poll interval — checks compute wall-clock deltas, so a poll
  * that fires late (throttling, suspension) still measures correctly. */
 const STALL_POLL_MS = 1_000;
@@ -62,6 +77,16 @@ const ONLINE_POLL_MS = 1_000;
 function isUrlExpiryError(error: Error): boolean {
     const msg = (error.message || '').toLowerCase();
     return msg.includes('http 403') || msg.includes('forbidden');
+}
+
+/**
+ * Failure shapes only a dead link produces — the request never got an HTTP
+ * status ("HTTP 0", generic network errors). A fast 5xx/429 is a *server*
+ * answering and must never feed offline inference [R14].
+ */
+function looksLikeConnectionFailure(error: Error): boolean {
+    const msg = (error.message || '').toLowerCase();
+    return msg.includes('http 0') || msg.includes('network') || msg.includes('failed to fetch');
 }
 
 /**
@@ -77,7 +102,17 @@ export async function runUploaders(
 ): Promise<Map<number, string>> {
     const stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
     const maxAttempts = Math.max(1, opts.maxAttemptsPerPart ?? DEFAULT_MAX_ATTEMPTS);
+    const offlineInferenceThreshold = Math.max(
+        1,
+        opts.offlineInferenceThreshold ?? DEFAULT_OFFLINE_INFERENCE_THRESHOLD,
+    );
+    const immediateFailureMs = opts.immediateFailureMs ?? DEFAULT_IMMEDIATE_FAILURE_MS;
     const setTimeoutFn = opts.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+
+    // Offline inference [R14]: run-wide because a dead link fails every
+    // worker's attempts alike, and any transferred byte anywhere proves the
+    // network is alive again.
+    let consecutiveImmediateFailures = 0;
 
     let urls = opts.urls;
     const etags = new Map<number, string>();
@@ -183,6 +218,7 @@ export async function runUploaders(
             return await opts.uploadPart(url, body, {
                 onProgress: (loaded) => {
                     lastProgressAt = opts.now();
+                    consecutiveImmediateFailures = 0; // bytes moved — link is alive
                     inFlight.set(partNumber, loaded);
                     emitProgress();
                 },
@@ -205,6 +241,7 @@ export async function runUploaders(
         let urlRefreshed = false;
         for (let attempt = 0; ; attempt++) {
             throwIfAborted();
+            const attemptStart = opts.now();
             try {
                 const { etag } = await attemptPart(partNumber);
                 inFlight.delete(partNumber);
@@ -237,12 +274,34 @@ export async function runUploaders(
                     opts.onRetry();
                     continue;
                 }
-                if (!isRetryableError(error) || attempt + 1 >= maxAttempts) {
+                if (!isRetryableError(error)) {
+                    throw error;
+                }
+                // Offline inference [R14]: an instant connection-shaped
+                // failure with no bytes transferred looks like a dead link
+                // the relay never told us about.
+                if (
+                    looksLikeConnectionFailure(error) &&
+                    opts.now() - attemptStart < immediateFailureMs
+                ) {
+                    consecutiveImmediateFailures += 1;
+                } else {
+                    consecutiveImmediateFailures = 0;
+                }
+                const inferredOffline = consecutiveImmediateFailures >= offlineInferenceThreshold;
+                if (!inferredOffline && attempt + 1 >= maxAttempts) {
                     throw error;
                 }
                 opts.onRetry();
                 await sleep(opts.retryDelayMs(attempt));
                 await waitForOnline();
+                if (inferredOffline) {
+                    // Parked probing: keep retrying at the backoff interval
+                    // without burning the attempt budget — the run must ride
+                    // out an outage, not die 60s into it. Recovery (any byte
+                    // of progress) resets the inference and the budget rules.
+                    attempt -= 1;
+                }
             }
         }
     };

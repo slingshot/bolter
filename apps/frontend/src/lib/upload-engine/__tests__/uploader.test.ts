@@ -493,6 +493,93 @@ describe('runUploaders', () => {
         expect(retries).toBe(1);
     });
 
+    it('infers offline from consecutive immediate failures instead of dying (spec R14)', async () => {
+        // The relayed online flag is stale-true (the offline event never
+        // reached the worker). Each attempt fails instantly with "HTTP 0";
+        // without inference the run would burn maxAttemptsPerPart and reject.
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let calls = 0;
+        let networkDead = true;
+        const uploadPart: UploaderOpts['uploadPart'] = () => {
+            calls += 1;
+            if (networkDead) {
+                return Promise.reject(new Error('HTTP 0'));
+            }
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                maxAttemptsPerPart: 4,
+                retryDelayMs: () => 10,
+                isOnline: () => true, // missed relay — flag stays optimistic
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        run.catch(() => undefined);
+
+        // Ride far past what used to be the whole attempt budget…
+        for (let i = 0; i < 12; i++) {
+            clock.advance(10);
+            await flush();
+        }
+        // …the run is still alive, probing on the backoff interval.
+        expect(calls).toBeGreaterThan(4);
+
+        networkDead = false;
+        clock.advance(10);
+        await flush();
+        expect(await run).toEqual(new Map([[1, 'etag-1']]));
+    });
+
+    it('a fast server error never feeds offline inference', async () => {
+        // HTTP 429 answers arrive instantly too, but a responding server is
+        // not a dead link — the attempt budget must still apply.
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let calls = 0;
+        const uploadPart: UploaderOpts['uploadPart'] = () => {
+            calls += 1;
+            return Promise.reject(new Error('HTTP 429 (Too Many Requests)'));
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                maxAttemptsPerPart: 4,
+                offlineInferenceThreshold: 3,
+                retryDelayMs: () => 10,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        run.catch(() => undefined);
+        for (let i = 0; i < 12; i++) {
+            clock.advance(10);
+            await flush();
+        }
+
+        await expect(run).rejects.toThrow('HTTP 429');
+        expect(calls).toBe(4);
+    });
+
     it('refreshes expired URLs once per part and retries with the fresh URL', async () => {
         const store = new MemoryPartStore();
         const { state } = fakeState();
