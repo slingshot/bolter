@@ -162,6 +162,27 @@ describe('upload-engine client facade', () => {
         await expect(run).rejects.toThrow('part sequence invalid: no parts');
     });
 
+    it('failure telemetry detail carries the pipeline stage', async () => {
+        const { trackEngineEvent } = await import('@/lib/plausible');
+        vi.mocked(trackEngineEvent).mockClear();
+        const { hooks } = makeHooks();
+        const { canceller } = makeCanceller();
+
+        const run = runEngineInWorker(makeJob(), makeEnvelope(), hooks, canceller);
+        const worker = FakeWorker.instances[0];
+        worker.emit({
+            type: 'error',
+            message: 'OPFS quota exhausted while staging part 2',
+            retryable: true,
+            stage: 'stager-quota',
+        });
+
+        await expect(run).rejects.toThrow(/quota/);
+        expect(vi.mocked(trackEngineEvent)).toHaveBeenCalledWith(
+            expect.objectContaining({ event: 'failure', detail: 'stager-quota:retryable' }),
+        );
+    });
+
     it('relays online/offline window events as connectivity messages', async () => {
         const { hooks } = makeHooks();
         const { canceller } = makeCanceller();

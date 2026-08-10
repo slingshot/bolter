@@ -365,7 +365,14 @@ function runWorkerJob(
                 case 'error':
                     settle(() => {
                         worker.terminate();
-                        engineEvent('failure', message.retryable ? 'retryable' : 'fatal');
+                        // Failure telemetry carries the pipeline stage [R16]
+                        // — quota exhaustion, transport faults, and
+                        // completion rejections must be distinguishable.
+                        const severity = message.retryable ? 'retryable' : 'fatal';
+                        engineEvent(
+                            'failure',
+                            message.stage ? `${message.stage}:${severity}` : severity,
+                        );
                         reject(new EngineWorkerError(message.message, message.retryable));
                     });
                     break;

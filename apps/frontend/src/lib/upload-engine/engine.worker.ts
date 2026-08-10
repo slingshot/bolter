@@ -91,6 +91,7 @@ async function runJob(
             type: 'error',
             message: 'engine worker already has an active job',
             retryable: false,
+            stage: 'engine',
         });
         return;
     }
@@ -107,6 +108,7 @@ async function runJob(
                 // An environment fault (IndexedDB unavailable, OPFS gone), not
                 // a verdict on the upload — the caller may retry or fall back.
                 retryable: true,
+                stage: 'engine',
             });
             return;
         }
@@ -121,7 +123,7 @@ async function runJob(
                 // The engine never ran, so nothing posted a terminal event.
                 // Retryable: the upload is alive in the other holder — this
                 // attempt is redundant, not broken.
-                post({ type: 'error', message: err.message, retryable: true });
+                post({ type: 'error', message: err.message, retryable: true, stage: 'engine' });
                 return;
             }
             // Terminal events (`done` / `error` / `cancelled`) are posted by

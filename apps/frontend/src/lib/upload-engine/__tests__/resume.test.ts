@@ -392,6 +392,7 @@ describe('executeResume', () => {
             type: 'error',
             message: expect.stringContaining('network error'),
             retryable: true,
+            stage: 'completion',
         });
     });
 

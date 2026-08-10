@@ -296,12 +296,12 @@ export async function executeResume(
         const error = new Error(
             `upload ${fileId} is not resumable: no engine lease or completion envelope`,
         );
-        deps.onEvent({ type: 'error', message: error.message, retryable: false });
+        deps.onEvent({ type: 'error', message: error.message, retryable: false, stage: 'resume' });
         throw error;
     }
     if (plan.action === 'need-source') {
         const error = new ResumeNeedsSourceError(plan.kind);
-        deps.onEvent({ type: 'error', message: error.message, retryable: false });
+        deps.onEvent({ type: 'error', message: error.message, retryable: false, stage: 'resume' });
         throw error;
     }
     if (plan.action === 'replay-complete') {
@@ -313,6 +313,7 @@ export async function executeResume(
                 type: 'error',
                 message: error.message,
                 retryable: isRetryableError(error),
+                stage: 'completion',
             });
             throw error;
         }

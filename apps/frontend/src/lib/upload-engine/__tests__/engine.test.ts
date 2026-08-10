@@ -211,11 +211,11 @@ interface Harness {
 
 function makeHarness(
     urls: string[],
-    opts?: { uploadPart?: (harness: Harness) => EngineDeps['uploadPart'] },
+    opts?: { uploadPart?: (harness: Harness) => EngineDeps['uploadPart']; store?: PartStore },
 ): Harness {
     const log: string[] = [];
     const { state } = fakeState(log);
-    const store = new RecordingPartStore(new MemoryPartStore(), log);
+    const store = new RecordingPartStore(opts?.store ?? new MemoryPartStore(), log);
     const events: WorkerToClient[] = [];
     const bodies = new Map<number, Uint8Array>();
     const completions: Harness['completions'] = [];
@@ -420,6 +420,7 @@ describe('runEngine', () => {
             type: 'error',
             message: expect.stringContaining('network error'),
             retryable: true,
+            stage: 'uploader',
         });
         // Resume material is intact: lease, eof checkpoint, part records.
         expect(await h.state.getLease(job.fileId)).toBeDefined();
@@ -538,6 +539,36 @@ describe('runEngine', () => {
             { PartNumber: 3, ETag: 'etag-3' },
         ]);
         expect(h.completions[0].actualSize).toBe(total);
+    });
+
+    it('tags OPFS quota exhaustion with the stager-quota failure stage', async () => {
+        // Telemetry must distinguish quota exhaustion from transport faults
+        // and completion rejections [R16].
+        const urls = urlsFor(3);
+        const h = makeHarness(urls, { store: new MemoryPartStore({ quotaBytes: 2 }) });
+        const job = makeJob({
+            source: { kind: 'blob', blob: new Blob([makeData(12)]) },
+            partUrls: urls,
+            partSize: 4,
+            declaredTotalSize: 12,
+            maxConcurrent: 1,
+        });
+
+        await expect(
+            runEngine(
+                job,
+                makeEnvelope(job.fileId, 12),
+                h.deps,
+                new AbortController().signal,
+                FAST,
+            ),
+        ).rejects.toThrow(/quota/);
+
+        expect(h.events[h.events.length - 1]).toMatchObject({
+            type: 'error',
+            retryable: true, // quota is a typed recoverable failure
+            stage: 'stager-quota',
+        });
     });
 
     it('does not double-queue a part staged just before the checkpoint write (crash window)', async () => {

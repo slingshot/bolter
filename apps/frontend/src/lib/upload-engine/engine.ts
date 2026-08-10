@@ -24,7 +24,7 @@ import { isRetryableError, retryDelayMs as sharedRetryDelayMs } from '@/lib/uplo
 import { finalizeUpload } from './completion';
 import { type PartStore, PartStoreQuotaError } from './part-store';
 import { createSliceProducer, createZipProducer, type ProducerChunk } from './producer';
-import type { EngineJob, WorkerToClient } from './protocol';
+import type { EngineFailureStage, EngineJob, WorkerToClient } from './protocol';
 import { runStager } from './stager';
 import type { CompletionEnvelope, EngineStateStore, ProducerCheckpoint } from './state';
 import type { UploadPartResult } from './uploader';
@@ -68,6 +68,28 @@ export interface EngineTuning {
 /** Staged-but-unuploaded parts the stager may run ahead of the uploaders. */
 const WINDOW_SLACK = 2;
 
+// ---------------------------------------------------------------------------
+// Failure-stage tagging [R16]: errors are tagged where the pipeline knows
+// which leg they came from, and the tag rides the error object to the single
+// place that emits the terminal `error` event. First tag wins — an uploader
+// failure that unwinds the stager must not be re-labeled 'staging'.
+// ---------------------------------------------------------------------------
+
+const failureStages = new WeakMap<Error, EngineFailureStage>();
+
+/** Tag `error` with the pipeline stage it escaped from (first tag wins). */
+export function tagFailureStage(error: Error, stage: EngineFailureStage): Error {
+    if (!failureStages.has(error)) {
+        failureStages.set(error, stage);
+    }
+    return error;
+}
+
+/** The stage `error` was tagged with, if any. */
+export function failureStageOf(error: Error): EngineFailureStage | undefined {
+    return failureStages.get(error);
+}
+
 export async function runEngine(
     job: EngineJob,
     envelope: CompletionEnvelope,
@@ -91,6 +113,7 @@ export async function runEngine(
             type: 'error',
             message: error.message,
             retryable: isRetryableEngineError(error),
+            stage: failureStageOf(error) ?? 'engine',
         });
         throw error;
     }
@@ -277,7 +300,13 @@ async function runPipeline(
             // Close so uploaders drain in-flight parts and settle — progress
             // made while staging failed stays persisted for resume.
             queue.close();
-            throw toError(err);
+            const error = toError(err);
+            // First tag wins: an uploader failure that unwound the stager
+            // keeps its 'uploader' stage.
+            throw tagFailureStage(
+                error,
+                error instanceof PartStoreQuotaError ? 'stager-quota' : 'staging',
+            );
         },
     );
 
@@ -304,7 +333,7 @@ async function runPipeline(
         signal: cancel,
         setTimeoutFn: tuning?.setTimeoutFn,
     }).catch((err: unknown) => {
-        const error = toError(err);
+        const error = tagFailureStage(toError(err), 'uploader');
         stopStaging(error);
         throw error;
     });
@@ -331,11 +360,15 @@ async function runPipeline(
         etags.set(partNumber, etag);
     }
 
-    await finalizeUpload(envelope, etags, sizes, job.partSize, {
-        completeUpload: (env, parts, actualSize) => deps.completeUpload(env, parts, actualSize),
-        state: deps.state,
-        store: deps.store,
-    });
+    try {
+        await finalizeUpload(envelope, etags, sizes, job.partSize, {
+            completeUpload: (env, parts, actualSize) => deps.completeUpload(env, parts, actualSize),
+            state: deps.state,
+            store: deps.store,
+        });
+    } catch (err) {
+        throw tagFailureStage(toError(err), 'completion');
+    }
 
     let actualSize = 0;
     for (const size of sizes.values()) {

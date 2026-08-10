@@ -34,11 +34,25 @@ export type ClientToWorker =
     | { type: 'cancel' }
     | { type: 'connectivity'; online: boolean };
 
+/**
+ * Which pipeline leg a terminal engine failure came from — the spec's
+ * "engine failure (stage)" telemetry dimension [R16]. Without it, OPFS quota
+ * exhaustion, transport failures, and completion rejections are
+ * telemetrically identical. Additive: consumers must tolerate its absence.
+ */
+export type EngineFailureStage =
+    | 'staging' // producer/stager leg (reads, encryption, OPFS writes)
+    | 'stager-quota' // OPFS quota exhaustion while staging
+    | 'uploader' // part transport (XHR) leg
+    | 'completion' // /upload/complete + validation
+    | 'resume' // resume planning (need-source / unrecoverable)
+    | 'engine'; // setup/dispatch faults outside a specific leg
+
 export type WorkerToClient =
     | { type: 'progress'; bytesSent: number; totalBytes: number }
     | { type: 'retry' }
     | { type: 'cancelled' } // cancel ack — worker has aborted XHRs + called server abort
-    | { type: 'error'; message: string; retryable: boolean }
+    | { type: 'error'; message: string; retryable: boolean; stage?: EngineFailureStage }
     | { type: 'done'; actualSize: number };
 
 /**
