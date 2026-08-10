@@ -14,6 +14,7 @@
  * guarantees of the legacy synchronous `Canceller.cancel()`.
  */
 
+import { acquireUploadLock } from '../upload-lifecycle';
 import type { EngineResult } from './engine';
 import { OpfsPartStore, UPLOADS_DIR } from './part-store';
 import type {
@@ -461,37 +462,23 @@ async function listStagedUploadIds(): Promise<string[]> {
 }
 
 /**
- * `true` when another context holds the `upload:<fileId>` Web Lock. An
- * `ifAvailable` grant is released immediately — this is a probe, not the
- * upload-lifetime lock (that one is held by the running upload itself).
+ * Delete `uploads/<id>` dirs with no lease and no live lock holder [R12].
+ * Each deletion runs while holding the dir's `upload:<fileId>` Web Lock for
+ * the full delete — a busy lock (`UploadLockBusyError`) means a live upload
+ * in another tab or worker and the directory is skipped; holding the lock
+ * through the delete closes the probe-then-release TOCTOU window.
  */
-async function uploadLockHeldElsewhere(fileId: string): Promise<boolean> {
-    const locks = globalThis.navigator?.locks;
-    if (!locks || typeof locks.request !== 'function') {
-        return false;
-    }
-    try {
-        const held = await locks.request(
-            `upload:${fileId}`,
-            { ifAvailable: true },
-            (lock) => lock === null,
-        );
-        return held === true;
-    } catch {
-        return true; // cannot verify → do not delete
-    }
-}
-
-/** Delete `uploads/<id>` dirs with no lease and no live lock holder [R12]. */
 async function collectOrphanedStaging(liveFileIds: Set<string>): Promise<void> {
     const staged = await listStagedUploadIds();
-    const keep = new Set(liveFileIds);
     for (const id of staged) {
-        if (!keep.has(id) && (await uploadLockHeldElsewhere(id))) {
-            keep.add(id);
+        if (liveFileIds.has(id)) {
+            continue;
         }
-    }
-    if (staged.some((id) => !keep.has(id))) {
-        await OpfsPartStore.gc(keep);
+        try {
+            await acquireUploadLock(id, () => new OpfsPartStore(id).destroy());
+        } catch {
+            // Busy (live holder) or a failed delete — keep the bytes; the
+            // next startup pass retries.
+        }
     }
 }

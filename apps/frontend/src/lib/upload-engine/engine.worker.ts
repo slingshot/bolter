@@ -15,6 +15,7 @@
  * structurally because this app compiles against the DOM lib).
  */
 
+import { acquireUploadLock, UploadLockBusyError } from '../upload-lifecycle';
 import { type EngineDeps, runEngine } from './engine';
 import { OpfsPartStore } from './part-store';
 import type {
@@ -109,9 +110,23 @@ async function runJob(
             });
             return;
         }
-        // Terminal events (`done` / `error` / `cancelled`) are posted by the
-        // engine itself before this rejection surfaces.
-        await run(deps, controller.signal).catch(() => undefined);
+        // The `upload:<fileId>` Web Lock is held for the job's full lifetime
+        // [R12]: startup GC in other tabs skips this upload's staging
+        // directory, and a second context resuming the same upload is refused
+        // instead of becoming a second writer. Coordination only — the lock
+        // auto-releases if this worker is terminated; the durable lease stays
+        // the source of truth.
+        await acquireUploadLock(fileId, () => run(deps, controller.signal)).catch((err) => {
+            if (err instanceof UploadLockBusyError) {
+                // The engine never ran, so nothing posted a terminal event.
+                // Retryable: the upload is alive in the other holder — this
+                // attempt is redundant, not broken.
+                post({ type: 'error', message: err.message, retryable: true });
+                return;
+            }
+            // Terminal events (`done` / `error` / `cancelled`) are posted by
+            // the engine itself before this rejection surfaces.
+        });
     } finally {
         active = undefined;
         scope.close();

@@ -34,6 +34,7 @@ import {
 } from './upload-engine/client';
 import type { EngineJob, EngineSource } from './upload-engine/protocol';
 import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
+import { withUploadLifecycle } from './upload-lifecycle';
 import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
 import {
     computeContentFingerprint,
@@ -932,7 +933,22 @@ export async function getDownloadStatus(
  * Upload files with resilient multipart support
  * Multi-file uploads are zipped at upload time for efficient downloads
  */
-export async function uploadFiles(
+export function uploadFiles(
+    options: UploadOptions,
+    keychain: Keychain,
+    canceller: Canceller,
+): Promise<UploadResult> {
+    // Lifecycle extras (screen wake lock, one-shot storage.persist()) wrap the
+    // engine and legacy pipelines alike. The server fileId does not exist
+    // until allocation happens mid-pipeline, so the lifecycle is keyed by a
+    // per-attempt label instead.
+    const attemptLabel = `up_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    return withUploadLifecycle(attemptLabel, () =>
+        uploadFilesPipeline(options, keychain, canceller),
+    );
+}
+
+async function uploadFilesPipeline(
     options: UploadOptions,
     keychain: Keychain,
     canceller: Canceller,
