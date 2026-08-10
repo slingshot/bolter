@@ -43,6 +43,10 @@ Thanks for your interest in contributing to Bolter. This document covers everyth
 
    Edit `.env.local` with your S3/R2 credentials and Redis URL. See the [README](README.md#configuration) for the full variable reference.
 
+   **Set `NODE_ENV=development`.** CORS fails closed: `origin: true` is only enabled for an explicit development build, so with `NODE_ENV` unset (which resolves to `production`) the API will reject requests from the Vite dev server on `http://localhost:3000`. The backend also refuses to start if `S3_BUCKET`/`S3_ENDPOINT` are missing or any numeric variable is malformed — the error message names the offending variable.
+
+   Your development bucket needs a CORS policy exposing `ETag` and `Content-Range`, otherwise multipart uploads and resumable downloads fail at runtime. See [Operational requirements](README.md#operational-requirements).
+
 4. **Start development**:
 
    ```bash
