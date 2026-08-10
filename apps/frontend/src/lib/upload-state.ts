@@ -5,7 +5,14 @@
 
 // Version 2: encrypted parts are cut on ECE record boundaries. Pre-v2 encrypted
 // state with completed parts was cut mid-record and cannot be resumed safely.
-export const UPLOAD_STATE_VERSION = 2;
+// Version 3: state carries a content fingerprint of the file being uploaded so a
+// resume cannot splice a different file's tail onto the uploaded prefix.
+export const UPLOAD_STATE_VERSION = 3;
+
+// The version at which encrypted parts started being cut on ECE record
+// boundaries. Pinned separately from UPLOAD_STATE_VERSION so later schema bumps
+// don't retroactively poison correctly-aligned state.
+const ECE_ALIGNED_STATE_VERSION = 2;
 
 export interface PersistedUpload {
     version?: number; // Schema version (missing = 1, pre record-aligned cuts)
@@ -15,6 +22,11 @@ export interface PersistedUpload {
     fileName: string; // To match against re-selected file
     fileSize: number; // Raw (pre-encryption) file size for matching
     fileLastModified: number; // To verify same file
+    // Content fingerprint of the file (see computeContentFingerprint). (name,
+    // size, mtime) is not an identity: a different file with the same tuple
+    // would be spliced tail-onto-prefix and, for encrypted uploads, decrypt
+    // cleanly into a corrupt hybrid.
+    contentFingerprint?: string;
     encrypted: boolean;
     partSize: number; // Encrypted part size used by S3
     plaintextPartSize: number; // Plaintext bytes per part (for resume offset)
@@ -25,6 +37,89 @@ export interface PersistedUpload {
     timeLimit: number;
     downloadLimit: number;
     createdAt: number; // Timestamp for cleanup
+}
+
+// Bytes read per sampled window when fingerprinting file content.
+export const FINGERPRINT_WINDOW_BYTES = 1024 * 1024;
+// Number of windows sampled across the file.
+export const FINGERPRINT_WINDOWS = 4;
+
+/**
+ * Content fingerprint used to verify that a file offered for resume really is
+ * the file whose prefix was already uploaded.
+ *
+ * Hashing the whole uploaded prefix would mean re-reading up to hundreds of
+ * gigabytes (and WebCrypto has no incremental digest), which defeats the point
+ * of resuming. Instead this hashes the file size plus a bounded, deterministic
+ * set of sampled windows spread across the file — always including the very
+ * start, so a file whose content differs from the uploaded prefix is rejected.
+ */
+export async function computeContentFingerprint(blob: Blob): Promise<string> {
+    const size = blob.size;
+    const windows: Array<[number, number]> = [];
+
+    if (size <= FINGERPRINT_WINDOW_BYTES * FINGERPRINT_WINDOWS) {
+        windows.push([0, size]);
+    } else {
+        const stride = Math.floor(
+            (size - FINGERPRINT_WINDOW_BYTES) / Math.max(1, FINGERPRINT_WINDOWS - 1),
+        );
+        for (let i = 0; i < FINGERPRINT_WINDOWS; i++) {
+            const start =
+                i === FINGERPRINT_WINDOWS - 1 ? size - FINGERPRINT_WINDOW_BYTES : i * stride;
+            windows.push([start, start + FINGERPRINT_WINDOW_BYTES]);
+        }
+    }
+
+    // The header binds the digest to the size and the exact sampled ranges, so
+    // two different sampling layouts can never produce the same fingerprint.
+    const header = new TextEncoder().encode(
+        `bolter-fp/1|${size}|${windows.map(([s, e]) => `${s}-${e}`).join(',')}\n`,
+    );
+
+    const chunks: Uint8Array[] = [header];
+    for (const [start, end] of windows) {
+        chunks.push(new Uint8Array(await blob.slice(start, end).arrayBuffer()));
+    }
+
+    const total = chunks.reduce((sum, c) => sum + c.length, 0);
+    const buffer = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        buffer.set(chunk, offset);
+        offset += chunk.length;
+    }
+
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+/**
+ * File IDs that must never be resumed, marked synchronously in memory.
+ *
+ * IndexedDB writes are independent transactions with no ordering guarantees, so
+ * a best-effort `deleteUploadState()` can lose a race with an in-flight
+ * `updateCompletedPart()` and leave poisoned state behind. Marking here first
+ * suppresses every later write regardless of whether the delete lands.
+ */
+const nonResumableUploads = new Set<string>();
+
+export function isUploadNonResumable(fileId: string): boolean {
+    return nonResumableUploads.has(fileId);
+}
+
+/**
+ * Synchronously mark an upload as non-resumable, then best-effort delete its
+ * persisted state. Callers may ignore the returned promise: the in-memory mark
+ * already guarantees no further writes and no resume offer for this file ID.
+ */
+export function discardUploadState(fileId: string): Promise<void> {
+    nonResumableUploads.add(fileId);
+    return deleteUploadState(fileId).catch(() => {
+        // Intentionally ignored — the in-memory mark is the real guarantee
+    });
 }
 
 const DB_NAME = 'bolter-uploads';
@@ -45,17 +140,33 @@ function openDB(): Promise<IDBDatabase> {
     });
 }
 
-// Encrypted pre-v2 state with completed parts was cut mid-ECE-record, so a
-// resume would duplicate a record fragment and produce an undecryptable file.
+// State that can never be safely resumed:
+//  - Encrypted pre-v2 state with completed parts was cut mid-ECE-record, so a
+//    resume would duplicate a record fragment and produce an undecryptable file.
+//  - State with completed parts but no content fingerprint cannot prove the
+//    re-selected file matches the uploaded prefix, so resuming it risks
+//    splicing a different file's tail onto that prefix.
+//  - State marked non-resumable in this session (e.g. a merged final part broke
+//    the fixed-part-size offset math a resume relies on).
 function isPoisonedUploadState(state: PersistedUpload): boolean {
-    return (
-        state.encrypted &&
-        state.completedParts.length >= 1 &&
-        (state.version ?? 1) < UPLOAD_STATE_VERSION
-    );
+    if (nonResumableUploads.has(state.fileId)) {
+        return true;
+    }
+    if (state.completedParts.length >= 1) {
+        if (state.encrypted && (state.version ?? 1) < ECE_ALIGNED_STATE_VERSION) {
+            return true;
+        }
+        if (!state.contentFingerprint) {
+            return true;
+        }
+    }
+    return false;
 }
 
 export async function saveUploadState(state: PersistedUpload): Promise<void> {
+    if (nonResumableUploads.has(state.fileId)) {
+        return;
+    }
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -78,6 +189,11 @@ export async function updateCompletedPart(
     fileId: string,
     part: { PartNumber: number; ETag: string },
 ): Promise<void> {
+    // Suppressed for uploads marked non-resumable — otherwise this write can
+    // land after a best-effort deleteUploadState and resurrect poisoned state.
+    if (nonResumableUploads.has(fileId)) {
+        return;
+    }
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
