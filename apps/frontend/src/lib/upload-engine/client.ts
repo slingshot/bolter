@@ -560,6 +560,19 @@ export interface EngineResumeCandidate {
  * candidates.
  */
 export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[]> {
+    // Warm the capability cache off the critical path. Startup is the one
+    // moment the answer can be computed while nobody is waiting on it, so the
+    // session's first upload finds it already decided instead of paying the
+    // worker spawn + OPFS round trip — or a PROBE_TIMEOUT_MS hang — inline.
+    // Deliberately `probeCapability`, not `probeEligibility`: the latter mints
+    // the delegation-decision telemetry attempt, which must stay one per
+    // upload. One per page load would inflate the very attempt counts that are
+    // the evidence for deleting the legacy pipeline [R16], and would leave a
+    // stale engine label in `currentUploadAttempt()` for Home's success event.
+    // The kill switch still gates it: a disabled engine spawns nothing.
+    if (!killSwitchOn()) {
+        void probeCapability();
+    }
     let state: EngineStateStore;
     try {
         state = await openEngineState();

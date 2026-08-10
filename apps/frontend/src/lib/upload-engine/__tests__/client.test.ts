@@ -171,6 +171,28 @@ describe('upload-engine client facade', () => {
         expect(FakeWorker.instances.length).toBe(1);
     });
 
+    it('warms the capability cache at startup so the first upload never probes', async () => {
+        await engineStartupMaintenance();
+
+        // Startup did the probing, before any upload asked…
+        expect(FakeWorker.instances.length).toBe(1);
+        expect(FakeWorker.instances[0].posted).toEqual([{ type: 'probe' }]);
+
+        // …so the first upload's probe reads that cache (in flight or
+        // settled) instead of spawning a second worker.
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+        expect(FakeWorker.instances.length).toBe(1);
+    });
+
+    it('skips the startup warm-up while the kill switch is on', async () => {
+        localStorage.setItem('bolter:upload-engine', 'off');
+
+        await engineStartupMaintenance();
+
+        // A disabled engine spawns nothing, warm-up included.
+        expect(FakeWorker.instances.length).toBe(0);
+    });
+
     it('caches an ineligible verdict so a broken worker is probed once', async () => {
         setWorkerFactory(() => {
             throw new Error('no workers here');
