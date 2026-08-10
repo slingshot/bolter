@@ -19,6 +19,148 @@ export interface FileSlice {
 }
 
 /**
+ * Drop C0 control characters and DEL: they are illegal in zip entry names and
+ * let a crafted name hide or spoof its real path in an extractor's output.
+ * Filtered by code point rather than a regex literal, since biome forbids
+ * control characters inside regex literals.
+ */
+function stripControlCharacters(value: string): string {
+    let stripped = '';
+    for (const char of value) {
+        const code = char.codePointAt(0) ?? 0;
+        if (code >= 0x20 && code !== 0x7f) {
+            stripped += char;
+        }
+    }
+    return stripped;
+}
+
+/**
+ * Normalize a zip entry name so it can never escape the extraction directory.
+ *
+ * Entry names on the download path come from uploader-controlled server
+ * metadata, and JSZip/client-zip write whatever they are given verbatim into
+ * the archive headers. A naive extractor handed `../../../.bashrc` or
+ * `/etc/cron.d/x` will happily write outside the target directory (zip slip),
+ * so absolute paths, drive prefixes, `.`/`..` segments and control characters
+ * are stripped before the name reaches the archive.
+ */
+export function sanitizeZipEntryName(rawName: string, fallback = 'unnamed'): string {
+    const normalized = stripControlCharacters(rawName)
+        .replace(/\\/g, '/')
+        // Strip any leading separators and a Windows drive prefix (`C:`, `/C:`)
+        .replace(/^\/+/, '')
+        .replace(/^[A-Za-z]:/, '')
+        .replace(/^\/+/, '');
+
+    const segments = normalized
+        .split('/')
+        .filter((segment) => segment !== '' && segment !== '.' && segment !== '..');
+
+    const sanitized = segments.join('/');
+    return sanitized === '' ? fallback : sanitized;
+}
+
+function splitNameAndExtension(name: string): { baseName: string; extension: string } {
+    const lastDot = name.lastIndexOf('.');
+    return lastDot > 0
+        ? { baseName: name.slice(0, lastDot), extension: name.slice(lastDot) }
+        : { baseName: name, extension: '' };
+}
+
+/** `report (1)` → stem `report`, next counter `2`; `report` → stem `report`, next `1`. */
+function splitDuplicateCounter(baseName: string): { stem: string; nextCounter: number } {
+    const match = /^(.*) \((\d+)\)$/.exec(baseName);
+    if (!match) {
+        return { stem: baseName, nextCounter: 1 };
+    }
+    return { stem: match[1], nextCounter: Number(match[2]) + 1 };
+}
+
+/**
+ * Build a stateful de-duplicator for zip entry names.
+ *
+ * Every name handed out is sanitized and recorded, and generated `base (N).ext`
+ * candidates are re-checked against the names already assigned. Registering the
+ * generated names is what makes this safe: a counter that only tracks the
+ * *original* names will happily mint `report (1).pdf` for the second
+ * `report.pdf` and then hand the same string to a genuine `report (1).pdf`,
+ * whose `zip.file()` call silently replaces the earlier entry — the archive
+ * ships with one file fewer than the metadata advertises, and on the upload
+ * path the original bytes are gone for good.
+ */
+export function createNameDeduplicator(): (rawName: string) => string {
+    const assigned = new Set<string>();
+
+    return (rawName: string): string => {
+        const name = sanitizeZipEntryName(rawName);
+        if (!assigned.has(name)) {
+            assigned.add(name);
+            return name;
+        }
+
+        const { baseName, extension } = splitNameAndExtension(name);
+        const { stem, nextCounter } = splitDuplicateCounter(baseName);
+        let counter = nextCounter;
+        let candidate = `${stem} (${counter})${extension}`;
+        while (assigned.has(candidate)) {
+            counter++;
+            candidate = `${stem} (${counter})${extension}`;
+        }
+
+        assigned.add(candidate);
+        return candidate;
+    };
+}
+
+/**
+ * Largest value representable in the 32-bit size/offset fields of a plain
+ * (non-ZIP64) zip archive.
+ */
+export const ZIP32_MAX_BYTES = 0xffffffff;
+
+/**
+ * Upper-bound the size of a STORE-compressed archive: per entry a local file
+ * header (30 bytes + name), a data descriptor (16 bytes) and a central
+ * directory record (46 bytes + name), plus the 22-byte end-of-central-directory.
+ */
+export function projectZipArchiveSize(entries: { name: string; size: number }[]): number {
+    const encoder = new TextEncoder();
+    let total = 22;
+    for (const entry of entries) {
+        const nameBytes = encoder.encode(entry.name).length;
+        total += 30 + nameBytes + 16 + 46 + nameBytes + entry.size;
+    }
+    return total;
+}
+
+/**
+ * Fail loudly when an archive would need ZIP64.
+ *
+ * JSZip 3.10.1 has no ZIP64 support: it writes sizes and central-directory
+ * offsets modulo 2^32 without raising, so an archive crossing 4 GiB
+ * "succeeds" and produces a file extractors reject or unpack as garbage.
+ * Throwing here keeps the failure ahead of `reportDownloadComplete`, so the
+ * download credit is preserved.
+ */
+export function assertZipFitsWithoutZip64(entries: { name: string; size: number }[]): void {
+    for (const entry of entries) {
+        if (entry.size >= ZIP32_MAX_BYTES) {
+            throw new Error(
+                `Cannot build the zip: "${entry.name}" is ${entry.size} bytes, which exceeds the 4 GiB per-entry limit of the zip format used here. Download the files individually instead.`,
+            );
+        }
+    }
+
+    const projectedSize = projectZipArchiveSize(entries);
+    if (projectedSize >= ZIP32_MAX_BYTES) {
+        throw new Error(
+            `Cannot build the zip: the archive would be ${projectedSize} bytes, which exceeds the 4 GiB limit of the zip format used here. Download the files individually instead.`,
+        );
+    }
+}
+
+/**
  * Read a file with streaming progress
  */
 async function readFileWithProgress(
@@ -73,22 +215,12 @@ export async function createZipFromUploadFiles(
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
     let totalBytesRead = 0;
 
-    // Handle duplicate filenames
-    const nameCount: Record<string, number> = {};
+    // Handle duplicate filenames (collision-safe: generated names are registered too)
+    const nextEntryName = createNameDeduplicator();
 
     // Read files with streaming progress tracking (0-50%)
     for (const file of files) {
-        let name = file.name;
-
-        if (nameCount[name] !== undefined) {
-            const lastDot = name.lastIndexOf('.');
-            const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
-            const extension = lastDot > 0 ? name.slice(lastDot) : '';
-            nameCount[name]++;
-            name = `${baseName} (${nameCount[name]})${extension}`;
-        } else {
-            nameCount[name] = 0;
-        }
+        const name = nextEntryName(file.name);
 
         // Read file with progress
         const baseBytes = totalBytesRead;
@@ -122,6 +254,21 @@ export async function createZipFromUploadFiles(
     return { blob, filename };
 }
 
+export interface StreamingZip {
+    stream: ReadableStream<Uint8Array>;
+    filename: string;
+    estimatedSize: number;
+    /**
+     * Release every per-file source stream held by the zip.
+     *
+     * MUST be called by the consumer when the upload is cancelled or fails —
+     * neither client-zip's cancel handler (a no-op for plain-Array entries) nor
+     * `releaseLock()` on the zip stream reaches the wrapped file streams.
+     * Never rejects.
+     */
+    dispose: () => Promise<void>;
+}
+
 /**
  * Create a streaming zip from File objects
  * Uses client-zip which streams data without buffering the entire zip in memory
@@ -132,48 +279,48 @@ export async function createZipFromUploadFiles(
 export function createStreamingZip(
     files: File[],
     onProgress?: (bytesProcessed: number, totalBytes: number) => void,
-): { stream: ReadableStream<Uint8Array>; filename: string; estimatedSize: number } {
+): StreamingZip {
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
     let bytesProcessed = 0;
 
-    // Handle duplicate filenames
-    const nameCount: Record<string, number> = {};
-    const renamedFiles: { name: string; input: File }[] = [];
-
-    for (const file of files) {
-        let name = file.name;
-
-        if (nameCount[name] !== undefined) {
-            const lastDot = name.lastIndexOf('.');
-            const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
-            const extension = lastDot > 0 ? name.slice(lastDot) : '';
-            nameCount[name]++;
-            name = `${baseName} (${nameCount[name]})${extension}`;
-        } else {
-            nameCount[name] = 0;
-        }
-
-        renamedFiles.push({ name, input: file });
-    }
+    // Handle duplicate filenames (collision-safe: generated names are registered too)
+    const nextEntryName = createNameDeduplicator();
+    const renamedFiles: { name: string; input: File }[] = files.map((file) => ({
+        name: nextEntryName(file.name),
+        input: file,
+    }));
 
     // Create file entries with progress tracking
-    // Each entry wraps the file stream with progress reporting
-    const entries = renamedFiles.map(({ name, input }) => {
-        let fileStream: ReadableStream<Uint8Array>;
-        try {
-            fileStream = input.stream();
-        } catch (e) {
-            throw new FileReadError(input.name, e);
-        }
-        return {
-            name,
-            lastModified: new Date(input.lastModified),
-            input: createProgressStream(fileStream, input.size, (bytes) => {
+    // Each entry wraps the file stream with progress reporting. The wrapper
+    // acquires its reader lazily, so constructing the zip does not lock every
+    // source stream up front, and every wrapper is retained so dispose() can
+    // cancel it when the upload is cancelled.
+    const progressHandles: ProgressStreamHandle[] = [];
+    let entries: { name: string; lastModified: Date; input: ReadableStream<Uint8Array> }[];
+    try {
+        entries = renamedFiles.map(({ name, input }) => {
+            let fileStream: ReadableStream<Uint8Array>;
+            try {
+                fileStream = input.stream();
+            } catch (e) {
+                throw new FileReadError(input.name, e);
+            }
+            const handle = createProgressStream(fileStream, input.size, (bytes) => {
                 bytesProcessed += bytes;
                 onProgress?.(bytesProcessed, totalSize);
-            }),
-        };
-    });
+            });
+            progressHandles.push(handle);
+            return {
+                name,
+                lastModified: new Date(input.lastModified),
+                input: handle.stream,
+            };
+        });
+    } catch (e) {
+        // Don't strand the wrappers created before the failing file.
+        void Promise.all(progressHandles.map((handle) => handle.cancel()));
+        throw e;
+    }
 
     // Use client-zip to create the streaming zip
     const response = downloadZip(entries);
@@ -189,21 +336,58 @@ export function createStreamingZip(
         files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
     );
 
-    return { stream, filename, estimatedSize };
+    // client-zip's own cancel handler is a no-op for plain-Array entries, and
+    // the upload path only releases its lock on cancel — so nothing would ever
+    // reach the per-file streams. dispose() is that missing link.
+    const dispose = async (): Promise<void> => {
+        await Promise.all(progressHandles.map((handle) => handle.cancel()));
+    };
+
+    return { stream, filename, estimatedSize, dispose };
+}
+
+interface ProgressStreamHandle {
+    stream: ReadableStream<Uint8Array>;
+    /** Cancels the wrapped source stream (and its reader, if one was acquired). */
+    cancel: (reason?: unknown) => Promise<void>;
 }
 
 /**
- * Wrap a stream to track bytes read for progress reporting
+ * Wrap a stream to track bytes read for progress reporting.
+ *
+ * The source reader is acquired on the first pull rather than eagerly, so a
+ * zip whose entries are never consumed leaves its source streams unlocked.
  */
 function createProgressStream(
     stream: ReadableStream<Uint8Array>,
     _totalSize: number,
     onBytes: (bytes: number) => void,
-): ReadableStream<Uint8Array> {
-    const reader = stream.getReader();
+): ProgressStreamHandle {
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let cancelled = false;
 
-    return new ReadableStream<Uint8Array>({
+    const cancel = async (reason?: unknown): Promise<void> => {
+        cancelled = true;
+        const active = reader;
+        reader = null;
+        try {
+            // Cancel through the reader when one exists (the stream is locked
+            // to it); otherwise cancel the unlocked source directly.
+            await (active ? active.cancel(reason) : stream.cancel(reason));
+        } catch {
+            // Best-effort cleanup — an already errored/closed stream is fine.
+        }
+    };
+
+    const progressStream = new ReadableStream<Uint8Array>({
         async pull(controller) {
+            if (cancelled) {
+                controller.close();
+                return;
+            }
+            if (!reader) {
+                reader = stream.getReader();
+            }
             const { done, value } = await reader.read();
             if (done) {
                 controller.close();
@@ -212,10 +396,12 @@ function createProgressStream(
             onBytes(value.length);
             controller.enqueue(value);
         },
-        cancel() {
-            reader.cancel();
+        cancel(reason) {
+            return cancel(reason);
         },
     });
+
+    return { stream: progressStream, cancel };
 }
 
 export interface SliceOptions {
@@ -301,28 +487,15 @@ export function sliceConcatenatedBlob(
 }
 
 /**
- * Handle duplicate filenames by appending (1), (2), etc.
+ * Sanitize entry names and handle duplicates by appending (1), (2), etc.
  */
 function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
-    const nameCount: Record<string, number> = {};
+    const nextEntryName = createNameDeduplicator();
+    return slices.map((slice) => ({ ...slice, name: nextEntryName(slice.name) }));
+}
 
-    return slices.map((slice) => {
-        let name = slice.name;
-
-        if (nameCount[name] !== undefined) {
-            // Split name and extension
-            const lastDot = name.lastIndexOf('.');
-            const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
-            const extension = lastDot > 0 ? name.slice(lastDot) : '';
-
-            nameCount[name]++;
-            name = `${baseName} (${nameCount[name]})${extension}`;
-        } else {
-            nameCount[name] = 0;
-        }
-
-        return { ...slice, name };
-    });
+function entryByteLength(data: Blob | Uint8Array): number {
+    return data instanceof Blob ? data.size : data.byteLength;
 }
 
 /**
@@ -332,8 +505,15 @@ function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
 export async function createZipFromFiles(fileSlices: FileSlice[]): Promise<Blob> {
     const zip = new JSZip();
 
-    // Handle duplicate filenames
+    // Sanitize + de-duplicate entry names before they reach the archive headers
     const dedupedSlices = deduplicateFilenames(fileSlices);
+
+    // JSZip 3.x cannot emit ZIP64, so anything at or past 4 GiB would be
+    // written with wrapped sizes/offsets and no error. Fail here, before the
+    // caller reports the download complete, so the credit isn't burned.
+    assertZipFitsWithoutZip64(
+        dedupedSlices.map((slice) => ({ name: slice.name, size: entryByteLength(slice.data) })),
+    );
 
     for (const slice of dedupedSlices) {
         // Use STORE compression (level 0) to minimize memory usage

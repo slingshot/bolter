@@ -1,0 +1,349 @@
+import JSZip from 'jszip';
+import { describe, expect, it } from 'vitest';
+import {
+    assertZipFitsWithoutZip64,
+    createNameDeduplicator,
+    createStreamingZip,
+    createZipFromFiles,
+    createZipFromUploadFiles,
+    type FileSlice,
+    projectZipArchiveSize,
+    sanitizeZipEntryName,
+    ZIP32_MAX_BYTES,
+} from '@/lib/zip';
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+function slice(name: string, contents: string): FileSlice {
+    return { name, data: encoder.encode(contents), type: 'text/plain' };
+}
+
+function uploadFile(name: string, contents: string): File {
+    return new File([encoder.encode(contents)], name, { type: 'text/plain' });
+}
+
+async function readZipEntries(blob: Blob): Promise<Record<string, string>> {
+    const zip = await JSZip.loadAsync(new Uint8Array(await blob.arrayBuffer()));
+    const entries: Record<string, string> = {};
+    for (const name of Object.keys(zip.files)) {
+        const entry = zip.files[name];
+        // JSZip synthesizes directory entries for nested paths; only files matter here.
+        if (entry.dir) {
+            continue;
+        }
+        entries[name] = decoder.decode(await entry.async('uint8array'));
+    }
+    return entries;
+}
+
+async function readStreamingZipEntries(
+    stream: ReadableStream<Uint8Array>,
+): Promise<Record<string, string>> {
+    const buffer = await new Response(stream).arrayBuffer();
+    return readZipEntries(new Blob([buffer]));
+}
+
+/**
+ * A Blob whose reported size is a lie. Lets the >= 4 GiB ZIP64 guard be
+ * exercised without allocating 4 GiB.
+ */
+function blobOfDeclaredSize(size: number): Blob {
+    const blob = new Blob([new Uint8Array(1)]);
+    Object.defineProperty(blob, 'size', { value: size });
+    return blob;
+}
+
+/**
+ * A File-like object whose `stream()` hands back an instrumented source, so a
+ * test can observe when the reader is acquired and when the source is cancelled.
+ */
+function instrumentedFile(name: string, contents: string, chunkCount = 1) {
+    const bytes = encoder.encode(contents);
+    let emitted = 0;
+    const spy = { getReaderCalls: 0, cancelCalls: 0 };
+
+    const source = new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (emitted >= chunkCount) {
+                controller.close();
+                return;
+            }
+            emitted++;
+            controller.enqueue(bytes);
+        },
+        cancel() {
+            spy.cancelCalls++;
+        },
+    });
+
+    const originalGetReader = source.getReader.bind(source);
+    source.getReader = ((options?: { mode?: 'byob' }) => {
+        spy.getReaderCalls++;
+        return originalGetReader(options as never);
+    }) as typeof source.getReader;
+
+    const file = {
+        name,
+        size: bytes.byteLength * chunkCount,
+        type: 'text/plain',
+        lastModified: 0,
+        stream: () => source,
+    } as unknown as File;
+
+    return { file, spy };
+}
+
+describe('createNameDeduplicator (finding 4)', () => {
+    it('never hands out a generated name that collides with a real entry', () => {
+        const next = createNameDeduplicator();
+
+        // The pre-fix counter only tracked the ORIGINAL names, so the third
+        // file's literal "report (1).pdf" was treated as unseen and reused the
+        // name already minted for the second file.
+        expect(next('report.pdf')).toBe('report.pdf');
+        expect(next('report.pdf')).toBe('report (1).pdf');
+        expect(next('report (1).pdf')).toBe('report (2).pdf');
+    });
+
+    it('keeps incrementing past a chain of pre-existing generated names', () => {
+        const next = createNameDeduplicator();
+
+        expect(next('a.txt')).toBe('a.txt');
+        expect(next('a (1).txt')).toBe('a (1).txt');
+        expect(next('a (2).txt')).toBe('a (2).txt');
+        expect(next('a.txt')).toBe('a (3).txt');
+    });
+
+    it('handles extensionless and dotfile names', () => {
+        const next = createNameDeduplicator();
+
+        expect(next('README')).toBe('README');
+        expect(next('README')).toBe('README (1)');
+        expect(next('.env')).toBe('.env');
+        expect(next('.env')).toBe('.env (1)');
+    });
+
+    it('de-duplicates names that only collide after sanitization', () => {
+        const next = createNameDeduplicator();
+
+        expect(next('notes.txt')).toBe('notes.txt');
+        expect(next('/notes.txt')).toBe('notes (1).txt');
+    });
+});
+
+describe('sanitizeZipEntryName (finding 33)', () => {
+    it('strips parent-directory traversal segments', () => {
+        expect(sanitizeZipEntryName('../../../.bashrc')).toBe('.bashrc');
+        expect(sanitizeZipEntryName('../../../../home/user/.profile')).toBe('home/user/.profile');
+        expect(sanitizeZipEntryName('a/../../b/c.txt')).toBe('a/b/c.txt');
+    });
+
+    it('strips absolute paths and drive prefixes', () => {
+        expect(sanitizeZipEntryName('/etc/cron.d/x')).toBe('etc/cron.d/x');
+        expect(sanitizeZipEntryName('///etc/passwd')).toBe('etc/passwd');
+        expect(sanitizeZipEntryName('C:\\Windows\\System32\\evil.dll')).toBe(
+            'Windows/System32/evil.dll',
+        );
+        expect(sanitizeZipEntryName('C:evil.dll')).toBe('evil.dll');
+    });
+
+    it('normalizes backslash separators and drops "." segments', () => {
+        expect(sanitizeZipEntryName('a\\b\\c.txt')).toBe('a/b/c.txt');
+        expect(sanitizeZipEntryName('./a/./b.txt')).toBe('a/b.txt');
+    });
+
+    it('drops control characters', () => {
+        expect(sanitizeZipEntryName('re\u0000port\u001f.pdf\u007f')).toBe('report.pdf');
+        expect(sanitizeZipEntryName('line\nbreak.txt')).toBe('linebreak.txt');
+    });
+
+    it('falls back when nothing survives sanitization', () => {
+        expect(sanitizeZipEntryName('../../..')).toBe('unnamed');
+        expect(sanitizeZipEntryName('/')).toBe('unnamed');
+        expect(sanitizeZipEntryName('\u0000')).toBe('unnamed');
+    });
+
+    it('leaves ordinary names untouched', () => {
+        expect(sanitizeZipEntryName('report.pdf')).toBe('report.pdf');
+        expect(sanitizeZipEntryName('photos/holiday (1).jpg')).toBe('photos/holiday (1).jpg');
+        expect(sanitizeZipEntryName('..hidden.txt')).toBe('..hidden.txt');
+    });
+});
+
+describe('createZipFromFiles (findings 4, 22, 33)', () => {
+    it('delivers every file when a generated duplicate name collides with a real one', async () => {
+        const blob = await createZipFromFiles([
+            slice('report.pdf', 'first'),
+            slice('report.pdf', 'second'),
+            slice('report (1).pdf', 'third'),
+        ]);
+
+        const entries = await readZipEntries(blob);
+
+        // Pre-fix the third slice reused "report (1).pdf" and JSZip silently
+        // replaced the second slice's bytes — the archive shipped 2 of 3 files.
+        expect(Object.keys(entries)).toHaveLength(3);
+        expect(entries['report.pdf']).toBe('first');
+        expect(entries['report (1).pdf']).toBe('second');
+        expect(entries['report (2).pdf']).toBe('third');
+    });
+
+    it('sanitizes traversal entry names before they reach the archive headers', async () => {
+        const blob = await createZipFromFiles([
+            slice('../../../../home/user/.profile', 'payload'),
+            slice('/etc/cron.d/x', 'cron'),
+        ]);
+
+        const entries = await readZipEntries(blob);
+
+        expect(Object.keys(entries).sort()).toEqual(['etc/cron.d/x', 'home/user/.profile']);
+    });
+
+    it('rejects a single entry at or above the 4 GiB non-ZIP64 limit', async () => {
+        await expect(
+            createZipFromFiles([
+                { name: 'huge.bin', data: blobOfDeclaredSize(ZIP32_MAX_BYTES), type: '' },
+            ]),
+        ).rejects.toThrow(/exceeds the 4 GiB per-entry limit/);
+    });
+
+    it('rejects an archive whose projected size crosses 4 GiB', async () => {
+        const twoGiB = 2 * 1024 * 1024 * 1024;
+
+        await expect(
+            createZipFromFiles([
+                { name: 'a.bin', data: blobOfDeclaredSize(twoGiB), type: '' },
+                { name: 'b.bin', data: blobOfDeclaredSize(twoGiB), type: '' },
+            ]),
+        ).rejects.toThrow(/exceeds the 4 GiB limit/);
+    });
+
+    it('still builds archives that comfortably fit in 32-bit fields', async () => {
+        const blob = await createZipFromFiles([slice('a.txt', 'hello')]);
+        expect(await readZipEntries(blob)).toEqual({ 'a.txt': 'hello' });
+    });
+});
+
+describe('assertZipFitsWithoutZip64 (finding 22)', () => {
+    it('accepts an archive just under the limit', () => {
+        expect(() =>
+            assertZipFitsWithoutZip64([{ name: 'a.bin', size: ZIP32_MAX_BYTES - 1_000 }]),
+        ).not.toThrow();
+    });
+
+    it('rejects an entry exactly at the limit', () => {
+        expect(() => assertZipFitsWithoutZip64([{ name: 'a.bin', size: ZIP32_MAX_BYTES }])).toThrow(
+            /huge|exceeds the 4 GiB per-entry limit/,
+        );
+    });
+
+    it('accounts for per-entry header overhead in the projected size', () => {
+        // Payload alone fits; headers push it over.
+        expect(() =>
+            assertZipFitsWithoutZip64([{ name: 'a.bin', size: ZIP32_MAX_BYTES - 10 }]),
+        ).toThrow(/exceeds the 4 GiB limit/);
+    });
+
+    it('projects a plausible archive size', () => {
+        // 22 (EOCD) + 30 + 5 (name) + 16 (descriptor) + 46 + 5 (name) + 100
+        expect(projectZipArchiveSize([{ name: 'a.txt', size: 100 }])).toBe(
+            22 + 30 + 16 + 46 + 10 + 100,
+        );
+    });
+});
+
+describe('createZipFromUploadFiles (finding 4)', () => {
+    it('never drops a file when a generated name collides with a real one', async () => {
+        const { blob } = await createZipFromUploadFiles([
+            uploadFile('report.pdf', 'first'),
+            uploadFile('report.pdf', 'second'),
+            uploadFile('report (1).pdf', 'third'),
+        ]);
+
+        const entries = await readZipEntries(blob);
+
+        expect(Object.keys(entries)).toHaveLength(3);
+        expect(entries['report.pdf']).toBe('first');
+        expect(entries['report (1).pdf']).toBe('second');
+        expect(entries['report (2).pdf']).toBe('third');
+    });
+});
+
+describe('createStreamingZip (findings 4, 33, 34)', () => {
+    it('never drops a file when a generated name collides with a real one', async () => {
+        const { stream } = createStreamingZip([
+            uploadFile('report.pdf', 'first'),
+            uploadFile('report.pdf', 'second'),
+            uploadFile('report (1).pdf', 'third'),
+        ]);
+
+        const entries = await readStreamingZipEntries(stream);
+
+        expect(Object.keys(entries)).toHaveLength(3);
+        expect(entries['report.pdf']).toBe('first');
+        expect(entries['report (1).pdf']).toBe('second');
+        expect(entries['report (2).pdf']).toBe('third');
+    });
+
+    it('sanitizes traversal entry names', async () => {
+        const { stream } = createStreamingZip([
+            uploadFile('../../../../home/user/.profile', 'payload'),
+        ]);
+
+        expect(Object.keys(await readStreamingZipEntries(stream))).toEqual(['home/user/.profile']);
+    });
+
+    it('does not lock the per-file source streams at construction time', () => {
+        const a = instrumentedFile('a.txt', 'aaa');
+        const b = instrumentedFile('b.txt', 'bbb');
+
+        createStreamingZip([a.file, b.file]);
+
+        // Pre-fix, createProgressStream called getReader() eagerly for every
+        // file, locking all source streams before a single byte was requested.
+        expect(a.spy.getReaderCalls).toBe(0);
+        expect(b.spy.getReaderCalls).toBe(0);
+    });
+
+    it('dispose() cancels every per-file source stream', async () => {
+        const a = instrumentedFile('a.txt', 'aaa');
+        const b = instrumentedFile('b.txt', 'bbb');
+
+        const zip = createStreamingZip([a.file, b.file]);
+        await zip.dispose();
+
+        // Pre-fix there was no dispose(): cancelling an upload released the
+        // zip stream's lock and left every file stream suspended and locked.
+        expect(a.spy.cancelCalls).toBe(1);
+        expect(b.spy.cancelCalls).toBe(1);
+    });
+
+    it('dispose() cancels through an already-acquired reader mid-stream', async () => {
+        // Several chunks, so the source is still open when dispose() lands.
+        const a = instrumentedFile('a.txt', 'aaa', 8);
+
+        const zip = createStreamingZip([a.file]);
+
+        // Pump the zip until the entry's source reader has been acquired.
+        const reader = zip.stream.getReader();
+        for (let i = 0; i < 10 && a.spy.getReaderCalls === 0; i++) {
+            await reader.read();
+        }
+        expect(a.spy.getReaderCalls).toBe(1);
+        expect(a.spy.cancelCalls).toBe(0);
+
+        await zip.dispose();
+        expect(a.spy.cancelCalls).toBe(1);
+
+        reader.releaseLock();
+    });
+
+    it('dispose() is idempotent and never rejects', async () => {
+        const a = instrumentedFile('a.txt', 'aaa');
+
+        const zip = createStreamingZip([a.file]);
+        await expect(zip.dispose()).resolves.toBeUndefined();
+        await expect(zip.dispose()).resolves.toBeUndefined();
+    });
+});
