@@ -2808,6 +2808,33 @@ export function createResilientDownloadStream(
 }
 
 /**
+ * Wire length the server advertised for a response body, or 0 when unknown.
+ *
+ * Prefers `X-Object-Content-Length` over `Content-Length`. The backend's
+ * fallback stream routes (`GET /download/:id`, `/download/blob/:id`) cannot
+ * advertise a real `Content-Length`: Bun serialises every streamed body as
+ * `transfer-encoding: chunked` and drops an explicit `Content-Length`, so those
+ * responses would read as length 0 and skip the only hard truncation guard
+ * below — a severed transfer would be saved as a complete-looking, corrupt
+ * file. The custom header survives that serialisation and carries the object's
+ * true size from S3 (`GetObject` `ContentLength`); it is CORS-exposed by the
+ * backend. Signed-URL downloads straight from S3 keep using `Content-Length`.
+ */
+export function advertisedBodyLength(response: Response): number {
+    for (const header of ['X-Object-Content-Length', 'Content-Length']) {
+        const raw = response.headers.get(header);
+        if (raw === null) {
+            continue;
+        }
+        const parsed = parseInt(raw, 10);
+        if (Number.isFinite(parsed) && parsed >= 0) {
+            return parsed;
+        }
+    }
+    return 0;
+}
+
+/**
  * Download a file
  */
 export type DownloadPhase = 'downloading' | 'decrypting' | 'finalizing';
@@ -2900,7 +2927,7 @@ export async function downloadFile(
     }
 
     // Stream with progress
-    const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+    const contentLength = advertisedBodyLength(response);
 
     if (!response.body) {
         throw new Error('No response body');

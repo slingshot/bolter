@@ -79,16 +79,63 @@ export class S3Storage {
         return length;
     }
 
-    async getStream(id: string): Promise<ReadableStream<Uint8Array> | null> {
+    /**
+     * Stream an object out of the bucket.
+     *
+     * Returns null when the object is missing: `GetObject` *throws* `NoSuchKey`
+     * (404) for an absent key rather than resolving with an empty body, so
+     * without this catch the routes' `if (!stream) -> 404` branch is dead code
+     * and a missing object escapes as a generic 500 (which resilient clients
+     * retry forever). Non-404 failures still propagate.
+     *
+     * The returned stream is tagged with the `GetObject` `ContentLength` so the
+     * fallback download routes can emit a `Content-Length` header. Without it
+     * the response is chunked, the client sees `contentLength === 0`, and its
+     * truncation guard is skipped — a severed transfer would be saved as a
+     * silently truncated file.
+     */
+    async getStream(
+        id: string,
+    ): Promise<(ReadableStream<Uint8Array> & { contentLength?: number }) | null> {
         logger.debug({ id }, 'Getting object stream');
-        const result = await this.s3.send(
-            new GetObjectCommand({
-                Bucket: this.bucket,
-                Key: id,
-            }),
-        );
-        logger.debug({ id, hasBody: !!result.Body }, 'Object stream retrieved');
-        return result.Body?.transformToWebStream() || null;
+        try {
+            const result = await this.s3.send(
+                new GetObjectCommand({
+                    Bucket: this.bucket,
+                    Key: id,
+                }),
+            );
+            const body = result.Body?.transformToWebStream() || null;
+            logger.debug(
+                { id, hasBody: !!body, contentLength: result.ContentLength },
+                'Object stream retrieved',
+            );
+            if (!body) {
+                return null;
+            }
+            return typeof result.ContentLength === 'number' && result.ContentLength >= 0
+                ? Object.assign(body, { contentLength: result.ContentLength })
+                : body;
+        } catch (err) {
+            const name = (err as { name?: string })?.name;
+            const code = (err as { Code?: string })?.Code;
+            const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
+                ?.httpStatusCode;
+            const isMissing =
+                name === 'NoSuchKey' ||
+                code === 'NoSuchKey' ||
+                name === 'NotFound' ||
+                code === 'NotFound' ||
+                (status === 404 && name !== 'NoSuchBucket' && code !== 'NoSuchBucket');
+            if (!isMissing) {
+                throw err;
+            }
+            logger.warn(
+                { id, bucket: this.bucket, code: code ?? name },
+                'Object missing from bucket — treating as not found',
+            );
+            return null;
+        }
     }
 
     async set(id: string, data: Buffer | Uint8Array | ReadableStream): Promise<void> {
