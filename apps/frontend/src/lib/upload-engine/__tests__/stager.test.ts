@@ -8,6 +8,7 @@ import {
     ECE_VERSION,
     Keychain,
 } from '@/lib/crypto';
+import { isRetryableError } from '@/lib/upload-shared';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import { createSliceProducer } from '../producer';
 import { runStager } from '../stager';
@@ -266,6 +267,67 @@ describe('runStager', () => {
         expect(await readAllParts(store)).toEqual(twelve);
         expect(checkpointPuts.map((c) => c.nextPartNumber)).toEqual([2, 3]);
         expect(checkpointPuts.map((c) => c.sourceOffset)).toEqual([4, 12]);
+        expect(checkpointPuts.map((c) => c.eofReached)).toEqual([false, true]);
+    });
+
+    it('caps growth absorption at the S3 per-part limit and fails fast past it [R1]', async () => {
+        // Spec R1: the final allocated part absorbs growth *guarded by the
+        // S3 5 GiB per-part cap*. A source that outgrows the cap must fail
+        // clearly before shipping a part the bucket would reject with
+        // EntityTooLarge — never after staging/transferring >5 GiB.
+        const store = new MemoryPartStore();
+        const { state, partPuts } = fakeState();
+
+        const error: Error = await runStager(
+            createSliceProducer(new Blob([makeData(10)]), { chunkBytes: 3 }),
+            {
+                fileId: 'up_toolarge',
+                partSize: 4,
+                totalParts: 2,
+                windowSize: 8,
+                maxPartBytes: 5, // stand-in for the 5 GiB cap
+                store,
+                state,
+                checkpointOf: checkpointOf('up_toolarge'),
+                onPartStaged: () => undefined,
+                partReleased: neverReleased,
+            },
+        ).then(
+            () => {
+                throw new Error('expected the stager to reject');
+            },
+            (err: Error) => err,
+        );
+
+        expect(error.message).toMatch(/per-part limit/);
+        expect(isRetryableError(error)).toBe(false);
+        // The overflowing final part was never recorded as staged.
+        expect(partPuts.map((p) => p.partNumber)).toEqual([1]);
+    });
+
+    it('growth that exactly fills the per-part cap still completes', async () => {
+        const nine = makeData(9);
+        const store = new MemoryPartStore();
+        const { state, checkpointPuts } = fakeState();
+
+        const result = await runStager(createSliceProducer(new Blob([nine]), { chunkBytes: 3 }), {
+            fileId: 'up_exactcap',
+            partSize: 4,
+            totalParts: 2,
+            windowSize: 8,
+            maxPartBytes: 5,
+            store,
+            state,
+            checkpointOf: checkpointOf('up_exactcap'),
+            onPartStaged: () => undefined,
+            partReleased: neverReleased,
+        });
+
+        expect(result).toEqual({ partsProduced: 2, actualSize: 9 });
+        expect(await store.listParts()).toEqual([
+            { partNumber: 1, size: 4 },
+            { partNumber: 2, size: 5 },
+        ]);
         expect(checkpointPuts.map((c) => c.eofReached)).toEqual([false, true]);
     });
 

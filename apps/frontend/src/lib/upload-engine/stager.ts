@@ -4,7 +4,10 @@
  * Pipes a byte producer (optionally through the ECE encryption transform) and
  * cuts the payload at `partSize` boundaries into `PartStore.stagePart` calls.
  * The final allocated part absorbs all overflow bytes (iOS lazy-transcode
- * growth [R1]); a short source simply produces fewer contiguous parts
+ * growth [R1]) — guarded by the S3/R2 5 GiB per-part cap: growth past the cap
+ * fails fast with a clear, non-retryable error instead of staging and
+ * shipping >5 GiB only for the bucket to reject the PUT with EntityTooLarge.
+ * A short source simply produces fewer contiguous parts
  * (shrink). After every committed stage the part record is persisted and
  * *then* the producer checkpoint — the checkpoint always describes the next
  * part to produce, so a crash between stages resumes from an exact boundary
@@ -20,11 +23,18 @@ import type { PartStore } from './part-store';
 import type { ProducerChunk } from './producer';
 import type { EngineStateStore, ProducerCheckpoint } from './state';
 
+/** S3/R2 hard per-part maximum — the legacy pipeline enforces the same cap
+ * on its trailing-part drain (`MAX_PART_SIZE`, api.ts). */
+const MAX_PART_SIZE = 5 * 1024 * 1024 * 1024;
+
 export interface StagerOpts {
     fileId: string;
     partSize: number; // payload bytes per part (already effective/record-aligned when encrypted)
     totalParts: number; // allocated part count — hard cap; final part absorbs overflow [R1]
     windowSize: number; // max staged-not-yet-uploaded parts
+    /** Test seam for the growth-absorption cap; defaults to the S3/R2 5 GiB
+     * per-part limit. */
+    maxPartBytes?: number;
     store: PartStore;
     state: EngineStateStore;
     encrypt?: TransformStream<Uint8Array, Uint8Array>; // createEncryptionStream(keychain) when encrypted
@@ -38,8 +48,14 @@ export async function runStager(
     opts: StagerOpts,
 ): Promise<{ partsProduced: number; actualSize: number }> {
     const { partSize, totalParts, windowSize } = opts;
+    const maxPartBytes = opts.maxPartBytes ?? MAX_PART_SIZE;
     if (!Number.isInteger(partSize) || partSize <= 0) {
         throw new Error(`partSize must be a positive integer, got ${partSize}`);
+    }
+    if (!Number.isInteger(maxPartBytes) || maxPartBytes < partSize) {
+        throw new Error(
+            `maxPartBytes must be an integer >= partSize (${partSize}), got ${maxPartBytes}`,
+        );
     }
     if (!Number.isInteger(totalParts) || totalParts <= 0) {
         throw new Error(`totalParts must be a positive integer, got ${totalParts}`);
@@ -143,14 +159,31 @@ export async function runStager(
             }
 
             const isFinalAllocated = partNumber === totalParts;
-            const limit = isFinalAllocated ? Number.POSITIVE_INFINITY : partSize;
+            // Growth absorption is bounded by the S3/R2 per-part cap [R1]:
+            // a final part the bucket would reject must never be staged as
+            // complete, let alone transferred.
+            const limit = isFinalAllocated ? maxPartBytes : partSize;
             const { size } = await opts.store.stagePart(partNumber, partChunks(limit));
             actualSize += size;
 
             let eof: boolean;
-            if (isFinalAllocated || size < limit) {
+            if (isFinalAllocated) {
+                if (size >= limit) {
+                    const overflow = await pullChunk();
+                    if (overflow !== null) {
+                        // Deliberately non-retryable: the source outgrew what
+                        // this allocation can legally ship.
+                        throw new Error(
+                            `upload grew beyond its allocation: the final part reached the ` +
+                                `${limit}-byte S3/R2 per-part limit with source bytes remaining`,
+                        );
+                    }
+                }
                 // The final allocated part drains the source (growth
-                // absorption); a short part means the payload ended inside it.
+                // absorption).
+                eof = true;
+            } else if (size < limit) {
+                // A short part means the payload ended inside it.
                 eof = true;
             } else {
                 // Filled exactly to the boundary — peek so a source that ends
