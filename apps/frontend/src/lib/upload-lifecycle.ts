@@ -71,6 +71,28 @@ export function resetUploadLifecycleForTests(): void {
     persistRequested = false;
 }
 
+/** Outcome of the once-per-session `storage.persist()` request. */
+export type StoragePersistResult = 'granted' | 'denied' | 'error';
+
+let persistResultListener: ((result: StoragePersistResult) => void) | undefined;
+
+/**
+ * Telemetry seam [R16]: observe the once-per-session `storage.persist()`
+ * outcome. Single listener — registering replaces any previous one. The
+ * result stays advisory; nothing in the upload depends on it.
+ */
+export function onStoragePersistResult(listener: (result: StoragePersistResult) => void): void {
+    persistResultListener = listener;
+}
+
+function notifyPersistResult(result: StoragePersistResult): void {
+    try {
+        persistResultListener?.(result);
+    } catch {
+        // telemetry only — never disturb the upload
+    }
+}
+
 function requestStoragePersistOnce(): void {
     if (persistRequested) {
         return;
@@ -80,7 +102,11 @@ function requestStoragePersistOnce(): void {
         return;
     }
     persistRequested = true;
-    void storage.persist().catch(() => undefined); // advisory — result is not load-bearing
+    // Advisory — the result is not load-bearing, but it is telemetry [R16].
+    void storage.persist().then(
+        (granted) => notifyPersistResult(granted ? 'granted' : 'denied'),
+        () => notifyPersistResult('error'),
+    );
 }
 
 /**

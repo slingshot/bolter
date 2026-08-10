@@ -1,4 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The facade emits telemetry through @/lib/plausible; mock it so no analytics
+// traffic can reach the fetch spies these tests assert against.
+vi.mock('@/lib/plausible', () => ({
+    newUploadAttemptId: () => 'ua_testattemptid',
+    trackEngineEvent: vi.fn(),
+    trackUploadAttempt: vi.fn(),
+}));
+
 import { probeEligibility, runEngineInWorker, setWorkerFactory } from '../client';
 import type { ClientToWorker, EngineJob, WorkerToClient } from '../protocol';
 import type { CompletionEnvelope } from '../state';

@@ -15,6 +15,14 @@ const navigatorStub = {
 };
 vi.stubGlobal('navigator', navigatorStub);
 
+// The engine client emits telemetry through @/lib/plausible; mock it so no
+// analytics traffic can reach the fetch stub these tests assert against.
+vi.mock('@/lib/plausible', () => ({
+    newUploadAttemptId: () => 'ua_testattemptid',
+    trackEngineEvent: vi.fn(),
+    trackUploadAttempt: vi.fn(),
+}));
+
 const { uploadFiles, resumeUpload, Canceller } = await import('@/lib/api');
 const { Keychain } = await import('@/lib/crypto');
 const { getConcurrentUploads } = await import('@/lib/upload-shared');

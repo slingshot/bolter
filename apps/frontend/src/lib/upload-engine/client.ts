@@ -14,7 +14,8 @@
  * guarantees of the legacy synchronous `Canceller.cancel()`.
  */
 
-import { acquireUploadLock } from '../upload-lifecycle';
+import { newUploadAttemptId, trackEngineEvent, trackUploadAttempt } from '../plausible';
+import { acquireUploadLock, onStoragePersistResult } from '../upload-lifecycle';
 import type { EngineResult } from './engine';
 import { OpfsPartStore, UPLOADS_DIR } from './part-store';
 import type {
@@ -72,6 +73,80 @@ export class EngineWorkerError extends Error {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Telemetry [R16] — every event correlates on a random per-attempt id, never
+// a file identifier. This data is the evidence for eventually deleting the
+// legacy pipeline.
+// ---------------------------------------------------------------------------
+
+/** The engine decision recorded for the in-flight upload attempt. */
+export interface UploadAttemptTelemetry {
+    attemptId: string;
+    engine: 'worker' | 'legacy';
+}
+
+let currentAttempt: UploadAttemptTelemetry | undefined;
+let pendingPersistDetail: string | undefined;
+
+/**
+ * The most recent delegation decision — Home.tsx stamps the upload success
+ * event with its `engine`. Undefined until a probe (or engine resume) runs,
+ * and after `resetUploadAttemptTelemetry`.
+ */
+export function currentUploadAttempt(): UploadAttemptTelemetry | undefined {
+    return currentAttempt;
+}
+
+/**
+ * Called at upload start so an upload that never reaches the delegation
+ * decision (below the multipart threshold) cannot inherit the previous
+ * attempt's engine label.
+ */
+export function resetUploadAttemptTelemetry(): void {
+    currentAttempt = undefined;
+}
+
+/** Mint the attempt this run's engine events correlate on. Callers emit
+ * their primary event, then `flushPendingPersistResult()`. */
+function beginTelemetryAttempt(engine: 'worker' | 'legacy'): UploadAttemptTelemetry {
+    currentAttempt = { attemptId: newUploadAttemptId(), engine };
+    return currentAttempt;
+}
+
+function engineEvent(
+    event: 'failure' | 'resume' | 'cancel' | 'replay' | 'persist-result',
+    detail?: string,
+): void {
+    const attempt = currentAttempt ?? beginTelemetryAttempt('worker');
+    trackEngineEvent({
+        attemptId: attempt.attemptId,
+        event,
+        ...(detail !== undefined && { detail }),
+    });
+}
+
+function flushPendingPersistResult(): void {
+    if (pendingPersistDetail !== undefined && currentAttempt !== undefined) {
+        trackEngineEvent({
+            attemptId: currentAttempt.attemptId,
+            event: 'persist-result',
+            detail: pendingPersistDetail,
+        });
+        pendingPersistDetail = undefined;
+    }
+}
+
+// The lifecycle wrapper requests storage.persist() before the delegation
+// decision has minted an attempt id, so an early result is buffered and
+// flushed with the attempt it belongs to.
+onStoragePersistResult((result) => {
+    if (currentAttempt !== undefined) {
+        engineEvent('persist-result', result);
+    } else {
+        pendingPersistDetail = result;
+    }
+});
+
 function killSwitchOn(): boolean {
     try {
         return (
@@ -89,9 +164,22 @@ function killSwitchOn(): boolean {
  * Per-upload eligibility probe: kill switch → worker spawn → OPFS
  * `getDirectory` → 1-byte sync-access-handle write/read round trip →
  * `storage.estimate()` (advisory). Any failure means the caller falls through
- * to the legacy pipeline silently.
+ * to the legacy pipeline silently. Either outcome is the delegation decision,
+ * so it emits the attempt telemetry event [R16].
  */
 export async function probeEligibility(): Promise<EngineEligibility> {
+    const result = await probeEnvironment();
+    const attempt = beginTelemetryAttempt(result.eligible ? 'worker' : 'legacy');
+    trackUploadAttempt({
+        engine: attempt.engine,
+        ...(result.eligible || result.reason === undefined ? {} : { reason: result.reason }),
+        attemptId: attempt.attemptId,
+    });
+    flushPendingPersistResult();
+    return result;
+}
+
+async function probeEnvironment(): Promise<EngineEligibility> {
     if (killSwitchOn()) {
         return { eligible: false, reason: 'kill-switch' };
     }
@@ -167,6 +255,27 @@ export async function resumeEngineUploadInWorker(
     if (!lease) {
         throw new Error(`no engine lease for upload ${fileId} — nothing to resume`);
     }
+    // A resume is a fresh telemetry attempt: mint the id its engine events
+    // correlate on, report which resume-tree branch ran (the plan action is a
+    // fixed vocabulary — no file identifiers [R16]), and flag completion
+    // replays explicitly.
+    beginTelemetryAttempt('worker');
+    try {
+        const state = await openEngineState();
+        const [envelope, checkpoint, parts] = await Promise.all([
+            state.getEnvelope(fileId),
+            state.getCheckpoint(fileId),
+            state.getParts(fileId),
+        ]);
+        const plan = planResume(lease, envelope, checkpoint, parts);
+        engineEvent('resume', plan.action);
+        if (plan.action === 'replay-complete') {
+            engineEvent('replay');
+        }
+    } catch {
+        engineEvent('resume'); // branch unknown — still count the resume
+    }
+    flushPendingPersistResult();
     return runWorkerJob(
         { type: 'resume', fileId },
         { fileId, uploadId: lease.uploadId, uploadToken: lease.uploadToken },
@@ -232,6 +341,7 @@ function runWorkerJob(
                 case 'error':
                     settle(() => {
                         worker.terminate();
+                        engineEvent('failure', message.retryable ? 'retryable' : 'fatal');
                         reject(new EngineWorkerError(message.message, message.retryable));
                     });
                     break;
@@ -240,13 +350,17 @@ function runWorkerJob(
                     // (part-store destroy, state clear) and closes itself when
                     // finished — terminating here would kill that cleanup
                     // mid-flight [R6].
-                    settle(() => reject(new Error('Upload cancelled')));
+                    settle(() => {
+                        engineEvent('cancel', 'acked');
+                        reject(new Error('Upload cancelled'));
+                    });
                     break;
             }
         };
         worker.onerror = (event) => {
             settle(() => {
                 worker.terminate();
+                engineEvent('failure', 'worker-crash');
                 reject(new EngineWorkerError(event.message || 'engine worker crashed', true));
             });
         };
@@ -263,6 +377,7 @@ function runWorkerJob(
             escalationTimer = setTimeout(() => {
                 settle(() => {
                     worker.terminate();
+                    engineEvent('cancel', 'escalated');
                     void abortEngineUpload(
                         identity.fileId,
                         identity.uploadId,

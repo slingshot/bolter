@@ -21,9 +21,11 @@ import { Keychain } from '@/lib/crypto';
 import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
 import {
+    currentUploadAttempt,
     discardEngineUpload,
     type EngineResumeCandidate,
     engineStartupMaintenance,
+    resetUploadAttemptTelemetry,
 } from '@/lib/upload-engine/client';
 import { verifyHandleFile } from '@/lib/upload-engine/resume';
 import {
@@ -388,6 +390,9 @@ export function HomePage() {
         setCanceller(canceller);
         setKeychain(keychain);
         setZippingProgress(null);
+        // A small upload never reaches the engine delegation decision — clear
+        // the previous attempt so the success event cannot inherit its engine.
+        resetUploadAttemptTelemetry();
 
         addBreadcrumb('Upload started', {
             category: 'upload',
@@ -442,7 +447,11 @@ export function HomePage() {
             };
 
             addUploadedFile(uploaded);
-            trackUpload({ fileSize: uploaded.size, encrypted });
+            trackUpload({
+                fileSize: uploaded.size,
+                encrypted,
+                engine: currentUploadAttempt()?.engine ?? 'legacy',
+            });
             setUploadedFile(uploaded);
             clearFiles();
 
