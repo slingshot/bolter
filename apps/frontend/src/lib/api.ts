@@ -14,7 +14,7 @@ import {
     ECE_RECORD_SIZE,
     Keychain,
 } from './crypto';
-import { FileReadError } from './errors';
+import { FileReadError, LimitReachedError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
 import {
     deleteUploadState,
@@ -2993,6 +2993,21 @@ export async function downloadFile(
     // Get download URL
     const urlData = await fetchDownloadUrlInfo(id, keychain);
 
+    // At the download limit the backend deliberately answers with a soft 200
+    // carrying the counters (documented tradeoff) rather than a 410, so the
+    // client must gate on them. Falling through would hit /download/:id, which
+    // hard-410s (or 404s once the file is deleted) and surfaces as a generic
+    // retryable "HTTP 410"/"HTTP 404" plus a spurious error report.
+    if (
+        typeof urlData.dl === 'number' &&
+        typeof urlData.dlimit === 'number' &&
+        urlData.dlimit > 0 &&
+        urlData.dl >= urlData.dlimit
+    ) {
+        dlLog('Download limit reached', { dl: urlData.dl, dlimit: urlData.dlimit });
+        throw new LimitReachedError();
+    }
+
     dlLog('Got download URL', {
         useSignedUrl: urlData.useSignedUrl,
         urlLength: urlData.url?.length,
@@ -3236,11 +3251,30 @@ export async function downloadFile(
             `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
         );
     }
+    const isSinglePayload = !metadata.zipped && (!files || files.length <= 1);
+
+    // Defence-in-depth for the no-Content-Length fallback stream route: the
+    // guard above cannot fire, and an unencrypted payload carries no ECE
+    // authentication either, so a severed upstream would otherwise be saved as
+    // a truncated file with a download credit burned. The declared plaintext
+    // size is the only truncation signal left, so here it is enforced rather
+    // than merely reported.
+    if (
+        contentLength === 0 &&
+        isSinglePayload &&
+        !metadata.encrypted &&
+        metadata.size > 0 &&
+        loaded !== metadata.size
+    ) {
+        throw new Error(
+            `Download incomplete: received ${loaded} of ${metadata.size} bytes. Please try again.`,
+        );
+    }
+
     // Plaintext size can legitimately differ from metadata (iOS lazily
     // transcodes HEIC/HEVC after File.size is read), so a mismatch here is
     // telemetry, not failure — real truncation is caught by the
     // Content-Length check above and by ECE record authentication.
-    const isSinglePayload = !metadata.zipped && (!files || files.length <= 1);
     if (isSinglePayload && metadata.size > 0) {
         const expectedPlaintext = metadata.size;
         const actualPlaintext = metadata.encrypted ? decryptedSize : loaded;
