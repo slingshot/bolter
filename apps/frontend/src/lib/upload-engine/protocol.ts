@@ -40,3 +40,11 @@ export type WorkerToClient =
     | { type: 'cancelled' } // cancel ack — worker has aborted XHRs + called server abort
     | { type: 'error'; message: string; retryable: boolean }
     | { type: 'done'; actualSize: number };
+
+/**
+ * Internal eligibility-probe handshake (`probeEligibility`), sent to a
+ * throwaway worker before any job starts — additive to the job protocol
+ * above, never mixed into a running upload's message stream.
+ */
+export type EngineProbeRequest = { type: 'probe' };
+export type EngineProbeResult = { type: 'probe-result'; ok: boolean; reason?: string };
