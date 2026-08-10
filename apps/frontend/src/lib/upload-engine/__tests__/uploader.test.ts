@@ -644,4 +644,110 @@ describe('runUploaders', () => {
         expect(attemptSignal?.aborted).toBe(true);
         expect((await store.listParts()).map((p) => p.partNumber)).toEqual([1]);
     });
+
+    it('coalesces byte progress to a wall-clock cadence, stamped with the producer clock', async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        await stage(store, 1, makeData(1000));
+
+        const emitted: [number, number][] = [];
+        const uploadPart: UploaderOpts['uploadPart'] = (_url, _body, hooks) => {
+            // 40 XHR progress events across 1s — the rate a real part upload
+            // delivers, and a message per event is what janks the main thread.
+            for (let i = 1; i <= 40; i++) {
+                hooks.onProgress(i * 25);
+                clock.advance(25);
+            }
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        await runUploaders(
+            makeQueue([{ partNumber: 1, size: 1000 }]),
+            baseOpts({
+                store,
+                uploadPart,
+                maxConcurrent: 1,
+                progressEmitMs: 250,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+                onProgress: (sent, atMs) => {
+                    emitted.push([sent, atMs]);
+                },
+            }),
+        );
+
+        expect(emitted).toEqual([
+            [25, 0],
+            [275, 250],
+            [525, 500],
+            [775, 750],
+            [1000, 975], // the part's final byte, never coalesced away
+            [1000, 1000], // part completion
+        ]);
+    });
+
+    it("reports a part's final byte even when it lands inside a coalescing window", async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        await stage(store, 1, makeData(100));
+
+        const emitted: number[] = [];
+        const uploadPart: UploaderOpts['uploadPart'] = (_url, _body, hooks) => {
+            hooks.onProgress(40);
+            hooks.onProgress(100); // same millisecond as the leading emit
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        await runUploaders(
+            makeQueue([{ partNumber: 1, size: 100 }]),
+            baseOpts({
+                store,
+                uploadPart,
+                maxConcurrent: 1,
+                progressEmitMs: 250,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+                onProgress: (sent) => {
+                    emitted.push(sent);
+                },
+            }),
+        );
+
+        expect(emitted).toEqual([40, 100, 100]);
+    });
+
+    it('emits on every part completion regardless of cadence', async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        await stage(store, 1, makeData(4));
+        await stage(store, 2, makeData(4));
+        await stage(store, 3, makeData(2));
+
+        const emitted: number[] = [];
+        // Parts that finish without a single byte-progress event, all inside
+        // one coalescing window: completion totals must still be reported.
+        const uploadPart: UploaderOpts['uploadPart'] = (url) =>
+            Promise.resolve({ etag: `etag-${url.slice(-1)}` });
+
+        await runUploaders(
+            makeQueue([
+                { partNumber: 1, size: 4 },
+                { partNumber: 2, size: 4 },
+                { partNumber: 3, size: 2 },
+            ]),
+            baseOpts({
+                store,
+                uploadPart,
+                maxConcurrent: 1,
+                progressEmitMs: 250,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+                onProgress: (sent) => {
+                    emitted.push(sent);
+                },
+            }),
+        );
+
+        expect(emitted).toEqual([4, 8, 10]);
+    });
 });

@@ -337,6 +337,11 @@ describe('runEngine', () => {
         // Events: progress along the way, done (with the actual size) last.
         expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
         expect(h.events.some((e) => e.type === 'progress' && e.totalBytes === total)).toBe(true);
+        // Every progress event carries the worker's own clock reading, so the
+        // main thread never times throughput by message delivery.
+        expect(h.events.every((e) => e.type !== 'progress' || typeof e.atMs === 'number')).toBe(
+            true,
+        );
 
         // Lease + envelope were durable before any staging write.
         expect(h.log.indexOf('putLease')).toBeLessThan(h.log.indexOf('stagePart:1'));

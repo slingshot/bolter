@@ -19,7 +19,9 @@
  * transferred byte resets the inference. A 403-style pre-signed-URL expiry
  * triggers one `refreshUrls()` per part. On success the uploaded+ETag record is persisted
  * **before** the staged bytes are deleted [R11], so a crash between the two
- * re-deletes rather than re-uploads.
+ * re-deletes rather than re-uploads. Progress is coalesced to a wall-clock
+ * cadence and stamped with the time this uploader observed the bytes, so the
+ * consumer times throughput by production rather than by delivery.
  *
  * Worker-safe: no DOM globals — `setTimeout` and `AbortController` exist in
  * dedicated workers (and the timer is injectable for deterministic tests).
@@ -50,6 +52,9 @@ export interface UploaderOpts {
     isOnline(): boolean; // fed by connectivity relay
     stallMs?: number; // default 60_000 wall-clock without progress
     maxAttemptsPerPart?: number; // default 6
+    /** Minimum wall clock between byte-driven progress emissions; default
+     * 250ms. Part completions and a part's final byte always emit. */
+    progressEmitMs?: number;
     /** Consecutive immediate connection failures that flip the run to
      * inferred-offline probing [R14]; default 3. */
     offlineInferenceThreshold?: number;
@@ -57,7 +62,9 @@ export interface UploaderOpts {
      * "immediate" for offline inference; default 5_000 wall-clock ms. */
     immediateFailureMs?: number;
     retryDelayMs(attempt: number): number; // from upload-shared (Task 1)
-    onProgress(totalBytesSent: number): void;
+    /** `atMs` is this uploader's own clock reading for `totalBytesSent` —
+     * carried to the consumer so a rate is never timed by message delivery. */
+    onProgress(totalBytesSent: number, atMs: number): void;
     onRetry(): void;
     signal: AbortSignal;
     /** Injectable timer for deterministic tests; defaults to `setTimeout`. */
@@ -68,6 +75,11 @@ const DEFAULT_STALL_MS = 60_000;
 const DEFAULT_MAX_ATTEMPTS = 6;
 const DEFAULT_OFFLINE_INFERENCE_THRESHOLD = 3;
 const DEFAULT_IMMEDIATE_FAILURE_MS = 5_000;
+/** Byte-driven progress cadence. XHR fires ~60 upload progress events per
+ * second *per in-flight part*; relaying each one posts hundreds of messages a
+ * second at the main thread, which is itself a source of the jank that used to
+ * corrupt the reported speed. */
+const DEFAULT_PROGRESS_EMIT_MS = 250;
 /** Coarse stall-poll interval — checks compute wall-clock deltas, so a poll
  * that fires late (throttling, suspension) still measures correctly. */
 const STALL_POLL_MS = 1_000;
@@ -107,6 +119,7 @@ export async function runUploaders(
         opts.offlineInferenceThreshold ?? DEFAULT_OFFLINE_INFERENCE_THRESHOLD,
     );
     const immediateFailureMs = opts.immediateFailureMs ?? DEFAULT_IMMEDIATE_FAILURE_MS;
+    const progressEmitMs = Math.max(0, opts.progressEmitMs ?? DEFAULT_PROGRESS_EMIT_MS);
     const setTimeoutFn = opts.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
 
     // Offline inference [R14]: run-wide because a dead link fails every
@@ -175,16 +188,26 @@ export async function runUploaders(
     // re-sent), so totals stay truthful across retries.
     let completedBytes = 0;
     const inFlight = new Map<number, number>();
-    const emitProgress = () => {
+    // Byte-driven emissions are coalesced to `progressEmitMs` of wall clock;
+    // the state changes a consumer must not miss — a part finishing, its final
+    // byte going out, an attempt's bytes being dropped — force an emission
+    // regardless of cadence, so nothing sits unreported behind a quiet window.
+    let lastEmitAt = Number.NEGATIVE_INFINITY;
+    const emitProgress = (force = false) => {
+        const at = opts.now();
+        if (!force && at - lastEmitAt < progressEmitMs) {
+            return;
+        }
+        lastEmitAt = at;
         let total = completedBytes;
         for (const loaded of inFlight.values()) {
             total += loaded;
         }
-        opts.onProgress(total);
+        opts.onProgress(total, at);
     };
 
     /** One attempt: re-read the committed part, PUT it, stall-watch it. */
-    const attemptPart = async (partNumber: number): Promise<UploadPartResult> => {
+    const attemptPart = async (partNumber: number, size: number): Promise<UploadPartResult> => {
         const url = urls[partNumber - 1];
         if (!url) {
             throw new Error(`no pre-signed URL for part ${partNumber}`);
@@ -220,7 +243,10 @@ export async function runUploaders(
                     lastProgressAt = opts.now();
                     consecutiveImmediateFailures = 0; // bytes moved — link is alive
                     inFlight.set(partNumber, loaded);
-                    emitProgress();
+                    // The part's last byte is reported immediately: the
+                    // response can be seconds behind it, and coalescing it
+                    // away would leave the bar short for that whole wait.
+                    emitProgress(loaded >= size);
                 },
                 signal: attempt.signal,
             });
@@ -243,10 +269,10 @@ export async function runUploaders(
             throwIfAborted();
             const attemptStart = opts.now();
             try {
-                const { etag } = await attemptPart(partNumber);
+                const { etag } = await attemptPart(partNumber, size);
                 inFlight.delete(partNumber);
                 completedBytes += size;
-                emitProgress();
+                emitProgress(true);
                 // Durable ordering [R11]: commit the uploaded+ETag record
                 // first — a crash between the two re-deletes, never re-uploads.
                 await opts.state.putPart({
@@ -262,7 +288,7 @@ export async function runUploaders(
                 return;
             } catch (err) {
                 inFlight.delete(partNumber);
-                emitProgress();
+                emitProgress(true);
                 // A run-level abort wins over whatever this attempt threw.
                 throwIfAborted();
                 const error = err instanceof Error ? err : new Error(String(err));

@@ -67,7 +67,10 @@ export interface EngineEligibility {
 }
 
 export interface EngineClientHooks {
-    onProgress(sent: number, total: number): void;
+    /** `atMs` is the worker's own clock reading for these bytes — see the
+     * `progress` message in `protocol.ts`. Relayed verbatim so speed is never
+     * timed by main-thread delivery. */
+    onProgress(sent: number, total: number, atMs?: number): void;
     onRetry(): void;
 }
 
@@ -354,7 +357,7 @@ function runWorkerJob(
             const message = event.data as WorkerToClient;
             switch (message.type) {
                 case 'progress':
-                    hooks.onProgress(message.bytesSent, message.totalBytes);
+                    hooks.onProgress(message.bytesSent, message.totalBytes, message.atMs);
                     break;
                 case 'retry':
                     hooks.onRetry();

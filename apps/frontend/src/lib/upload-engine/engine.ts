@@ -323,11 +323,12 @@ async function runPipeline(
         stallMs: tuning?.stallMs,
         maxAttemptsPerPart: tuning?.maxAttemptsPerPart,
         retryDelayMs: tuning?.retryDelayMs ?? sharedRetryDelayMs,
-        onProgress: (sent) =>
+        onProgress: (sent, atMs) =>
             deps.onEvent({
                 type: 'progress',
                 bytesSent: uploadedBytesBaseline + sent,
                 totalBytes: job.declaredTotalSize,
+                atMs,
             }),
         onRetry: () => deps.onEvent({ type: 'retry' }),
         signal: cancel,

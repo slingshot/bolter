@@ -49,7 +49,13 @@ export type EngineFailureStage =
     | 'engine'; // setup/dispatch faults outside a specific leg
 
 export type WorkerToClient =
-    | { type: 'progress'; bytesSent: number; totalBytes: number }
+    /** `atMs` is the *producer's* `Date.now()` — the moment the worker
+     * observed these bytes, not the moment the main thread got around to
+     * handling the message. A busy main thread drains queued progress
+     * messages milliseconds apart; timing a rate by delivery would divide a
+     * real byte delta by a phantom gap. Additive: consumers must tolerate its
+     * absence. */
+    | { type: 'progress'; bytesSent: number; totalBytes: number; atMs?: number }
     | { type: 'retry' }
     | { type: 'cancelled' } // cancel ack — worker has aborted XHRs + called server abort
     | { type: 'error'; message: string; retryable: boolean; stage?: EngineFailureStage }

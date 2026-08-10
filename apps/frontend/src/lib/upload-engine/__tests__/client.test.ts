@@ -78,17 +78,20 @@ function makeEnvelope(): CompletionEnvelope {
 
 function makeHooks() {
     const progress: [number, number][] = [];
+    const stamps: (number | undefined)[] = [];
     let retries = 0;
     return {
         hooks: {
-            onProgress: (sent: number, total: number) => {
+            onProgress: (sent: number, total: number, atMs?: number) => {
                 progress.push([sent, total]);
+                stamps.push(atMs);
             },
             onRetry: () => {
                 retries++;
             },
         },
         progress,
+        stamps,
         retries: () => retries,
     };
 }
@@ -145,6 +148,23 @@ describe('upload-engine client facade', () => {
         await expect(run).resolves.toEqual({ actualSize: 4 });
         expect(progress).toContainEqual([2, 4]);
         expect(retries()).toBe(1);
+    });
+
+    it("relays the worker's own timestamp with progress", async () => {
+        const { hooks, progress, stamps } = makeHooks();
+        const { canceller } = makeCanceller();
+
+        const run = runEngineInWorker(makeJob(), makeEnvelope(), hooks, canceller);
+        const worker = FakeWorker.instances[0];
+
+        // Stamped by the worker when it observed the bytes — the reporter
+        // times throughput by this, not by when the message was delivered.
+        worker.emit({ type: 'progress', bytesSent: 2, totalBytes: 4, atMs: 1_700_000_000_123 });
+        worker.emit({ type: 'done', actualSize: 4 });
+
+        await expect(run).resolves.toEqual({ actualSize: 4 });
+        expect(progress).toEqual([[2, 4]]);
+        expect(stamps).toEqual([1_700_000_000_123]);
     });
 
     it('rejects when the worker reports a non-retryable error', async () => {
