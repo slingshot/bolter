@@ -29,6 +29,11 @@ function makeData(size: number): Uint8Array<ArrayBuffer> {
     return data;
 }
 
+// biome-ignore lint/suspicious/useAwait: async generator builds the AsyncIterable the PartStore contract requires
+async function* chunksOf(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+    yield bytes;
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
     const out = new Uint8Array(chunks.reduce((sum, c) => sum + c.byteLength, 0));
     let offset = 0;
@@ -533,6 +538,79 @@ describe('runEngine', () => {
             { PartNumber: 3, ETag: 'etag-3' },
         ]);
         expect(h.completions[0].actualSize).toBe(total);
+    });
+
+    it('does not double-queue a part staged just before the checkpoint write (crash window)', async () => {
+        const total = 2 * MIN + 12;
+        const data = makeData(total);
+        const urls = urlsFor(3);
+        const h = makeHarness(urls);
+        const job = makeJob({
+            source: { kind: 'file', file: new File([data], 'a.bin') },
+            partUrls: urls,
+            partSize: MIN,
+            declaredTotalSize: total,
+            maxConcurrent: 1,
+        });
+        const envelope = makeEnvelope(job.fileId, total);
+
+        // Interrupted run that crashed between `putPart(2, staged)` and
+        // `putCheckpoint(3)`: part 1 uploaded, part 2's bytes and staged
+        // record are durable, but the checkpoint still names part 2 as the
+        // next part to produce — production will re-stage it.
+        await h.state.putLease({
+            fileId: job.fileId,
+            uploadId: job.uploadId,
+            uploadToken: job.uploadToken,
+            ownerToken: job.ownerToken,
+            createdAt: 1,
+            engineVersion: 1,
+        });
+        await h.state.putEnvelope(envelope);
+        await h.state.putPart({
+            fileId: job.fileId,
+            partNumber: 1,
+            size: MIN,
+            staged: true,
+            uploaded: true,
+            etag: 'etag-pre-1',
+        });
+        await h.state.putPart({
+            fileId: job.fileId,
+            partNumber: 2,
+            size: MIN,
+            staged: true,
+            uploaded: false,
+        });
+        await h.store.stagePart(2, chunksOf(data.slice(MIN, 2 * MIN)));
+        await h.state.putCheckpoint({
+            fileId: job.fileId,
+            nextPartNumber: 2,
+            sourceOffset: MIN,
+            eceCounter: 0,
+            eofReached: false,
+            finalRecordEmitted: false,
+        });
+
+        const seededEntries = h.log.length; // ignore the seeding writes above
+
+        const result = await runEngine(job, envelope, h.deps, new AbortController().signal);
+
+        expect(result).toEqual({ actualSize: total });
+        // Part 2 was re-produced from the checkpoint and uploaded exactly
+        // once — the stale staged record did not feed the queue a duplicate
+        // whose readPart would race the winner's delete-after-upload.
+        const runLog = h.log.slice(seededEntries);
+        expect(runLog.filter((e) => e === 'uploadPart:2')).toHaveLength(1);
+        expect(runLog.filter((e) => e === 'stagePart:2')).toHaveLength(1);
+        expect(h.completions).toHaveLength(1);
+        expect(h.completions[0].parts).toEqual([
+            { PartNumber: 1, ETag: 'etag-pre-1' },
+            { PartNumber: 2, ETag: 'etag-2' },
+            { PartNumber: 3, ETag: 'etag-3' },
+        ]);
+        expectBytesEqual(concatBodies(h.bodies), data.slice(MIN));
+        expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
     });
 
     it('encrypted job uploads ciphertext cut at exact record multiples', async () => {

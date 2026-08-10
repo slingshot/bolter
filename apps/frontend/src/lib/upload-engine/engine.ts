@@ -145,14 +145,27 @@ async function runPipeline(
     const persistedEtags = new Map<number, string>();
     let uploadedBytesBaseline = 0;
     const alreadyStaged: { partNumber: number; size: number }[] = [];
+    // A crash between the stager's putPart(staged) and its checkpoint write
+    // leaves the checkpoint still naming that part as next-to-produce. Active
+    // production re-produces every part from the checkpoint onward, so stale
+    // staged records in that range must not also feed the upload queue — the
+    // same part queued twice races the winner's delete-after-upload against
+    // the duplicate's readPart, failing the run non-retryably [R4][R5].
+    const reproducedFrom = production.produce
+        ? production.basePartNumber + 1
+        : Number.POSITIVE_INFINITY;
     for (const part of persisted) {
-        sizes.set(part.partNumber, part.size);
         if (part.uploaded && part.etag) {
+            sizes.set(part.partNumber, part.size);
             persistedEtags.set(part.partNumber, part.etag);
             uploadedBytesBaseline += part.size;
-        } else if (part.staged) {
+        } else if (part.staged && part.partNumber < reproducedFrom) {
+            sizes.set(part.partNumber, part.size);
             alreadyStaged.push({ partNumber: part.partNumber, size: part.size });
         }
+        // Anything else (unstaged demotions, or staged records the producer
+        // will re-produce) contributes nothing here — re-production rewrites
+        // the record and reports its size through onPartStaged.
     }
 
     // Pull queue from stager to uploaders: persisted staged parts first, then
