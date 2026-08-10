@@ -3,7 +3,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn, copyToClipboard } from '@/lib/utils';
-import type { UploadedFile } from '@/stores/app';
+import { buildShareUrl, type UploadedFile } from '@/stores/app';
 
 interface ShareDialogProps {
     file: UploadedFile;
@@ -13,7 +13,12 @@ interface ShareDialogProps {
 export function ShareDialog({ file, onClose }: ShareDialogProps) {
     const [copied, setCopied] = useState(false);
 
-    const shareUrl = `${file.url}#${file.secretKey}`;
+    // Encryption is opt-in and defaults OFF — only claim it when it actually
+    // happened. `undefined` (history entries persisted before the flag existed)
+    // is "unknown" and must not be advertised as encrypted.
+    const isEncrypted = file.encrypted === true;
+    const isPlaintext = file.encrypted === false;
+    const shareUrl = buildShareUrl(file);
 
     const handleCopy = async () => {
         const success = await copyToClipboard(shareUrl);
@@ -41,18 +46,30 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
                 <div className="flex flex-col items-center gap-5">
                     {/* Success Icon */}
                     <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-overlay-medium">
-                        <ShieldCheck className="h-[22px] w-[22px] text-content-secondary" />
+                        {isEncrypted ? (
+                            <ShieldCheck className="h-[22px] w-[22px] text-content-secondary" />
+                        ) : (
+                            <LinkIcon className="h-[22px] w-[22px] text-content-secondary" />
+                        )}
                     </div>
 
                     {/* Title and Description */}
                     <div className="flex flex-col items-center gap-2 text-center">
                         <h2 className="text-heading-xs text-content-primary">
-                            Your file is encrypted and ready to send
+                            {isEncrypted
+                                ? 'Your file is encrypted and ready to send'
+                                : 'Your file is ready to send'}
                         </h2>
                         <p className="text-paragraph-xs text-content-secondary">
                             Copy the link to share your file{' '}
                             <span className="font-medium">{file.name}</span>
                         </p>
+                        {isPlaintext && (
+                            <p className="text-paragraph-xs text-content-secondary">
+                                This file is not end-to-end encrypted. Turn on encryption before
+                                uploading if you need that.
+                            </p>
+                        )}
                     </div>
 
                     {/* QR Code and Link */}

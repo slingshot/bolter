@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/lib/api', () => ({
     deleteFile: vi.fn().mockResolvedValue(undefined),
+    getDownloadStatus: vi.fn().mockResolvedValue({ status: 'error' }),
     API_BASE_URL: 'http://localhost:3001',
 }));
 vi.mock('@/lib/sentry', () => ({
@@ -24,6 +25,7 @@ const makeFile = (overrides: Partial<UploadedFile> = {}): UploadedFile => ({
     expiresAt: new Date('2026-04-01T00:00:00Z'),
     downloadLimit: 5,
     downloadCount: 0,
+    encrypted: true,
     ...overrides,
 });
 
@@ -56,8 +58,8 @@ describe('ShareDialog', () => {
         expect(screen.getByText('important-document.pdf')).toBeInTheDocument();
     });
 
-    it('shows the dialog title', () => {
-        render(<ShareDialog file={makeFile()} onClose={onClose} />);
+    it('shows the encrypted dialog title for an encrypted upload', () => {
+        render(<ShareDialog file={makeFile({ encrypted: true })} onClose={onClose} />);
 
         expect(screen.getByText('Your file is encrypted and ready to send')).toBeInTheDocument();
     });
@@ -137,5 +139,68 @@ describe('ShareDialog', () => {
         // (only from close button or backdrop)
         // The card has stopPropagation, so clicking the title should not trigger backdrop onClose
         expect(onClose).not.toHaveBeenCalled();
+    });
+
+    // Regression: finding #16 — encryption is opt-in and defaults OFF, but the
+    // dialog used to assert "Your file is encrypted" and append a key-looking
+    // fragment for every upload, including plaintext ones.
+    describe('unencrypted uploads', () => {
+        it('does not claim the file is encrypted', () => {
+            render(<ShareDialog file={makeFile({ encrypted: false })} onClose={onClose} />);
+
+            expect(screen.getByText('Your file is ready to send')).toBeInTheDocument();
+            expect(
+                screen.queryByText('Your file is encrypted and ready to send'),
+            ).not.toBeInTheDocument();
+        });
+
+        it('says explicitly that the file is not end-to-end encrypted', () => {
+            render(<ShareDialog file={makeFile({ encrypted: false })} onClose={onClose} />);
+
+            expect(screen.getByText(/not end-to-end encrypted/i)).toBeInTheDocument();
+        });
+
+        it('omits the meaningless secret-key fragment from the share link', () => {
+            render(<ShareDialog file={makeFile({ encrypted: false })} onClose={onClose} />);
+
+            expect(
+                screen.getByDisplayValue('https://example.com/download/abc'),
+            ).toBeInTheDocument();
+            expect(
+                screen.queryByDisplayValue('https://example.com/download/abc#my-secret-key-b64'),
+            ).not.toBeInTheDocument();
+        });
+
+        it('copies the fragment-free link', async () => {
+            const user = userEvent.setup();
+            const writeText = vi.fn().mockResolvedValue(undefined);
+            Object.defineProperty(navigator, 'clipboard', {
+                value: { writeText },
+                writable: true,
+                configurable: true,
+            });
+
+            render(<ShareDialog file={makeFile({ encrypted: false })} onClose={onClose} />);
+            await user.click(screen.getByRole('button', { name: /copy link/i }));
+
+            expect(writeText).toHaveBeenCalledWith('https://example.com/download/abc');
+        });
+    });
+
+    describe('legacy history entries without the encrypted flag', () => {
+        it('does not claim encryption when the flag is unknown', () => {
+            render(<ShareDialog file={makeFile({ encrypted: undefined })} onClose={onClose} />);
+
+            expect(screen.getByText('Your file is ready to send')).toBeInTheDocument();
+            expect(screen.queryByText(/not end-to-end encrypted/i)).not.toBeInTheDocument();
+        });
+
+        it('keeps the key fragment so previously shared links still work', () => {
+            render(<ShareDialog file={makeFile({ encrypted: undefined })} onClose={onClose} />);
+
+            expect(
+                screen.getByDisplayValue('https://example.com/download/abc#my-secret-key-b64'),
+            ).toBeInTheDocument();
+        });
     });
 });

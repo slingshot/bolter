@@ -3,6 +3,8 @@
  * Allows uploads to survive page reloads.
  */
 
+import { abortServerMultipart } from './multipart-abort';
+
 // Version 2: encrypted parts are cut on ECE record boundaries. Pre-v2 encrypted
 // state with completed parts was cut mid-record and cannot be resumed safely.
 export const UPLOAD_STATE_VERSION = 2;
@@ -214,32 +216,70 @@ export async function deleteUploadState(fileId: string): Promise<void> {
     });
 }
 
-export async function cleanupExpiredUploads(): Promise<void> {
-    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-    const cutoff = Date.now() - SEVEN_DAYS;
+/**
+ * Discard a resumable upload: abort the server-side multipart first (so the S3
+ * parts stop being billable and the provider file counter is decremented), then
+ * drop the local IndexedDB record.
+ *
+ * The abort is best-effort — `abortServerMultipart` never throws — so the local
+ * record is always removed even when the backend is unreachable.
+ */
+export async function discardResumableUpload(state: {
+    fileId: string;
+    uploadId: string;
+}): Promise<void> {
+    await abortServerMultipart(state.fileId, state.uploadId);
+    await deleteUploadState(state.fileId);
+}
+
+/** Collect (without deleting) the records older than `cutoff`. */
+async function listUploadsOlderThan(
+    cutoff: number,
+): Promise<Array<{ fileId: string; uploadId: string }>> {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const request = store.openCursor();
+        const stale: Array<{ fileId: string; uploadId: string }> = [];
 
         request.onsuccess = () => {
             const cursor = request.result;
             if (cursor) {
                 const state = cursor.value as PersistedUpload;
                 if (state.createdAt < cutoff) {
-                    cursor.delete();
+                    stale.push({ fileId: state.fileId, uploadId: state.uploadId });
                 }
                 cursor.continue();
             }
         };
         tx.oncomplete = () => {
             db.close();
-            resolve();
+            resolve(stale);
         };
         tx.onerror = () => {
             db.close();
             reject(tx.error);
         };
     });
+}
+
+export async function cleanupExpiredUploads(): Promise<void> {
+    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - SEVEN_DAYS;
+    const stale = await listUploadsOlderThan(cutoff);
+
+    for (const record of stale) {
+        try {
+            // Abort the abandoned multipart before forgetting the only place
+            // that still holds its uploadId.
+            await discardResumableUpload(record);
+        } catch {
+            // The abort itself never throws; a failure here means the local
+            // delete failed. Retry it so cleanup still makes progress.
+            await deleteUploadState(record.fileId).catch(() => {
+                // Best-effort cleanup — nothing else to do.
+            });
+        }
+    }
 }

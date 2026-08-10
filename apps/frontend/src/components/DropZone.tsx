@@ -6,103 +6,157 @@ import { captureError } from '@/lib/sentry';
 import { cn } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
-// Recursively read all files from a directory entry
-async function readDirectoryEntries(dirEntry: FileSystemDirectoryEntry): Promise<File[]> {
-    const reader = dirEntry.createReader();
-    const files: File[] = [];
+/**
+ * Result of a fault-tolerant drop traversal.
+ *
+ * A folder drop must never be all-or-nothing: one un-enumerable subdirectory or
+ * one unreadable file used to reject the whole traversal and silently discard
+ * every file that HAD been read. Successes are collected, failures are counted
+ * so the UI can tell the user what was skipped.
+ */
+export interface DropTraversal {
+    files: File[];
+    skipped: number;
+}
 
-    // readEntries may not return all entries at once, so we need to call it repeatedly
-    const readAllEntries = (): Promise<FileSystemEntry[]> => {
-        return new Promise((resolve, reject) => {
-            const allEntries: FileSystemEntry[] = [];
+// readEntries may not return all entries at once, so it must be called
+// repeatedly. Resolves with whatever was read; `failed` marks a partial read.
+function readAllDirectoryEntries(
+    reader: FileSystemDirectoryReader,
+): Promise<{ entries: FileSystemEntry[]; failed: boolean }> {
+    return new Promise((resolve) => {
+        const allEntries: FileSystemEntry[] = [];
 
-            const readBatch = () => {
-                reader.readEntries((entries) => {
-                    if (entries.length === 0) {
-                        resolve(allEntries);
-                    } else {
-                        allEntries.push(...entries);
-                        readBatch();
-                    }
-                }, reject);
-            };
+        const readBatch = () => {
+            try {
+                reader.readEntries(
+                    (entries) => {
+                        if (entries.length === 0) {
+                            resolve({ entries: allEntries, failed: false });
+                        } else {
+                            allEntries.push(...entries);
+                            readBatch();
+                        }
+                    },
+                    () => resolve({ entries: allEntries, failed: true }),
+                );
+            } catch {
+                resolve({ entries: allEntries, failed: true });
+            }
+        };
 
-            readBatch();
-        });
-    };
+        readBatch();
+    });
+}
 
-    const entries = await readAllEntries();
+// Recursively read all files from a directory entry, tolerating per-entry errors
+async function readDirectoryEntries(
+    dirEntry: FileSystemDirectoryEntry,
+    acc: DropTraversal,
+): Promise<void> {
+    let reader: FileSystemDirectoryReader;
+    try {
+        reader = dirEntry.createReader();
+    } catch {
+        acc.skipped++;
+        return;
+    }
+
+    const { entries, failed } = await readAllDirectoryEntries(reader);
+    if (failed) {
+        // We could not enumerate the whole directory — keep what we did read.
+        acc.skipped++;
+    }
 
     for (const entry of entries) {
         if (entry.isFile) {
             const file = await getFileFromEntry(entry as FileSystemFileEntry);
-            if (file) {
-                // Preserve the relative path for folder structure
-                const relativePath = entry.fullPath.startsWith('/')
-                    ? entry.fullPath.slice(1)
-                    : entry.fullPath;
-                // Create a new File object with the relative path as the name
-                const fileWithPath = new File([file], relativePath, {
-                    type: file.type,
-                    lastModified: file.lastModified,
-                });
-                files.push(fileWithPath);
+            if (!file) {
+                acc.skipped++;
+                continue;
             }
+            // Preserve the relative path for folder structure
+            const relativePath = entry.fullPath.startsWith('/')
+                ? entry.fullPath.slice(1)
+                : entry.fullPath;
+            // Create a new File object with the relative path as the name
+            const fileWithPath = new File([file], relativePath, {
+                type: file.type,
+                lastModified: file.lastModified,
+            });
+            acc.files.push(fileWithPath);
         } else if (entry.isDirectory) {
-            const subFiles = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-            files.push(...subFiles);
+            try {
+                await readDirectoryEntries(entry as FileSystemDirectoryEntry, acc);
+            } catch {
+                acc.skipped++;
+            }
         }
     }
-
-    return files;
 }
 
 // Get a File object from a FileSystemFileEntry
 function getFileFromEntry(fileEntry: FileSystemFileEntry): Promise<File | null> {
     return new Promise((resolve) => {
-        fileEntry.file(
-            (file) => resolve(file),
-            () => resolve(null),
-        );
+        try {
+            fileEntry.file(
+                (file) => resolve(file),
+                () => resolve(null),
+            );
+        } catch {
+            resolve(null);
+        }
     });
 }
 
 // Process DataTransferItemList to handle both files and folders
-async function processDataTransferItems(items: DataTransferItemList): Promise<File[]> {
-    const files: File[] = [];
+export async function processDataTransferItems(
+    items: DataTransferItemList,
+): Promise<DropTraversal> {
+    const acc: DropTraversal = { files: [], skipped: 0 };
     const entries: FileSystemEntry[] = [];
 
     // Collect all entries first (must be done synchronously during the event)
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (item.kind === 'file') {
-            const entry = item.webkitGetAsEntry();
+            let entry: FileSystemEntry | null = null;
+            try {
+                entry = item.webkitGetAsEntry();
+            } catch {
+                entry = null;
+            }
             if (entry) {
                 entries.push(entry);
             }
         }
     }
 
-    // Process entries asynchronously
+    // Process entries asynchronously — one bad entry must not lose the rest
     for (const entry of entries) {
-        if (entry.isFile) {
-            const file = await getFileFromEntry(entry as FileSystemFileEntry);
-            if (file) {
-                files.push(file);
+        try {
+            if (entry.isFile) {
+                const file = await getFileFromEntry(entry as FileSystemFileEntry);
+                if (file) {
+                    acc.files.push(file);
+                } else {
+                    acc.skipped++;
+                }
+            } else if (entry.isDirectory) {
+                await readDirectoryEntries(entry as FileSystemDirectoryEntry, acc);
             }
-        } else if (entry.isDirectory) {
-            const dirFiles = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-            files.push(...dirFiles);
+        } catch {
+            acc.skipped++;
         }
     }
 
-    return files;
+    return acc;
 }
 
 export function DropZone() {
     const [isDragging, setIsDragging] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
-    const { addFiles, config } = useAppStore();
+    const { addFiles, addToast, config } = useAppStore();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const folderInputRef = useRef<HTMLInputElement>(null);
 
@@ -131,30 +185,70 @@ export function DropZone() {
             e.stopPropagation();
             setIsDragging(false);
 
-            if (!e.dataTransfer.items || e.dataTransfer.items.length === 0) {
+            // Snapshot the plain file list SYNCHRONOUSLY. After the first await
+            // the DataTransfer is neutered/protected and `files` reads empty, so
+            // the fallback path had nothing left to recover.
+            const droppedFiles = Array.from(e.dataTransfer.files ?? []);
+            const items = e.dataTransfer.items;
+            // Count only `kind === 'file'` items, synchronously. Dragging a URL,
+            // a text selection or an image from another page produces `string`
+            // items and no files at all — that is a no-op, not a failed drop,
+            // and must not raise "Nothing was added".
+            let fileItemCount = 0;
+            for (let i = 0; i < (items?.length ?? 0); i++) {
+                if (items[i].kind === 'file') {
+                    fileItemCount++;
+                }
+            }
+
+            if (fileItemCount === 0 && droppedFiles.length === 0) {
                 return;
             }
 
             setIsProcessing(true);
 
+            let files: File[] = [];
+            let skipped = 0;
+
             try {
-                const files = await processDataTransferItems(e.dataTransfer.items);
-                if (files.length > 0) {
-                    addFiles(files);
+                if (fileItemCount > 0) {
+                    const traversal = await processDataTransferItems(items);
+                    files = traversal.files;
+                    skipped = traversal.skipped;
+                }
+                if (files.length === 0 && droppedFiles.length > 0) {
+                    // Nothing came back from the entry traversal — fall back to
+                    // the synchronous snapshot rather than dropping everything.
+                    files = droppedFiles.filter((f) => f.size > 0);
                 }
             } catch (error) {
                 console.error('Error processing dropped items:', error);
                 captureError(error, { operation: 'dropzone.process' });
-                // Fallback to basic file handling
-                const files = Array.from(e.dataTransfer.files).filter((f) => f.size > 0);
-                if (files.length > 0) {
-                    addFiles(files);
-                }
+                files = droppedFiles.filter((f) => f.size > 0);
             } finally {
                 setIsProcessing(false);
             }
+
+            if (files.length > 0) {
+                addFiles(files);
+            }
+
+            if (files.length === 0) {
+                addToast({
+                    title: 'Nothing was added',
+                    description:
+                        'None of the dropped items could be read. Try selecting them with the file picker instead.',
+                    variant: 'destructive',
+                });
+            } else if (skipped > 0) {
+                addToast({
+                    title: `${skipped} item${skipped === 1 ? '' : 's'} skipped`,
+                    description: `${files.length} file${files.length === 1 ? '' : 's'} added. Some items could not be read and were left out.`,
+                    variant: 'destructive',
+                });
+            }
         },
-        [addFiles],
+        [addFiles, addToast],
     );
 
     const handleFileInput = useCallback(
