@@ -48,26 +48,52 @@ export type DirectDownloadOutcome = 'delivered' | 'not-delivered' | 'unknown';
 /**
  * Decide whether a hidden-iframe direct download actually delivered anything.
  *
- * The iframe cannot surface HTTP status, so the only observable signal is the
- * server-side download counter moving. `gone` means the file disappeared
- * during the attempt: that is only consistent with success when this very
- * download would have exhausted the limit (the server schedules deletion once
- * `dl >= dlimit`); otherwise it was deleted or expired out from under us and
- * nothing was delivered. A transient status error tells us nothing, so it
- * stays `unknown` and is treated as before (the page deliberately never turns
- * a transient status failure into a hard error).
+ * Two signals, in priority order:
+ *
+ * 1. `framedDocument` — whether the hidden iframe fired `load`. A successful
+ *    `/download/direct/:id` answers 302 → S3 with
+ *    `Content-Disposition: attachment`; the browser turns that navigation into
+ *    a download, so the frame keeps its previous document and **no `load`
+ *    event fires**. Every failure is a renderable body instead (the route's
+ *    404/400/410/500 JSON, or an S3 error page after the redirect), which the
+ *    frame does load. A fired `load` is therefore per-request proof that
+ *    *this* request delivered nothing — the one signal that is attributable to
+ *    us rather than shared with other viewers.
+ *
+ * 2. The server-side download counter, which catches the failures that never
+ *    reach the frame at all (navigation blocked, request never sent). It is
+ *    only trustworthy in the negative direction: a counter that did not move
+ *    proves nothing was delivered, but a counter that did move may have been
+ *    moved by a concurrent viewer, which is why signal 1 outranks it.
+ *
+ * Anything else is `unknown`: a transient status-check failure, or a file that
+ * vanished mid-attempt (deleted or TTL-expired). Neither is evidence of
+ * delivery — a vanished file least of all — and neither is evidence of
+ * failure, since a 404 from the route itself would have rendered in the frame.
  */
 export function evaluateDirectDownloadOutcome(
     before: { dl: number; dlimit: number },
     after: DownloadStatusResult,
+    framedDocument: boolean,
 ): DirectDownloadOutcome {
+    if (framedDocument) {
+        return 'not-delivered';
+    }
     if (after.status === 'ok') {
         return after.dl > before.dl ? 'delivered' : 'not-delivered';
     }
-    if (after.status === 'gone') {
-        return before.dl + 1 >= before.dlimit ? 'delivered' : 'not-delivered';
-    }
     return 'unknown';
+}
+
+/**
+ * True while the download counter alone cannot attribute delivery to us: the
+ * file's credits are now exhausted, so the server may have refused this very
+ * request with a 410 while another viewer's request moved the counter. In that
+ * window the frame's `load` event is the deciding signal, so it is worth
+ * waiting a moment longer for a slow error document before claiming success.
+ */
+function isAmbiguousDelivery(after: DownloadStatusResult): boolean {
+    return after.status === 'ok' && after.dl >= after.dlimit;
 }
 
 /**
@@ -84,10 +110,26 @@ export function classifyDownloadError(err: unknown): 'key' | 'limit' | 'other' {
         return 'key';
     }
     const message = err instanceof Error ? err.message : String(err);
-    if (name === 'LimitReachedError' || /HTTP (404|410)/.test(message)) {
+    if (name === 'LimitReachedError' || /\bHTTP (?:404|410)\b/.test(message)) {
         return 'limit';
     }
     return 'other';
+}
+
+/**
+ * Copy for the completion screen. A delivery the page could not confirm gets
+ * an honest account of what is and is not known, plus what to do about it —
+ * never "your file has been downloaded".
+ */
+function completionMessage(deliveryConfirmed: boolean, canDownloadAgain: boolean): string {
+    if (deliveryConfirmed) {
+        return canDownloadAgain
+            ? 'Your file has been downloaded successfully.'
+            : 'Your file has been downloaded. Download limit reached.';
+    }
+    return canDownloadAgain
+        ? "We couldn't confirm the download finished. Check your downloads folder, and try again if the file isn't there."
+        : "We couldn't confirm the download finished, and the download limit has now been reached. If the file isn't in your downloads folder, ask the sender for a new link.";
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -124,6 +166,12 @@ export function DownloadPage() {
     const [downloadsLeft, setDownloadsLeft] = useState<number | null>(null);
     const [downloadPhase, setDownloadPhase] = useState<DownloadPhase>('downloading');
     const [isKeyError, setIsKeyError] = useState(false);
+    // False when the complete screen is showing but delivery could not be
+    // confirmed — never assert "Download complete!" on a guess
+    const [deliveryConfirmed, setDeliveryConfirmed] = useState(true);
+    // True while a direct download has been handed to the browser and the page
+    // is still working out whether it was actually delivered
+    const [directChecking, setDirectChecking] = useState(false);
     const loadedKeyRef = useRef<string | null>(null);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
     const directPendingRef = useRef(false);
@@ -162,11 +210,22 @@ export function DownloadPage() {
     // Update document title and meta description
     useDocumentMeta(documentMeta);
 
-    // Keep the download iframe attached until the page unmounts — removing it
-    // early cancels slow redirects after the server has already counted the download
+    // Create the hidden download frame up front rather than at click time.
+    // Inserting an iframe fires a `load` event for its initial about:blank
+    // document, and the delivery check treats `load` as "the server rendered a
+    // page instead of handing over a file" — creating the frame on mount keeps
+    // that event far away from any download attempt. It then stays attached
+    // until the page unmounts: removing it early cancels slow redirects after
+    // the server has already counted the download.
     useEffect(() => {
+        const iframe = document.createElement('iframe');
+        iframe.title = 'File download';
+        iframe.setAttribute('aria-hidden', 'true');
+        iframe.style.display = 'none';
+        document.body.appendChild(iframe);
+        iframeRef.current = iframe;
         return () => {
-            iframeRef.current?.remove();
+            iframe.remove();
             iframeRef.current = null;
         };
     }, []);
@@ -312,21 +371,31 @@ export function DownloadPage() {
                 return;
             }
             directPendingRef.current = true;
+            setDirectChecking(true);
             // A later click supersedes any still-running delivery check
             const run = ++directRunRef.current;
+            const releaseClickGuard = () => {
+                // Only the newest attempt may release the guard — releasing it
+                // early lets an impatient second click burn another
+                // server-side download credit
+                if (directRunRef.current === run) {
+                    directPendingRef.current = false;
+                    setDirectChecking(false);
+                }
+            };
 
             // Validate before navigating the iframe — the iframe itself cannot
             // surface server errors, so a failed pre-check must not burn a click
             const status = await getDownloadStatus(id, keychain);
             if (isStale()) {
-                directPendingRef.current = false;
+                releaseClickGuard();
                 return;
             }
             if (
                 status.status === 'gone' ||
                 (status.status === 'ok' && status.dl >= status.dlimit)
             ) {
-                directPendingRef.current = false;
+                releaseClickGuard();
                 if (fromCompleteScreen) {
                     // The file was already delivered to this user — show the
                     // limit-reached copy instead of replacing it with "not found"
@@ -338,7 +407,7 @@ export function DownloadPage() {
                 return;
             }
             if (status.status === 'error') {
-                directPendingRef.current = false;
+                releaseClickGuard();
                 setIsKeyError(false);
                 setError(
                     'Could not reach the server to start the download. Check your connection and try again.',
@@ -347,12 +416,14 @@ export function DownloadPage() {
                 return;
             }
 
-            // Use hidden iframe to trigger download without leaving the page;
-            // reuse a single iframe across clicks and keep it attached until
-            // unmount so slow redirects are not cancelled mid-flight
+            // Use a hidden iframe to trigger the download without leaving the
+            // page. The frame is created on mount and kept attached until
+            // unmount so slow redirects are not cancelled mid-flight.
             let iframe = iframeRef.current;
             if (!iframe) {
                 iframe = document.createElement('iframe');
+                iframe.title = 'File download';
+                iframe.setAttribute('aria-hidden', 'true');
                 iframe.style.display = 'none';
                 document.body.appendChild(iframe);
                 iframeRef.current = iframe;
@@ -361,68 +432,110 @@ export function DownloadPage() {
             // delivery from an iframe request the server refused
             const before = { dl: status.dl, dlimit: status.dlimit };
 
+            // Watch for the frame loading a document. A delivered file never
+            // loads (Content-Disposition: attachment turns the navigation into
+            // a download); a refused request renders its error body instead.
+            // That makes `load` the one delivery signal attributable to *this*
+            // request rather than shared with every other viewer.
+            let framedDocument = false;
+            const onFrameLoad = () => {
+                try {
+                    // The frame resetting to about:blank is not a server
+                    // response. A cross-origin document throws here, which is
+                    // itself proof that a real response rendered.
+                    if (iframe.contentWindow?.location.href === 'about:blank') {
+                        return;
+                    }
+                } catch {
+                    // Cross-origin — a real document loaded
+                }
+                framedDocument = true;
+            };
+            iframe.addEventListener('load', onFrameLoad);
+
             iframe.src = `${API_BASE_URL}/download/direct/${id}`;
 
             // Refresh download counts once the server has likely burned the credit
             setTimeout(async () => {
-                directPendingRef.current = false;
-                trackDownload({ fileId: id });
-                if (isStale() || directRunRef.current !== run) {
-                    return;
-                }
-
-                // The iframe cannot report HTTP failures (410 at the limit, a
-                // 5xx from URL signing), so confirm delivery by watching the
-                // server-side counter instead of assuming success. Re-check a
-                // couple of times before giving up — a slow request may not
-                // have reached the server yet.
-                let after = await getDownloadStatus(id, keychain);
-                for (
-                    let attempt = 1;
-                    attempt < DIRECT_DOWNLOAD_STATUS_ATTEMPTS &&
-                    evaluateDirectDownloadOutcome(before, after) === 'not-delivered';
-                    attempt++
-                ) {
-                    await delay(DIRECT_DOWNLOAD_RECHECK_MS);
+                try {
                     if (isStale() || directRunRef.current !== run) {
                         return;
                     }
-                    after = await getDownloadStatus(id, keychain);
-                }
-                if (isStale() || directRunRef.current !== run) {
-                    return;
-                }
 
-                if (after.status === 'ok') {
-                    setDownloadsLeft(after.dlimit - after.dl);
-                    setCanDownloadAgain(after.dl < after.dlimit);
-                } else if (after.status === 'gone') {
-                    setCanDownloadAgain(false);
-                }
+                    // Confirm delivery instead of assuming it. Re-check a
+                    // couple of times before giving up — a slow request may
+                    // not have reached the server yet.
+                    let after = await getDownloadStatus(id, keychain);
+                    for (
+                        let attempt = 1;
+                        attempt < DIRECT_DOWNLOAD_STATUS_ATTEMPTS &&
+                        !framedDocument &&
+                        evaluateDirectDownloadOutcome(before, after, false) === 'not-delivered';
+                        attempt++
+                    ) {
+                        await delay(DIRECT_DOWNLOAD_RECHECK_MS);
+                        if (isStale() || directRunRef.current !== run) {
+                            return;
+                        }
+                        after = await getDownloadStatus(id, keychain);
+                    }
 
-                if (evaluateDirectDownloadOutcome(before, after) === 'not-delivered') {
-                    captureError(new Error('Direct download delivered nothing'), {
-                        operation: 'download.direct',
-                        level: 'warning',
-                        extra: {
-                            fileId: id,
-                            dlBefore: before.dl,
-                            dlimit: before.dlimit,
-                            afterStatus: after.status,
-                        },
-                    });
-                    setIsKeyError(false);
-                    setError(
-                        'The download did not start. The file may have just reached its download limit, or the server rejected the request.',
-                    );
-                    setState('error');
-                    return;
-                }
+                    // The counter says delivered, but the file's credits are
+                    // now spent — so the increment could have been another
+                    // viewer's while this request was refused. Give a slow
+                    // error document time to arrive before believing it.
+                    if (
+                        !framedDocument &&
+                        isAmbiguousDelivery(after) &&
+                        evaluateDirectDownloadOutcome(before, after, false) === 'delivered'
+                    ) {
+                        await delay(DIRECT_DOWNLOAD_RECHECK_MS);
+                        if (isStale() || directRunRef.current !== run) {
+                            return;
+                        }
+                    }
 
-                // 'unknown' (transient status error) is reported as before —
-                // the page deliberately never turns a transient status failure
-                // into a hard error
-                setState('complete');
+                    if (after.status === 'ok') {
+                        setDownloadsLeft(after.dlimit - after.dl);
+                        setCanDownloadAgain(after.dl < after.dlimit);
+                    } else if (after.status === 'gone') {
+                        setCanDownloadAgain(false);
+                        setDownloadsLeft(0);
+                    }
+
+                    const outcome = evaluateDirectDownloadOutcome(before, after, framedDocument);
+                    if (outcome === 'not-delivered') {
+                        captureError(new Error('Direct download delivered nothing'), {
+                            operation: 'download.direct',
+                            level: 'warning',
+                            extra: {
+                                fileId: id,
+                                dlBefore: before.dl,
+                                dlimit: before.dlimit,
+                                afterStatus: after.status,
+                                framedDocument,
+                            },
+                        });
+                        setIsKeyError(false);
+                        setError(
+                            'The download did not start. The file may have just reached its download limit, or the server rejected the request.',
+                        );
+                        setState('error');
+                        return;
+                    }
+
+                    // Only count a download that was not proven to have failed
+                    trackDownload({ fileId: id });
+                    // 'unknown' means the status check itself failed or the
+                    // file vanished mid-attempt: the frame never rendered an
+                    // error, so the navigation most likely became a download —
+                    // but say so honestly rather than asserting completion.
+                    setDeliveryConfirmed(outcome === 'delivered');
+                    setState('complete');
+                } finally {
+                    iframe.removeEventListener('load', onFrameLoad);
+                    releaseClickGuard();
+                }
             }, DIRECT_DOWNLOAD_SETTLE_MS);
             return;
         }
@@ -472,6 +585,8 @@ export function DownloadPage() {
             } else if (status.status === 'gone') {
                 setCanDownloadAgain(false);
             }
+            // This path read the bytes itself — delivery is not a guess
+            setDeliveryConfirmed(true);
             setState('complete');
         } catch (e: unknown) {
             const message = e instanceof Error ? e.message : String(e);
@@ -623,28 +738,46 @@ export function DownloadPage() {
                 <div className="max-w-main-card mx-auto">
                     <div className="card-glass p-card shadow-card">
                         <div className="relative z-10 flex flex-col items-center gap-5">
-                            {/* Icon */}
-                            <div className="flex h-[38px] w-[38px] items-center justify-center rounded-element bg-green-500/20">
-                                <CheckCircle2 className="h-5 w-5 text-green-400" />
+                            {/* Icon — a delivery we could not confirm must not
+                                wear the green tick */}
+                            <div
+                                className={`flex h-[38px] w-[38px] items-center justify-center rounded-element ${
+                                    deliveryConfirmed ? 'bg-green-500/20' : 'bg-amber-500/20'
+                                }`}
+                            >
+                                {deliveryConfirmed ? (
+                                    <CheckCircle2 className="h-5 w-5 text-green-400" />
+                                ) : (
+                                    <AlertCircle className="h-5 w-5 text-amber-400" />
+                                )}
                             </div>
 
                             {/* Title and Description */}
                             <div className="flex flex-col items-center gap-2 text-center">
                                 <h2 className="text-heading-xs text-content-primary">
-                                    Download complete!
+                                    {deliveryConfirmed ? 'Download complete!' : 'Download started'}
                                 </h2>
                                 <p className="text-paragraph-xs text-content-secondary">
-                                    {canDownloadAgain
-                                        ? 'Your file has been downloaded successfully.'
-                                        : 'Your file has been downloaded. Download limit reached.'}
+                                    {completionMessage(deliveryConfirmed, canDownloadAgain)}
                                 </p>
                             </div>
 
                             {/* Actions */}
                             <div className="w-full flex flex-col gap-3">
                                 {canDownloadAgain && (
-                                    <Button className="w-full" onClick={handleDownload}>
-                                        Download again
+                                    <Button
+                                        className="w-full"
+                                        onClick={handleDownload}
+                                        disabled={directChecking}
+                                    >
+                                        {directChecking ? (
+                                            <>
+                                                <Loader2 className="h-4 w-4 animate-spin" />
+                                                Starting download...
+                                            </>
+                                        ) : (
+                                            'Download again'
+                                        )}
                                     </Button>
                                 )}
                                 <Button
@@ -764,8 +897,22 @@ export function DownloadPage() {
                                 </p>
                             </div>
                         ) : (
-                            <Button className="w-full" onClick={handleDownload}>
-                                Download
+                            // While the direct-download verdict is still
+                            // pending the click is a no-op — say so, rather
+                            // than offering a button that does nothing
+                            <Button
+                                className="w-full"
+                                onClick={handleDownload}
+                                disabled={directChecking}
+                            >
+                                {directChecking ? (
+                                    <>
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                        Starting download...
+                                    </>
+                                ) : (
+                                    'Download'
+                                )}
                             </Button>
                         )}
 
