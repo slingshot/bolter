@@ -8,10 +8,11 @@
  * fails fast with a clear, non-retryable error instead of staging and
  * shipping >5 GiB only for the bucket to reject the PUT with EntityTooLarge.
  * A short source simply produces fewer contiguous parts
- * (shrink). After every committed stage the part record is persisted and
- * *then* the producer checkpoint — the checkpoint always describes the next
- * part to produce, so a crash between stages resumes from an exact boundary
- * [R4][R5]. When `windowSize` unreleased parts accumulate, staging pauses
+ * (shrink). After every committed stage the part record and the producer
+ * checkpoint are persisted in one transaction — the checkpoint always
+ * describes the next part to produce, so a crash between stages resumes from
+ * an exact boundary [R4][R5], and no crash can land the part record without
+ * it. When `windowSize` unreleased parts accumulate, staging pauses
  * until `partReleased()` reports a freed slot (backpressure). What frees a
  * slot is the consumer's business — the engine frees one when an uploader
  * picks a part up, so the window measures parts staged and *waiting*, not
@@ -200,14 +201,14 @@ export async function runStager(
                 }
             }
 
-            await opts.state.putPart({
-                fileId: opts.fileId,
-                partNumber,
-                size,
-                staged: true,
-                uploaded: false,
-            });
-            await opts.state.putCheckpoint(
+            await opts.state.putPartAndCheckpoint(
+                {
+                    fileId: opts.fileId,
+                    partNumber,
+                    size,
+                    staged: true,
+                    uploaded: false,
+                },
                 opts.checkpointOf(sourceOffsetAt(eof), partNumber + 1, eof),
             );
             partsProduced += 1;

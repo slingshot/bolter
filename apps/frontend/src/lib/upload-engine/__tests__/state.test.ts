@@ -142,6 +142,33 @@ describe('engine state store (bolter-upload-engine)', () => {
         expect(await state.getParts('file-a')).toEqual([uploaded]);
     });
 
+    it('putPartAndCheckpoint commits both records', async () => {
+        const state = await openEngineState();
+        const part = makePart({ partNumber: 2 });
+        const checkpoint = makeCheckpoint({ nextPartNumber: 3, sourceOffset: 10_485_760 });
+
+        await state.putPartAndCheckpoint(part, checkpoint);
+
+        expect(await state.getParts('file-a')).toEqual([part]);
+        expect(await state.getCheckpoint('file-a')).toEqual(checkpoint);
+    });
+
+    it('putPartAndCheckpoint rolls the part back if the checkpoint write fails', async () => {
+        const state = await openEngineState();
+        // A checkpoint with no value at its key path: `put` throws, taking the
+        // whole transaction down with it.
+        const unwritable = { ...makeCheckpoint(), fileId: undefined } as unknown;
+
+        await expect(
+            state.putPartAndCheckpoint(makePart(), unwritable as ProducerCheckpoint),
+        ).rejects.toThrow();
+
+        // Neither record landed. A staged part record is never durable without
+        // the checkpoint that says what comes after it.
+        expect(await state.getParts('file-a')).toEqual([]);
+        expect(await state.getCheckpoint('file-a')).toBeUndefined();
+    });
+
     it('lists all leases', async () => {
         const state = await openEngineState();
         const leaseA = makeLease({ fileId: 'file-a' });

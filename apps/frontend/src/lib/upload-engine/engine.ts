@@ -522,6 +522,8 @@ function offsetPartState(inner: EngineStateStore, base: number): EngineStateStor
         putCheckpoint: (c) => inner.putCheckpoint(c),
         getCheckpoint: (fileId) => inner.getCheckpoint(fileId),
         putPart: (p) => inner.putPart({ ...p, partNumber: base + p.partNumber }),
+        putPartAndCheckpoint: (p, c) =>
+            inner.putPartAndCheckpoint({ ...p, partNumber: base + p.partNumber }, c),
         getParts: (fileId) => inner.getParts(fileId),
         listLeases: () => inner.listLeases(),
         clearUpload: (fileId) => inner.clearUpload(fileId),

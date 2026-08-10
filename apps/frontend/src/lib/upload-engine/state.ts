@@ -84,6 +84,15 @@ export interface EngineStateStore {
     putCheckpoint(c: ProducerCheckpoint): Promise<void>;
     getCheckpoint(fileId: string): Promise<ProducerCheckpoint | undefined>;
     putPart(p: EnginePartRecord): Promise<void>;
+    /**
+     * Commit a staged part and the checkpoint that supersedes it in a single
+     * transaction. The stager used two sequential writes, whose crash window —
+     * part record durable, checkpoint still naming that part as next — the
+     * engine has to detect and step around on resume. One atomic write is
+     * strictly stronger than that ordering and costs the staging hot path one
+     * round trip instead of two.
+     */
+    putPartAndCheckpoint(p: EnginePartRecord, c: ProducerCheckpoint): Promise<void>;
     getParts(fileId: string): Promise<EnginePartRecord[]>; // sorted by partNumber
     listLeases(): Promise<EngineLease[]>;
     clearUpload(fileId: string): Promise<void>; // lease+envelope+checkpoint+parts
@@ -212,6 +221,13 @@ export function openEngineState(): Promise<EngineStateStore> {
             },
             putPart(p: EnginePartRecord): Promise<void> {
                 return putRecord(PARTS, p);
+            },
+            putPartAndCheckpoint(p: EnginePartRecord, c: ProducerCheckpoint): Promise<void> {
+                return run([PARTS, CHECKPOINTS], 'readwrite', (tx) => {
+                    tx.objectStore(PARTS).put(p);
+                    tx.objectStore(CHECKPOINTS).put(c);
+                    return () => undefined;
+                });
             },
             getParts(fileId: string): Promise<EnginePartRecord[]> {
                 return run(PARTS, 'readonly', (tx) => {

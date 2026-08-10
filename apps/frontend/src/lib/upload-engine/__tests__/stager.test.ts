@@ -120,6 +120,16 @@ function fakeState(log: string[] = []) {
             parts.set(`${p.fileId}:${p.partNumber}`, p);
             return Promise.resolve();
         },
+        putPartAndCheckpoint(p, c) {
+            // One log entry, because it is one transaction: the stager can no
+            // longer land a part record without the checkpoint that follows it.
+            log.push(`commit:${p.partNumber}:${c.nextPartNumber}`);
+            partPuts.push({ ...p });
+            parts.set(`${p.fileId}:${p.partNumber}`, p);
+            checkpointPuts.push({ ...c });
+            checkpoints.set(c.fileId, c);
+            return Promise.resolve();
+        },
         getParts(fileId) {
             return Promise.resolve(
                 [...parts.values()]
@@ -225,19 +235,17 @@ describe('runStager', () => {
         expect(checkpointPuts.map((c) => c.nextPartNumber)).toEqual([2, 3, 4]);
         expect(checkpointPuts.map((c) => c.sourceOffset)).toEqual([4, 8, 10]);
         expect(checkpointPuts.map((c) => c.eofReached)).toEqual([false, false, true]);
-        // putPart precedes putCheckpoint for every part; staging notifications follow both.
+        // The part record and its successor checkpoint commit together, after
+        // the bytes are committed and before the uploaders are told about them.
         expect(log).toEqual([
             'stagePart:1',
-            'putPart:1',
-            'putCheckpoint:2',
+            'commit:1:2',
             'staged:1',
             'stagePart:2',
-            'putPart:2',
-            'putCheckpoint:3',
+            'commit:2:3',
             'staged:2',
             'stagePart:3',
-            'putPart:3',
-            'putCheckpoint:4',
+            'commit:3:4',
             'staged:3',
         ]);
     });

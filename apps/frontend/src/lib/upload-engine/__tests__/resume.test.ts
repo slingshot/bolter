@@ -246,6 +246,11 @@ function fakeState(log: string[]) {
             parts.set(`${p.fileId}:${p.partNumber}`, p);
             return Promise.resolve();
         },
+        putPartAndCheckpoint(p, c) {
+            parts.set(`${p.fileId}:${p.partNumber}`, p);
+            checkpoints.set(c.fileId, c);
+            return Promise.resolve();
+        },
         getParts(fileId) {
             return Promise.resolve(
                 [...parts.values()]

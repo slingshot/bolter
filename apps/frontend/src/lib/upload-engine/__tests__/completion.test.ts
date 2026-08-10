@@ -39,6 +39,7 @@ function fakeState(log: string[]): EngineStateStore {
         putCheckpoint: () => Promise.resolve(),
         getCheckpoint: () => Promise.resolve(undefined),
         putPart: () => Promise.resolve(),
+        putPartAndCheckpoint: () => Promise.resolve(),
         getParts: () => Promise.resolve([]),
         listLeases: () => Promise.resolve([]),
         clearUpload: (fileId) => {
