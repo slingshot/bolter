@@ -172,6 +172,14 @@ async function getOpfsRoot(): Promise<OpfsDirectoryHandle> {
  * read with `getFile()` only.
  */
 export class OpfsPartStore implements PartStore {
+    /**
+     * The upload's staging directory, resolved once and reused for the store's
+     * lifetime. Re-walking `getDirectory()` → `uploads/` → `<fileId>/` per
+     * call added three awaited directory resolutions to every stage, read and
+     * delete — on the hot path of every part.
+     */
+    private dir: OpfsDirectoryHandle | undefined;
+
     constructor(private readonly fileId: string) {}
 
     /**
@@ -208,11 +216,20 @@ export class OpfsPartStore implements PartStore {
         }
     }
 
+    /**
+     * The staging directory handle, memoized once resolved. Only a fulfilled
+     * handle is cached, so a failed resolution never poisons a later call and
+     * a `create: false` miss never blocks a later `create: true`.
+     */
     private async getDir(create: boolean): Promise<OpfsDirectoryHandle | undefined> {
+        if (this.dir) {
+            return this.dir;
+        }
         const root = await getOpfsRoot();
         try {
             const uploads = await root.getDirectoryHandle(UPLOADS_DIR, { create });
-            return await uploads.getDirectoryHandle(this.fileId, { create });
+            this.dir = await uploads.getDirectoryHandle(this.fileId, { create });
+            return this.dir;
         } catch (err) {
             if (!create && isNotFoundError(err)) {
                 return undefined;
@@ -221,18 +238,45 @@ export class OpfsPartStore implements PartStore {
         }
     }
 
+    /**
+     * Run `fn` against the staging directory. A memoized handle can go stale —
+     * the directory is removed underneath it by teardown, GC, or storage
+     * eviction — and every operation on it then throws `NotFoundError`. One
+     * invalidate-and-retry separates that from the genuine "this entry does
+     * not exist" answer, which simply repeats. `fn` must be safe to run twice.
+     */
+    private async withDir<T>(
+        create: boolean,
+        fn: (dir: OpfsDirectoryHandle | undefined) => Promise<T>,
+    ): Promise<T> {
+        const memoized = this.dir !== undefined;
+        try {
+            return await fn(await this.getDir(create));
+        } catch (err) {
+            if (!memoized || !isNotFoundError(err)) {
+                throw err;
+            }
+            this.dir = undefined;
+            return await fn(await this.getDir(create));
+        }
+    }
+
     async stagePart(
         partNumber: number,
         chunks: AsyncIterable<Uint8Array>,
     ): Promise<{ size: number }> {
-        const dir = await this.getDir(true);
-        if (!dir) {
-            throw new Error('failed to open OPFS staging directory');
-        }
         const tmp = tmpName(partNumber);
-        // Drop any temp left over from a previous failed stage of this part.
-        await removeIfExists(dir, tmp);
-        const tmpHandle = await dir.getFileHandle(tmp, { create: true });
+        // Only the temp entry's creation may hit a stale memoized directory,
+        // and it happens before a single chunk is pulled — `chunks` is
+        // one-shot, so nothing past this point may be retried.
+        const { dir, tmpHandle } = await this.withDir(true, async (dir) => {
+            if (!dir) {
+                throw new Error('failed to open OPFS staging directory');
+            }
+            // Drop any temp left over from a previous failed stage of this part.
+            await removeIfExists(dir, tmp);
+            return { dir, tmpHandle: await dir.getFileHandle(tmp, { create: true }) };
+        });
         let handle: SyncAccessHandle | undefined;
         let size = 0;
         try {
@@ -268,13 +312,14 @@ export class OpfsPartStore implements PartStore {
     }
 
     async readPart(partNumber: number): Promise<Blob> {
-        const dir = await this.getDir(false);
-        if (!dir) {
-            throw new Error(`part ${partNumber} is not committed`);
-        }
         try {
-            const fileHandle = await dir.getFileHandle(binName(partNumber));
-            return await fileHandle.getFile();
+            return await this.withDir(false, async (dir) => {
+                if (!dir) {
+                    throw new Error(`part ${partNumber} is not committed`);
+                }
+                const fileHandle = await dir.getFileHandle(binName(partNumber));
+                return await fileHandle.getFile();
+            });
         } catch (err) {
             if (isNotFoundError(err)) {
                 throw new Error(`part ${partNumber} is not committed`);
@@ -284,43 +329,48 @@ export class OpfsPartStore implements PartStore {
     }
 
     async deletePart(partNumber: number): Promise<void> {
-        const dir = await this.getDir(false);
-        if (!dir) {
-            return;
-        }
-        await removeIfExists(dir, binName(partNumber));
+        await this.withDir(false, async (dir) => {
+            if (dir) {
+                await removeIfExists(dir, binName(partNumber));
+            }
+        });
     }
 
-    async listParts(): Promise<{ partNumber: number; size: number }[]> {
-        const dir = await this.getDir(false);
-        if (!dir) {
-            return [];
-        }
-        const names: string[] = [];
-        for await (const name of dir.keys()) {
-            names.push(name);
-        }
-        const parts: { partNumber: number; size: number }[] = [];
-        for (const name of names) {
-            const match = COMMITTED_PART_RE.exec(name);
-            if (!match) {
-                continue;
+    listParts(): Promise<{ partNumber: number; size: number }[]> {
+        return this.withDir(false, async (dir) => {
+            if (!dir) {
+                return [];
             }
-            try {
-                const fileHandle = await dir.getFileHandle(name);
-                const file = await fileHandle.getFile();
-                parts.push({ partNumber: Number(match[1]), size: file.size });
-            } catch (err) {
-                // Deleted between listing and stat — skip it.
-                if (!isNotFoundError(err)) {
-                    throw err;
+            const names: string[] = [];
+            for await (const name of dir.keys()) {
+                names.push(name);
+            }
+            const parts: { partNumber: number; size: number }[] = [];
+            for (const name of names) {
+                const match = COMMITTED_PART_RE.exec(name);
+                if (!match) {
+                    continue;
+                }
+                try {
+                    const fileHandle = await dir.getFileHandle(name);
+                    const file = await fileHandle.getFile();
+                    parts.push({ partNumber: Number(match[1]), size: file.size });
+                } catch (err) {
+                    // Deleted between listing and stat — skip it.
+                    if (!isNotFoundError(err)) {
+                        throw err;
+                    }
                 }
             }
-        }
-        return parts.sort((a, b) => a.partNumber - b.partNumber);
+            return parts.sort((a, b) => a.partNumber - b.partNumber);
+        });
     }
 
     async destroy(): Promise<void> {
+        // Drop the memoized handle first: anything still in flight (a detached
+        // part deletion) must re-resolve rather than write through a handle
+        // whose directory is about to disappear.
+        this.dir = undefined;
         const root = await getOpfsRoot();
         let uploads: OpfsDirectoryHandle;
         try {
