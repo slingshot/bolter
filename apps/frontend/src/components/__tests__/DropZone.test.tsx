@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,7 +12,88 @@ vi.mock('@/lib/sentry', () => ({
 }));
 
 import { useAppStore } from '@/stores/app';
-import { DropZone } from '../DropZone';
+import { DropZone, processDataTransferItems } from '../DropZone';
+
+// --- Minimal FileSystemEntry doubles for drop-traversal tests -----------------
+
+function fileEntry(name: string, content = 'x'): FileSystemEntry {
+    return {
+        isFile: true,
+        isDirectory: false,
+        name,
+        fullPath: `/${name}`,
+        file: (onSuccess: (f: File) => void) =>
+            onSuccess(new File([content], name, { type: 'text/plain' })),
+    } as unknown as FileSystemEntry;
+}
+
+/** A file entry whose `file()` invokes the error callback (permission error). */
+function unreadableFileEntry(name: string): FileSystemEntry {
+    return {
+        isFile: true,
+        isDirectory: false,
+        name,
+        fullPath: `/${name}`,
+        file: (_onSuccess: (f: File) => void, onError: (e: Error) => void) =>
+            onError(new Error('NotReadableError')),
+    } as unknown as FileSystemEntry;
+}
+
+function dirEntry(name: string, children: FileSystemEntry[]): FileSystemEntry {
+    return {
+        isFile: false,
+        isDirectory: true,
+        name,
+        fullPath: `/${name}`,
+        createReader: () => {
+            let done = false;
+            return {
+                readEntries: (onSuccess: (entries: FileSystemEntry[]) => void) => {
+                    if (done) {
+                        onSuccess([]);
+                        return;
+                    }
+                    done = true;
+                    onSuccess(children);
+                },
+            };
+        },
+    } as unknown as FileSystemEntry;
+}
+
+/** A directory whose enumeration fails partway (e.g. deleted mid-read). */
+function partiallyUnreadableDirEntry(name: string, readable: FileSystemEntry[]): FileSystemEntry {
+    return {
+        isFile: false,
+        isDirectory: true,
+        name,
+        fullPath: `/${name}`,
+        createReader: () => {
+            let batch = 0;
+            return {
+                readEntries: (
+                    onSuccess: (entries: FileSystemEntry[]) => void,
+                    onError: (e: Error) => void,
+                ) => {
+                    if (batch === 0 && readable.length > 0) {
+                        batch++;
+                        onSuccess(readable);
+                        return;
+                    }
+                    onError(new Error('NotFoundError'));
+                },
+            };
+        },
+    } as unknown as FileSystemEntry;
+}
+
+function makeItems(entries: Array<FileSystemEntry | null>): DataTransferItemList {
+    const items = entries.map((entry) => ({
+        kind: 'file' as const,
+        webkitGetAsEntry: () => entry,
+    }));
+    return Object.assign(items, { length: items.length }) as unknown as DataTransferItemList;
+}
 
 describe('DropZone', () => {
     afterEach(() => {
@@ -22,6 +103,7 @@ describe('DropZone', () => {
     beforeEach(() => {
         useAppStore.setState({
             files: [],
+            toasts: [],
             config: {
                 maxFileSize: 1_000_000_000_000, // 1TB
                 maxFilesPerArchive: 64,
@@ -202,5 +284,139 @@ describe('DropZone', () => {
         render(<DropZone />);
         // Default UPLOAD_LIMITS.MAX_FILE_SIZE is 1TB
         expect(screen.getByText(/Send up to 1TB/)).toBeInTheDocument();
+    });
+
+    // Regression: finding #17 — folder drop used to be all-or-nothing. One
+    // un-enumerable subdirectory rejected the whole traversal, every
+    // successfully-read file was discarded, and the user saw no feedback.
+    describe('fault-tolerant drop traversal', () => {
+        it('keeps the files it could read when a subdirectory fails mid-enumeration', async () => {
+            const items = makeItems([
+                dirEntry('project', [
+                    fileEntry('a.txt'),
+                    partiallyUnreadableDirEntry('locked', [fileEntry('b.txt')]),
+                    fileEntry('c.txt'),
+                ]),
+            ]);
+
+            const result = await processDataTransferItems(items);
+
+            expect(result.files.map((f) => f.name).sort()).toEqual(['a.txt', 'b.txt', 'c.txt']);
+            expect(result.skipped).toBe(1);
+        });
+
+        it('counts an unreadable file as skipped without losing its siblings', async () => {
+            const items = makeItems([
+                dirEntry('mixed', [fileEntry('good.txt'), unreadableFileEntry('bad.txt')]),
+            ]);
+
+            const result = await processDataTransferItems(items);
+
+            expect(result.files.map((f) => f.name)).toEqual(['good.txt']);
+            expect(result.skipped).toBe(1);
+        });
+
+        it('reports zero files and a skip when the top-level directory is unreadable', async () => {
+            const items = makeItems([partiallyUnreadableDirEntry('doomed', [])]);
+
+            const result = await processDataTransferItems(items);
+
+            expect(result.files).toHaveLength(0);
+            expect(result.skipped).toBe(1);
+        });
+
+        it('reports no skips for a clean traversal', async () => {
+            const items = makeItems([dirEntry('clean', [fileEntry('one.txt')])]);
+
+            const result = await processDataTransferItems(items);
+
+            expect(result.files).toHaveLength(1);
+            expect(result.skipped).toBe(0);
+        });
+    });
+
+    describe('drop feedback', () => {
+        it('adds the readable files and toasts about the skipped ones', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            fireEvent.drop(dropArea, {
+                dataTransfer: {
+                    items: makeItems([
+                        dirEntry('project', [
+                            fileEntry('kept.txt'),
+                            partiallyUnreadableDirEntry('locked', []),
+                        ]),
+                    ]),
+                    files: [],
+                },
+            });
+
+            await waitFor(() => {
+                expect(useAppStore.getState().files).toHaveLength(1);
+            });
+            expect(useAppStore.getState().files[0].file.name).toBe('kept.txt');
+
+            const { toasts } = useAppStore.getState();
+            expect(toasts).toHaveLength(1);
+            expect(toasts[0].title).toBe('1 item skipped');
+            expect(toasts[0].variant).toBe('destructive');
+        });
+
+        it('toasts instead of failing silently when the drop yields no files', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            fireEvent.drop(dropArea, {
+                dataTransfer: {
+                    items: makeItems([partiallyUnreadableDirEntry('doomed', [])]),
+                    files: [],
+                },
+            });
+
+            await waitFor(() => {
+                expect(useAppStore.getState().toasts).toHaveLength(1);
+            });
+            expect(useAppStore.getState().files).toHaveLength(0);
+            expect(useAppStore.getState().toasts[0].title).toBe('Nothing was added');
+        });
+
+        it('falls back to the synchronously snapshotted file list', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            const plain = new File(['hello'], 'plain.txt', { type: 'text/plain' });
+            // webkitGetAsEntry returns null (protected DataTransfer): the entry
+            // traversal yields nothing, so the snapshot must save the drop.
+            fireEvent.drop(dropArea, {
+                dataTransfer: {
+                    items: makeItems([null]),
+                    files: [plain],
+                },
+            });
+
+            await waitFor(() => {
+                expect(useAppStore.getState().files).toHaveLength(1);
+            });
+            expect(useAppStore.getState().files[0].file.name).toBe('plain.txt');
+            expect(useAppStore.getState().toasts).toHaveLength(0);
+        });
+
+        it('does not toast on a clean folder drop', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            fireEvent.drop(dropArea, {
+                dataTransfer: {
+                    items: makeItems([dirEntry('clean', [fileEntry('one.txt')])]),
+                    files: [],
+                },
+            });
+
+            await waitFor(() => {
+                expect(useAppStore.getState().files).toHaveLength(1);
+            });
+            expect(useAppStore.getState().toasts).toHaveLength(0);
+        });
     });
 });
