@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { Elysia, t } from 'elysia';
 import { config, deriveBaseUrl } from '../config';
 import { captureError } from '../lib/sentry';
 import { uploadLogger as logger } from '../logger';
+import { getReapRecord, scheduleObjectReap, unscheduleObjectReap } from '../reaper';
 import { type CompletedPart, storage } from '../storage';
 import { providerRegistry } from '../storage/provider-registry';
 
@@ -66,11 +67,165 @@ export function calculateOptimalPartSize(
 // Pre-signed URL expiration: 7 days (max allowed by S3/R2)
 const URL_EXPIRATION_SECONDS = 7 * 24 * 60 * 60; // 604800
 
+/**
+ * Clamp the client-declared download limit into a stored, enforceable integer.
+ *
+ * `config.maxDownloads` was advertised via `GET /config` but never enforced, so a
+ * modified client could store `dlimit: 1e9` (making the `dl >= dlimit` gate
+ * unreachable — unlimited egress) or a float like `1e21`, which round-trips
+ * through Redis as `'1e+21'` and reads back via `parseInt` as `1`, turning the
+ * file into an accidental single-use self-destruct.
+ */
+export function clampDownloadLimit(requested?: number): number {
+    const max = Math.max(Math.trunc(config.maxDownloads) || 1, 1);
+    const fallback = Math.min(Math.max(Math.trunc(config.defaultDownloads) || 1, 1), max);
+
+    if (requested === undefined || requested === null || !Number.isFinite(requested)) {
+        return fallback;
+    }
+    return Math.min(Math.max(Math.trunc(requested), 1), max);
+}
+
+/**
+ * Clamp the client-declared expiry into a value that is safe to hand to
+ * `EXPIRE`. A negative `timeLimit` reached `redis.expire(id, -1)`, which DELETES
+ * the key — after which the finalization writes resurrected a TTL-less,
+ * ownerless hash plus an object that never time-expires.
+ */
+export function clampExpireSeconds(requested?: number): number {
+    const max = Math.max(Math.trunc(config.maxExpireSeconds) || 1, 1);
+    const fallback = Math.min(Math.max(Math.trunc(config.defaultExpireSeconds) || 1, 1), max);
+
+    if (requested === undefined || requested === null || !Number.isFinite(requested)) {
+        return fallback;
+    }
+    const truncated = Math.trunc(requested);
+    if (truncated < 1) {
+        return fallback;
+    }
+    return Math.min(truncated, max);
+}
+
+// --- Upload-owner token (#52) ---------------------------------------------
+// `/upload/abort` and `/upload/multipart/:id/resume` were gated only by the S3
+// uploadId. If that opaque value leaks (logs, MITM), a third party could abort a
+// victim's in-flight upload or mint fresh pre-signed PUT URLs for its unfinished
+// parts and inject bytes before completion. Bind both routes to a secret handed
+// only to the uploader, stored as a hash (mirroring the `auth` field guard).
+
+function hashUploadToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+}
+
+export function verifyUploadToken(provided: unknown, storedHash: string): boolean {
+    if (typeof provided !== 'string' || provided.length === 0) {
+        return false;
+    }
+    const providedDigest = Buffer.from(hashUploadToken(provided), 'hex');
+    const storedDigest = Buffer.from(storedHash, 'hex');
+    if (providedDigest.length !== storedDigest.length) {
+        return false;
+    }
+    return timingSafeEqual(providedDigest, storedDigest);
+}
+
+// --- Speed-test rate limiting (#11) ---------------------------------------
+// `POST /upload/speedtest` is unauthenticated and each call mints 5 pre-signed
+// UploadPart URLs with no size constraint — an unbounded, repeatable write
+// amplification into billable incomplete-multipart storage.
+
+const SPEEDTEST_PREFIX = '__speedtest__';
+const SPEEDTEST_RATE_LIMIT = 5;
+const SPEEDTEST_RATE_WINDOW_MS = 5 * 60 * 1000;
+// A speed test that is never cleaned up by the client is swept by the reaper
+const SPEEDTEST_REAP_AFTER_MS = 15 * 60 * 1000;
+
+export class FixedWindowRateLimiter {
+    private readonly hits = new Map<string, number[]>();
+
+    constructor(
+        private readonly limit: number,
+        private readonly windowMs: number,
+    ) {}
+
+    take(key: string, now: number = Date.now()): boolean {
+        const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
+        if (recent.length >= this.limit) {
+            this.hits.set(key, recent);
+            return false;
+        }
+        recent.push(now);
+        this.hits.set(key, recent);
+
+        // Bound memory — drop buckets whose entries have all aged out
+        if (this.hits.size > 1000) {
+            for (const [k, times] of this.hits) {
+                if (times.every((t) => now - t >= this.windowMs)) {
+                    this.hits.delete(k);
+                }
+            }
+        }
+        return true;
+    }
+
+    reset(): void {
+        this.hits.clear();
+    }
+}
+
+export const speedTestRateLimiter = new FixedWindowRateLimiter(
+    SPEEDTEST_RATE_LIMIT,
+    SPEEDTEST_RATE_WINDOW_MS,
+);
+
+/**
+ * Authoritative remaining lifetime of a file, read from the Redis TTL.
+ *
+ * The metadata TTL starts at `/upload/url` and is never refreshed, so only the
+ * server knows how much of it a (possibly multi-day, possibly resumed) upload
+ * has already consumed. Returned by `/upload/complete` so the client never
+ * displays or persists an expiry the server will not honor.
+ *
+ * A missing/absent TTL is reported as 0 rather than "forever": understating the
+ * lifetime is the safe direction — it can only make a client refresh early.
+ */
+async function readRemainingLifetime(id: string): Promise<{ expiresAt: number; ttl: number }> {
+    let ttlSeconds = 0;
+    try {
+        const raw = await storage.getTTL(id);
+        if (Number.isFinite(raw) && raw > 0) {
+            ttlSeconds = Math.trunc(raw);
+        }
+    } catch (e) {
+        logger.warn({ id, error: e }, 'Failed to read remaining TTL');
+    }
+    return { expiresAt: Date.now() + ttlSeconds * 1000, ttl: ttlSeconds };
+}
+
+/**
+ * Visitor IP for rate limiting. `cf-connecting-ip` first — Cloudflare sets it to
+ * the real visitor and it survives edge rewrites of `x-forwarded-for`.
+ */
+export function clientIp(request: Request): string {
+    const cf = request.headers.get('cf-connecting-ip');
+    if (cf) {
+        return cf.trim();
+    }
+    const forwarded = request.headers.get('x-forwarded-for');
+    if (forwarded) {
+        const first = forwarded.split(',')[0]?.trim();
+        if (first) {
+            return first;
+        }
+    }
+    return 'unknown';
+}
+
 export const uploadRoutes = new Elysia()
     // Get upload URL(s)
     .post(
         '/upload/url',
-        async ({ body, request }) => {
+        async ({ body, request, set }) => {
             const { fileSize, encrypted, timeLimit, dlimit, preferredPartSize } = body;
             const requestId = randomBytes(4).toString('hex');
 
@@ -86,8 +241,12 @@ export const uploadRoutes = new Elysia()
                 'Upload URL request received',
             );
 
+            // Rejections must carry a 4xx status — returned as HTTP 200 the
+            // client's `response.ok` guard passes and the real reason is
+            // replaced by an unrelated "Pre-signed URLs not available"
             if (!fileSize || fileSize < 0) {
                 logger.warn({ requestId, fileSize }, 'Invalid file size');
+                set.status = 400;
                 return { error: 'Invalid file size' };
             }
 
@@ -96,6 +255,7 @@ export const uploadRoutes = new Elysia()
                     { requestId, fileSize, maxFileSize: config.maxFileSize },
                     'File size exceeds maximum',
                 );
+                set.status = 400;
                 return { error: `File size exceeds maximum of ${config.maxFileSize} bytes` };
             }
 
@@ -110,7 +270,6 @@ export const uploadRoutes = new Elysia()
                     requestId,
                     testDuration,
                     testSuccess: !!testUploadUrl,
-                    testUrlPreview: testUploadUrl ? `${testUploadUrl.substring(0, 100)}...` : null,
                 },
                 'Pre-signed URL test completed',
             );
@@ -131,17 +290,20 @@ export const uploadRoutes = new Elysia()
                 return { useSignedUrl: false };
             }
 
-            // Generate file ID and owner token
+            // Generate file ID, owner token, and the upload-owner token that
+            // gates abort/resume for this in-flight upload
             const id = randomBytes(8).toString('hex');
             const owner = randomBytes(10).toString('hex');
+            const uploadToken = randomBytes(16).toString('hex');
 
-            logger.info({ requestId, id, owner }, 'Generated file ID and owner token');
+            // Never log `owner`/`uploadToken` — they are bearer credentials for
+            // /delete, /params, /password and abort/resume respectively
+            logger.info({ requestId, id }, 'Generated file ID and owner token');
 
-            // Calculate expiration
-            const expireSeconds = Math.min(
-                timeLimit || config.defaultExpireSeconds,
-                config.maxExpireSeconds,
-            );
+            // Calculate expiration. A non-positive or non-integer timeLimit must
+            // never reach EXPIRE — EXPIRE(id, -1) deletes the key outright.
+            const expireSeconds = clampExpireSeconds(timeLimit);
+            const downloadLimit = clampDownloadLimit(dlimit);
             const prefix = Math.max(Math.floor(expireSeconds / 86400), 1);
             // Calculate object expiration date for S3 lifecycle
             const objectExpires = new Date(Date.now() + expireSeconds * 1000);
@@ -160,9 +322,10 @@ export const uploadRoutes = new Elysia()
             await storage.setField(id, 'owner', owner);
             await storage.setField(id, 'encrypted', encrypted ? 'true' : 'false');
             await storage.setField(id, 'dl', '0');
-            await storage.setField(id, 'dlimit', (dlimit || config.defaultDownloads).toString());
+            await storage.setField(id, 'dlimit', downloadLimit.toString());
             await storage.setField(id, 'fileSize', fileSize.toString());
             await storage.setField(id, 'providerId', activeProviderId);
+            await storage.setField(id, 'uploadAuth', hashUploadToken(uploadToken));
             await storage.redis.expire(id, expireSeconds);
             await providerRegistry.incrementFileCount(activeProviderId);
 
@@ -285,6 +448,26 @@ export const uploadRoutes = new Elysia()
                             );
                         }
                     }
+
+                    // Store multipart upload info. These writes live INSIDE the
+                    // rollback try: a transient Redis failure here used to 500
+                    // without aborting the S3 multipart or rolling back the
+                    // provider counter, and the client never learned the
+                    // id/uploadId it would need to clean up itself.
+                    await storage.setField(id, 'uploadId', uploadId);
+                    await storage.setField(id, 'multipart', 'true');
+                    await storage.setField(id, 'numParts', numParts.toString());
+                    await storage.setField(id, 'partSize', partSize.toString());
+
+                    // Register the object so the reaper can delete it (and abort
+                    // an abandoned multipart) once the metadata TTL has passed
+                    await scheduleObjectReap({
+                        kind: 'file',
+                        id,
+                        providerId: activeProviderId,
+                        uploadId,
+                        expiresAt: objectExpires.getTime(),
+                    });
                 } catch (e) {
                     captureError(e, {
                         operation: 'upload.multipart-sign',
@@ -300,6 +483,7 @@ export const uploadRoutes = new Elysia()
                         // Best-effort — the upload may already be gone
                     });
                     await storage.del(id);
+                    await unscheduleObjectReap(id);
                     return { useSignedUrl: false };
                 }
 
@@ -315,17 +499,12 @@ export const uploadRoutes = new Elysia()
                     'All upload URLs generated',
                 );
 
-                // Store multipart upload info
-                await storage.setField(id, 'uploadId', uploadId);
-                await storage.setField(id, 'multipart', 'true');
-                await storage.setField(id, 'numParts', numParts.toString());
-                await storage.setField(id, 'partSize', partSize.toString());
-
                 const response = {
                     useSignedUrl: true,
                     multipart: true,
                     id,
                     owner,
+                    uploadToken,
                     uploadId,
                     parts,
                     partSize,
@@ -340,7 +519,6 @@ export const uploadRoutes = new Elysia()
                         numParts,
                         partSize,
                         totalTime: Date.now() - testStartTime,
-                        firstPartUrl: `${parts[0]?.url.substring(0, 100)}...`,
                     },
                     'Multipart upload response ready',
                 );
@@ -359,12 +537,12 @@ export const uploadRoutes = new Elysia()
                 );
                 const singleUrlDuration = Date.now() - singleUrlStartTime;
 
+                // The signed URL is a PUT credential — log its length only
                 logger.info(
                     {
                         requestId,
                         id,
                         singleUrlDuration,
-                        uploadUrl: uploadUrl,
                         urlLength: uploadUrl?.length,
                     },
                     'Single upload URL generated',
@@ -378,11 +556,19 @@ export const uploadRoutes = new Elysia()
                     return { useSignedUrl: false };
                 }
 
+                await scheduleObjectReap({
+                    kind: 'file',
+                    id,
+                    providerId: activeProviderId,
+                    expiresAt: objectExpires.getTime(),
+                });
+
                 const response = {
                     useSignedUrl: true,
                     multipart: false,
                     id,
                     owner,
+                    uploadToken,
                     url: uploadUrl,
                     completeUrl: `${deriveBaseUrl(request)}/download/${id}#${owner}`,
                 };
@@ -404,13 +590,16 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Request upload URL(s)',
                 description:
-                    'Generates pre-signed S3 upload URLs. Returns a single URL for small files or multipart upload URLs for files exceeding the multipart threshold.',
+                    'Generates pre-signed S3 upload URLs. Returns a single URL for small files or multipart upload URLs for files exceeding the multipart threshold. The returned `uploadToken` authorizes aborting or resuming this upload and must be kept secret by the uploader.',
             },
             body: t.Object({
                 fileSize: t.Number(),
                 encrypted: t.Optional(t.Boolean()),
-                timeLimit: t.Optional(t.Number()),
-                dlimit: t.Optional(t.Number()),
+                // Positive integers only — a negative timeLimit reaches EXPIRE
+                // as a delete, and a non-integer dlimit corrupts the stored
+                // value on the parseInt round-trip
+                timeLimit: t.Optional(t.Integer({ minimum: 1 })),
+                dlimit: t.Optional(t.Integer({ minimum: 1 })),
                 preferredPartSize: t.Optional(t.Number()),
             }),
             response: {
@@ -419,6 +608,7 @@ export const uploadRoutes = new Elysia()
                     multipart: t.Optional(t.Boolean()),
                     id: t.Optional(t.String()),
                     owner: t.Optional(t.String()),
+                    uploadToken: t.Optional(t.String()),
                     url: t.Optional(t.Union([t.String(), t.Null()])),
                     uploadId: t.Optional(t.String()),
                     parts: t.Optional(
@@ -434,6 +624,9 @@ export const uploadRoutes = new Elysia()
                     partSize: t.Optional(t.Number()),
                     completeUrl: t.Optional(t.String()),
                     error: t.Optional(t.String()),
+                }),
+                400: t.Object({
+                    error: t.String(),
                 }),
             },
         },
@@ -496,10 +689,12 @@ export const uploadRoutes = new Elysia()
                     }
                 }
                 logger.info({ requestId, id }, 'Upload already completed — idempotent retry');
+                const retryLifetime = await readRemainingLifetime(id);
                 return {
                     success: true,
                     id,
                     url: `${deriveBaseUrl(request)}/download/${id}`,
+                    ...retryLifetime,
                 };
             }
 
@@ -686,16 +881,62 @@ export const uploadRoutes = new Elysia()
                 logger.debug({ requestId, id }, 'Cleaned up multipart metadata');
             }
 
-            // Store final metadata
-            if (metadata && typeof metadata === 'string') {
-                await storage.setField(id, 'metadata', metadata);
-                logger.debug(
-                    { requestId, id, metadataLength: metadata.length },
-                    'Stored file metadata',
+            // Bind the recorded size to the bytes S3 actually holds. Both the
+            // declared `fileSize` and the reported `actualSize` are client
+            // controlled: nothing in the pre-signed PUT/UploadPart constrains
+            // how much a modified client uploads, so the only trustworthy
+            // number is the object's own Content-Length.
+            let storedSize: number | null = null;
+            try {
+                const headSize = await storage.length(id);
+                if (Number.isFinite(headSize) && headSize > 0) {
+                    storedSize = headSize;
+                }
+            } catch (e) {
+                // A HEAD blip must not fail an otherwise-good upload; fall back
+                // to the client-reported size (still bounded at /upload/url)
+                logger.warn(
+                    { requestId, id, error: e },
+                    'Could not HEAD completed object — falling back to reported size',
                 );
             }
 
-            // Set auth based on encryption
+            if (storedSize !== null && storedSize > config.maxFileSize) {
+                captureError(new Error('Stored object exceeds maximum file size'), {
+                    operation: 'upload.size-limit',
+                    extra: { requestId, id, storedSize, maxFileSize: config.maxFileSize },
+                    level: 'warning',
+                });
+                logger.warn(
+                    { requestId, id, storedSize, maxFileSize: config.maxFileSize },
+                    'Stored object exceeds maximum file size — deleting',
+                );
+                // Delete the object AND the metadata: leaving either behind
+                // would keep the over-size bytes billable and downloadable
+                await storage.del(id).catch((delErr) => {
+                    logger.error(
+                        { requestId, id, error: delErr },
+                        'Failed to delete over-size object',
+                    );
+                });
+                await unscheduleObjectReap(id);
+                set.status = 413;
+                return {
+                    error: `Stored file exceeds maximum of ${config.maxFileSize} bytes`,
+                    status: 413,
+                };
+            }
+
+            // Collect every finalization write and apply them under a single
+            // EXISTS guard. A plain HSET on a key that TTL-expired during the
+            // (potentially very long) CompleteMultipartUpload would resurrect it
+            // as an immortal hash with no owner and no providerId.
+            const finalFields: Record<string, string> = {};
+
+            if (metadata && typeof metadata === 'string') {
+                finalFields.metadata = metadata;
+            }
+
             if (fileInfo.encrypted) {
                 // Safety net — already validated before the S3 completion above
                 if (!authKey || typeof authKey !== 'string') {
@@ -706,20 +947,26 @@ export const uploadRoutes = new Elysia()
                     set.status = 400;
                     return { error: 'Missing or invalid auth key for encrypted file' };
                 }
-                await storage.setField(id, 'auth', authKey);
-                const nonce = randomBytes(16).toString('base64');
-                await storage.setField(id, 'nonce', nonce);
-                logger.debug({ requestId, id }, 'Stored auth key and nonce for encrypted file');
+                finalFields.auth = authKey;
+                finalFields.nonce = randomBytes(16).toString('base64');
             } else {
-                await storage.setField(id, 'auth', 'unencrypted');
-                await storage.setField(id, 'nonce', '');
-                logger.debug({ requestId, id }, 'Set unencrypted auth');
+                finalFields.auth = 'unencrypted';
+                finalFields.nonce = '';
             }
 
-            // Update file size if provided
-            if (actualSize) {
-                await storage.setField(id, 'fileSize', actualSize.toString());
-                logger.debug({ requestId, id, actualSize }, 'Updated actual file size');
+            const resolvedSize = storedSize ?? (actualSize ? Math.trunc(actualSize) : null);
+            if (resolvedSize !== null && resolvedSize >= 0) {
+                finalFields.fileSize = resolvedSize.toString();
+            }
+
+            const written = await storage.redis.hSetIfExists(id, finalFields);
+            if (!written) {
+                logger.warn(
+                    { requestId, id },
+                    'File metadata expired during completion — refusing to resurrect it',
+                );
+                set.status = 404;
+                return { error: 'File not found', status: 404 };
             }
 
             logger.info(
@@ -728,9 +975,16 @@ export const uploadRoutes = new Elysia()
                     id,
                     multipart: isMultipart,
                     encrypted: fileInfo.encrypted,
+                    storedSize,
                 },
                 'Upload completed successfully',
             );
+
+            // Report the AUTHORITATIVE remaining lifetime. The TTL starts at
+            // /upload/url, not here — a long or resumed upload can burn days of
+            // it — so a client computing `now + timeLimit` would show (and
+            // persist) an expiry the server will not honor.
+            const lifetime = await readRemainingLifetime(id);
 
             // No fragment here — the real key never leaves the client, and the
             // owner token must not leak into a shareable URL
@@ -738,6 +992,7 @@ export const uploadRoutes = new Elysia()
                 success: true,
                 id,
                 url: `${deriveBaseUrl(request)}/download/${id}`,
+                ...lifetime,
             };
         },
         {
@@ -745,7 +1000,7 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Complete file upload',
                 description:
-                    'Finalizes an upload by completing the S3 multipart upload (if applicable), storing file metadata, and setting authentication.',
+                    'Finalizes an upload by completing the S3 multipart upload (if applicable), verifying the stored object size, storing file metadata, and setting authentication. Returns the authoritative remaining lifetime (`ttl` in seconds, `expiresAt` in epoch milliseconds) — the TTL starts when the upload URL is issued, so clients must not compute the expiry themselves.',
             },
             body: t.Object({
                 id: t.String(),
@@ -766,6 +1021,9 @@ export const uploadRoutes = new Elysia()
                     success: t.Optional(t.Boolean()),
                     id: t.Optional(t.String()),
                     url: t.Optional(t.String()),
+                    // Authoritative remaining lifetime — see route description
+                    expiresAt: t.Optional(t.Number()),
+                    ttl: t.Optional(t.Number()),
                     error: t.Optional(t.String()),
                     status: t.Optional(t.Number()),
                 }),
@@ -780,6 +1038,10 @@ export const uploadRoutes = new Elysia()
                     error: t.String(),
                     status: t.Optional(t.Number()),
                 }),
+                413: t.Object({
+                    error: t.String(),
+                    status: t.Optional(t.Number()),
+                }),
                 500: t.Object({
                     error: t.String(),
                 }),
@@ -790,9 +1052,9 @@ export const uploadRoutes = new Elysia()
     // Abort multipart upload
     .post(
         '/upload/abort/:id',
-        async ({ params, body }) => {
+        async ({ params, body, set }) => {
             const { id } = params;
-            const { uploadId } = body;
+            const { uploadId, uploadToken } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info({ requestId, id, uploadId }, 'Abort upload request received');
@@ -802,12 +1064,34 @@ export const uploadRoutes = new Elysia()
                 return { error: 'Missing upload ID' };
             }
 
+            const fileInfo = await storage.getMetadata(id);
+
+            if (fileInfo) {
+                // Only the uploader may abort. Uploads created before this field
+                // existed have no stored hash — allow those so in-flight uploads
+                // survive the deploy that introduces the token.
+                const storedTokenHash = await storage.getField(id, 'uploadAuth');
+                if (storedTokenHash && !verifyUploadToken(uploadToken, storedTokenHash)) {
+                    logger.warn({ requestId, id }, 'Abort rejected — invalid upload token');
+                    set.status = 401;
+                    return { error: 'Invalid upload token' };
+                }
+
+                // Don't pass an arbitrary uploadId through to S3: it must be the
+                // one this file was actually created with
+                if (fileInfo.uploadId && fileInfo.uploadId !== uploadId) {
+                    logger.warn({ requestId, id }, 'Abort rejected — upload ID mismatch');
+                    set.status = 400;
+                    return { error: 'Upload ID mismatch' };
+                }
+            }
+
             try {
-                const fileInfo = await storage.getMetadata(id);
                 await storage.abortMultipartUpload(id, uploadId, fileInfo?.providerId);
                 // storage.del (not redis.del) so the provider file counter
                 // incremented at /upload/url is decremented again
                 await storage.del(id);
+                await unscheduleObjectReap(id);
                 logger.info({ requestId, id, uploadId }, 'Upload aborted successfully');
                 return { success: true };
             } catch (e) {
@@ -828,15 +1112,22 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Abort multipart upload',
                 description:
-                    'Aborts an in-progress multipart upload, cleaning up uploaded parts from S3 and removing metadata from Redis.',
+                    'Aborts an in-progress multipart upload, cleaning up uploaded parts from S3 and removing metadata from Redis. Requires the `uploadToken` issued by `/upload/url`.',
             },
             body: t.Object({
                 uploadId: t.String(),
+                uploadToken: t.Optional(t.String()),
             }),
             response: {
                 200: t.Object({
                     success: t.Optional(t.Boolean()),
                     error: t.Optional(t.String()),
+                }),
+                400: t.Object({
+                    error: t.String(),
+                }),
+                401: t.Object({
+                    error: t.String(),
                 }),
             },
         },
@@ -847,7 +1138,7 @@ export const uploadRoutes = new Elysia()
         '/upload/multipart/:id/resume',
         async ({ params, body, set }) => {
             const { id } = params;
-            const { uploadId, completedPartNumbers } = body;
+            const { uploadId, uploadToken, completedPartNumbers } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info(
@@ -861,6 +1152,17 @@ export const uploadRoutes = new Elysia()
                 logger.warn({ requestId, id }, 'File not found for resume');
                 set.status = 404;
                 return { error: 'Upload not found or expired' };
+            }
+
+            // Only the uploader may mint fresh pre-signed PUT URLs for the
+            // unfinished parts — otherwise anyone holding a leaked uploadId
+            // could inject bytes into the object before the uploader completes.
+            // Pre-token uploads (no stored hash) stay resumable across deploy.
+            const storedTokenHash = await storage.getField(id, 'uploadAuth');
+            if (storedTokenHash && !verifyUploadToken(uploadToken, storedTokenHash)) {
+                logger.warn({ requestId, id }, 'Resume rejected — invalid upload token');
+                set.status = 401;
+                return { error: 'Invalid upload token' };
             }
 
             if (!fileInfo.uploadId || fileInfo.uploadId !== uploadId) {
@@ -919,10 +1221,11 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Resume multipart upload',
                 description:
-                    'Generates new pre-signed URLs for remaining parts of an interrupted multipart upload. Skips already-uploaded parts.',
+                    'Generates new pre-signed URLs for remaining parts of an interrupted multipart upload. Skips already-uploaded parts. Requires the `uploadToken` issued by `/upload/url`.',
             },
             body: t.Object({
                 uploadId: t.String(),
+                uploadToken: t.Optional(t.String()),
                 completedPartNumbers: t.Array(t.Number()),
             }),
             response: {
@@ -939,6 +1242,7 @@ export const uploadRoutes = new Elysia()
                     numParts: t.Number(),
                 }),
                 400: t.Object({ error: t.String() }),
+                401: t.Object({ error: t.String() }),
                 404: t.Object({ error: t.String() }),
             },
         },
@@ -948,12 +1252,26 @@ export const uploadRoutes = new Elysia()
     // The client uploads 5x100MB parts concurrently to measure real throughput.
     .post(
         '/upload/speedtest',
-        async () => {
+        async ({ request, set }) => {
             const SPEEDTEST_NUM_PARTS = 5;
-            const testId = `__speedtest__${randomBytes(8).toString('hex')}`;
+            const testId = `${SPEEDTEST_PREFIX}${randomBytes(8).toString('hex')}`;
 
+            // Unauthenticated write amplification: each call mints 5 unbounded
+            // pre-signed UploadPart URLs, so an unthrottled loop can park
+            // terabytes of list-invisible incomplete-multipart data in the bucket
+            if (!speedTestRateLimiter.take(clientIp(request))) {
+                logger.warn({ testId }, 'Speed test rate limit exceeded');
+                set.status = 429;
+                return { error: 'Too many speed test requests' };
+            }
+
+            // Pin the provider for the whole test so cleanup can't abort against
+            // a different bucket after a concurrent provider activation
+            const providerId = storage.getActiveProviderId();
+
+            let uploadId: string | null = null;
             try {
-                const uploadId = await storage.createMultipartUpload(testId);
+                uploadId = await storage.createMultipartUpload(testId, undefined, providerId);
                 if (!uploadId) {
                     return { error: 'Failed to create speed test upload' };
                 }
@@ -961,18 +1279,39 @@ export const uploadRoutes = new Elysia()
                 const parts = await Promise.all(
                     Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
                         storage
-                            .getSignedMultipartUploadUrl(testId, uploadId, i + 1, 60)
+                            .getSignedMultipartUploadUrl(
+                                testId,
+                                uploadId as string,
+                                i + 1,
+                                60,
+                                providerId,
+                            )
                             .then((url) => ({ partNumber: i + 1, url })),
                     ),
                 );
 
+                // Cleanup must not depend on the client coming back: register the
+                // test so the reaper aborts it if /speedtest/cleanup never arrives
+                await scheduleObjectReap({
+                    kind: 'speedtest',
+                    id: testId,
+                    providerId,
+                    uploadId,
+                    expiresAt: Date.now() + SPEEDTEST_REAP_AFTER_MS,
+                });
+
                 logger.info(
-                    { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS },
+                    { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS, providerId },
                     'Speed test URLs generated',
                 );
                 return { testId, uploadId, parts };
             } catch (e) {
                 logger.warn({ testId, error: e }, 'Speed test setup failed');
+                if (uploadId) {
+                    await storage
+                        .abortMultipartUpload(testId, uploadId, providerId)
+                        .catch(() => undefined);
+                }
                 return { error: 'Speed test setup failed' };
             }
         },
@@ -981,7 +1320,7 @@ export const uploadRoutes = new Elysia()
                 tags: ['Speed Test'],
                 summary: 'Start upload speed test',
                 description:
-                    'Creates a temporary multipart upload with 5 pre-signed part URLs for measuring upload throughput.',
+                    'Creates a temporary multipart upload with 5 pre-signed part URLs for measuring upload throughput. Rate limited per client IP; abandoned tests are swept server-side.',
             },
             response: {
                 200: t.Object({
@@ -997,6 +1336,9 @@ export const uploadRoutes = new Elysia()
                     ),
                     error: t.Optional(t.String()),
                 }),
+                429: t.Object({
+                    error: t.String(),
+                }),
             },
         },
     )
@@ -1004,16 +1346,43 @@ export const uploadRoutes = new Elysia()
     // Clean up speed test object after the test completes
     .post(
         '/upload/speedtest/cleanup',
-        async ({ body }) => {
+        async ({ body, set }) => {
             const { testId, uploadId } = body;
+
+            // This route aborts an arbitrary uploadId — restrict it to keys the
+            // speed test could actually have created
+            if (!testId.startsWith(SPEEDTEST_PREFIX)) {
+                logger.warn({ testId }, 'Speed test cleanup rejected — not a speed test id');
+                set.status = 400;
+                return { ok: false, error: 'Invalid speed test id' };
+            }
+
+            // Use the provider pinned at creation time; resolving "active" here
+            // would abort against the wrong bucket after a provider change and
+            // leak the real test parts behind a swallowed NoSuchUpload
+            const record = await getReapRecord(testId);
+
+            let cleaned = true;
             try {
                 // Abort the multipart upload (cleans up parts from S3)
-                if (uploadId) {
-                    await storage.abortMultipartUpload(testId, uploadId);
+                const effectiveUploadId = uploadId || record?.uploadId;
+                if (effectiveUploadId) {
+                    await storage.abortMultipartUpload(
+                        testId,
+                        effectiveUploadId,
+                        record?.providerId,
+                    );
                 }
                 logger.info({ testId }, 'Speed test cleaned up');
             } catch (e) {
+                cleaned = false;
                 logger.warn({ testId, error: e }, 'Failed to clean up speed test');
+            }
+
+            // Drop the sweep record only if the abort actually succeeded —
+            // otherwise leave it so the reaper retries the cleanup
+            if (cleaned) {
+                await unscheduleObjectReap(testId);
             }
             return { ok: true };
         },
@@ -1031,6 +1400,10 @@ export const uploadRoutes = new Elysia()
             response: {
                 200: t.Object({
                     ok: t.Boolean(),
+                }),
+                400: t.Object({
+                    ok: t.Boolean(),
+                    error: t.String(),
                 }),
             },
         },

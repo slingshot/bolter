@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { createHash } from 'node:crypto';
 import type { FileMetadata } from '../../storage';
 
 // ---------------------------------------------------------------------------
@@ -8,6 +9,7 @@ import type { FileMetadata } from '../../storage';
 const mockRedis = {
     ping: mock(() => Promise.resolve(true)),
     hSet: mock(() => Promise.resolve()),
+    hSetIfExists: mock(() => Promise.resolve(true)),
     hGet: mock(() => Promise.resolve(null as string | null)),
     hGetAll: mock(() => Promise.resolve(null as Record<string, string> | null)),
     hDel: mock(() => Promise.resolve()),
@@ -17,6 +19,12 @@ const mockRedis = {
     ttl: mock(() => Promise.resolve(-1)),
     hIncrBy: mock(() => Promise.resolve(0)),
 };
+
+/** Fields written by the single EXISTS-guarded finalization call, if any */
+function finalizedFields(): Record<string, string> {
+    const call = mockRedis.hSetIfExists.mock.calls[0] as unknown[] | undefined;
+    return (call?.[1] as Record<string, string>) ?? {};
+}
 
 const mockStorage = {
     redis: mockRedis,
@@ -85,19 +93,19 @@ mock.module('../../lib/sentry', () => ({
     }),
 }));
 
+// Recording logger — several regression tests assert that secrets (owner
+// tokens, pre-signed URLs) never reach a log record
+const loggedObjects: Record<string, unknown>[] = [];
+function recordLog(obj: unknown) {
+    if (obj && typeof obj === 'object') {
+        loggedObjects.push(obj as Record<string, unknown>);
+    }
+}
 const noopLogger = {
-    info: () => {
-        /* noop */
-    },
-    warn: () => {
-        /* noop */
-    },
-    error: () => {
-        /* noop */
-    },
-    debug: () => {
-        /* noop */
-    },
+    info: recordLog,
+    warn: recordLog,
+    error: recordLog,
+    debug: recordLog,
     child: () => noopLogger,
 };
 mock.module('../../logger', () => ({
@@ -106,13 +114,16 @@ mock.module('../../logger', () => ({
     downloadLogger: noopLogger,
     storageLogger: noopLogger,
     s3Logger: noopLogger,
+    reaperLogger: noopLogger,
+    redactPaths: [],
 }));
 
 // ---------------------------------------------------------------------------
 // Import AFTER mocks
 // ---------------------------------------------------------------------------
 import { Elysia } from 'elysia';
-import { uploadRoutes } from '../../routes/upload';
+import { REAP_KEY } from '../../reaper';
+import { speedTestRateLimiter, uploadRoutes } from '../../routes/upload';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -129,6 +140,22 @@ function jsonPost(path: string, body: Record<string, unknown>) {
         body: JSON.stringify(body),
     });
 }
+
+function setFieldValues(field: string): string[] {
+    return mockStorage.setField.mock.calls
+        .filter((call: unknown[]) => call[1] === field)
+        .map((call: unknown[]) => call[2] as string);
+}
+
+/** Reap records written through redis.hSet(REAP_KEY, id, json) */
+function reapRecords(): Record<string, unknown>[] {
+    return mockRedis.hSet.mock.calls
+        .filter((call: unknown[]) => call[0] === REAP_KEY)
+        .map((call: unknown[]) => JSON.parse(call[2] as string) as Record<string, unknown>);
+}
+
+const UPLOAD_TOKEN = 'a'.repeat(32);
+const UPLOAD_TOKEN_HASH = createHash('sha256').update(UPLOAD_TOKEN).digest('hex');
 
 // Default metadata returned by getMetadata when a file "exists"
 function makeMetadata(overrides: Partial<FileMetadata> = {}): FileMetadata {
@@ -176,6 +203,9 @@ describe('POST /upload/url', () => {
         mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
         mockRedis.expire.mockReset();
         mockRedis.expire.mockResolvedValue(undefined);
+        mockRedis.hSet.mockReset();
+        mockRedis.hSet.mockResolvedValue(undefined);
+        loggedObjects.length = 0;
     });
 
     it('should return a single URL for a small file (50MB)', async () => {
@@ -217,33 +247,44 @@ describe('POST /upload/url', () => {
         }
     });
 
-    it('should return error for file size of 0', async () => {
+    // Returned as HTTP 200 these bodies sailed through the client's
+    // `response.ok` guard, which then reported the unrelated
+    // "Pre-signed URLs not available" instead of the real reason
+    it('should return HTTP 400 (not 200) for file size of 0', async () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/url', { fileSize: 0 }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toBeDefined();
         expect(body.error).toContain('Invalid file size');
     });
 
-    it('should return error for negative file size', async () => {
+    it('should return HTTP 400 (not 200) for negative file size', async () => {
         const app = createApp();
         const res = await app.handle(jsonPost('/upload/url', { fileSize: -100 }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('Invalid file size');
     });
 
-    it('should return error for file exceeding MAX_FILE_SIZE', async () => {
+    it('should return HTTP 400 (not 200) for file exceeding MAX_FILE_SIZE', async () => {
         const app = createApp();
         // MAX_FILE_SIZE is 1TB = 1_000_000_000_000
         const res = await app.handle(jsonPost('/upload/url', { fileSize: 2_000_000_000_000 }));
 
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
         const body = await res.json();
         expect(body.error).toContain('File size exceeds maximum');
+    });
+
+    it('should not create any metadata or S3 state for a rejected size', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 0 }));
+
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+        expect(mockStorage.createMultipartUpload.mock.calls.length).toBe(0);
     });
 
     it('should return useSignedUrl=false when pre-signed URL test fails', async () => {
@@ -386,6 +427,177 @@ describe('POST /upload/url', () => {
         expect(call[1]).toBe(7 * 24 * 60 * 60); // expiresIn, not the 1h default
         expect(call[3]).toBe('default'); // providerId pinned
     });
+
+    // --- #35: secrets must never reach a log record --------------------------
+
+    it('should never log the owner token', async () => {
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
+        const body = await res.json();
+
+        expect(body.owner).toBeDefined();
+        // Log-read access must not become delete/params/password authority
+        for (const record of loggedObjects) {
+            expect(Object.keys(record)).not.toContain('owner');
+            expect(JSON.stringify(record)).not.toContain(body.owner);
+        }
+    });
+
+    it('should never log a pre-signed upload URL (single-part or multipart)', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
+        await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        // A pre-signed URL's query string is a valid AWS signature — replaying
+        // it overwrites the stored object for the URL's whole validity window
+        for (const record of loggedObjects) {
+            const serialized = JSON.stringify(record);
+            expect(serialized).not.toContain('signed=true');
+            expect(serialized).not.toContain('s3.example.com');
+        }
+    });
+
+    it('should never log the upload-owner token', async () => {
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+        const body = await res.json();
+
+        expect(body.uploadToken).toBeDefined();
+        for (const record of loggedObjects) {
+            expect(JSON.stringify(record)).not.toContain(body.uploadToken);
+        }
+    });
+
+    // --- #5: dlimit validation / clamping ------------------------------------
+
+    it('should clamp an oversized dlimit to config.maxDownloads', async () => {
+        const app = createApp();
+        // Unclamped this makes the `dl >= dlimit` gate unreachable — unlimited
+        // downloads for the whole expiry window
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, dlimit: 1_000_000_000 }));
+
+        expect(setFieldValues('dlimit')).toEqual(['100']); // DOWNLOAD_LIMITS.MAX_DOWNLOADS
+    });
+
+    it('should store the default dlimit when none is supplied', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
+
+        expect(setFieldValues('dlimit')).toEqual(['1']);
+    });
+
+    it('should store an in-range dlimit verbatim as an integer string', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, dlimit: 20 }));
+
+        expect(setFieldValues('dlimit')).toEqual(['20']);
+    });
+
+    it('should reject a negative dlimit at the schema instead of bricking the file', async () => {
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, dlimit: -1 }));
+
+        expect(res.status).toBe(422);
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should reject a fractional dlimit', async () => {
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/url', { fileSize: 50_000_000, dlimit: 2.5 }),
+        );
+
+        expect(res.status).toBe(422);
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+
+    it('should never store a dlimit in exponential notation', async () => {
+        const app = createApp();
+        // 1e21 stringifies as '1e+21', which reads back through parseInt as 1 —
+        // silently turning the file into a single-use self-destruct
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, dlimit: 1e21 }));
+
+        const stored = setFieldValues('dlimit');
+        expect(stored).toEqual(['100']);
+        expect(stored[0]).not.toContain('e');
+    });
+
+    // --- #7: timeLimit must never reach EXPIRE as a delete -------------------
+
+    it('should reject a negative timeLimit (EXPIRE with a negative TTL deletes the key)', async () => {
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/url', { fileSize: 50_000_000, timeLimit: -1 }),
+        );
+
+        expect(res.status).toBe(422);
+        expect(mockRedis.expire.mock.calls.length).toBe(0);
+    });
+
+    it('should reject a zero timeLimit', async () => {
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/url', { fileSize: 50_000_000, timeLimit: 0 }),
+        );
+
+        expect(res.status).toBe(422);
+        expect(mockRedis.expire.mock.calls.length).toBe(0);
+    });
+
+    it('should always call EXPIRE with a positive TTL', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, timeLimit: 3600 }));
+
+        const ttl = mockRedis.expire.mock.calls[0][1] as number;
+        expect(ttl).toBe(3600);
+        expect(ttl).toBeGreaterThan(0);
+    });
+
+    // --- #23: rollback must cover the post-signing Redis writes --------------
+
+    it('should abort the S3 multipart and roll back when a post-signing Redis write fails', async () => {
+        mockStorage.setField.mockImplementation((_id: string, field: string) =>
+            field === 'uploadId'
+                ? Promise.reject(new Error('redis blip'))
+                : Promise.resolve(undefined),
+        );
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        // Previously this threw out of the handler: 500 with no id/uploadId for
+        // the client to clean up, an orphaned S3 multipart, and a +1 provider count
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.useSignedUrl).toBe(false);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+    });
+
+    // --- #42: every created object is registered for reaping ----------------
+
+    it('should register a single-part upload for reaping with its pinned provider', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000, timeLimit: 3600 }));
+
+        const records = reapRecords();
+        expect(records.length).toBe(1);
+        expect(records[0].kind).toBe('file');
+        expect(records[0].providerId).toBe('default');
+        // Roughly now + 1h; the reap deadline must track the metadata TTL
+        expect(records[0].expiresAt as number).toBeGreaterThan(Date.now() + 3_500_000);
+    });
+
+    it('should register a multipart upload for reaping including its uploadId', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/url', { fileSize: 500_000_000 }));
+
+        const records = reapRecords();
+        expect(records.length).toBe(1);
+        // Without the uploadId an abandoned multipart's parts can never be aborted
+        expect(records[0].uploadId).toBe('test-upload-id');
+        expect(records[0].providerId).toBe('default');
+    });
 });
 
 describe('POST /upload/complete', () => {
@@ -397,8 +609,14 @@ describe('POST /upload/complete', () => {
         mockStorage.completeMultipartUpload.mockResolvedValue(undefined);
         mockStorage.length.mockReset();
         mockStorage.length.mockResolvedValue(0);
+        mockStorage.del.mockReset();
+        mockStorage.del.mockResolvedValue(undefined);
+        mockStorage.getTTL.mockReset();
+        mockStorage.getTTL.mockResolvedValue(-1);
         mockRedis.hDel.mockReset();
         mockRedis.hDel.mockResolvedValue(undefined);
+        mockRedis.hSetIfExists.mockReset();
+        mockRedis.hSetIfExists.mockResolvedValue(true);
     });
 
     it('should complete a single (non-multipart) upload and return success', async () => {
@@ -426,10 +644,7 @@ describe('POST /upload/complete', () => {
         expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
 
         // Should have stored auth as 'unencrypted'
-        const authCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'auth' && call[2] === 'unencrypted',
-        );
-        expect(authCalls.length).toBe(1);
+        expect(finalizedFields().auth).toBe('unencrypted');
     });
 
     it('should complete a multipart upload with sorted parts', async () => {
@@ -516,19 +731,11 @@ describe('POST /upload/complete', () => {
         const body = await res.json();
         expect(body.success).toBe(true);
 
-        // Should have stored auth key
-        const authCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'auth' && call[2] === 'dGVzdC1hdXRoLWtleQ==',
-        );
-        expect(authCalls.length).toBe(1);
-
-        // Should have stored a nonce
-        const nonceCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'nonce',
-        );
-        expect(nonceCalls.length).toBe(1);
-        // The nonce should be a non-empty base64 string
-        expect((nonceCalls[0] as unknown[])[2]).toBeTruthy();
+        // Should have stored auth key and a non-empty base64 nonce, in one
+        // EXISTS-guarded write
+        expect(mockRedis.hSetIfExists.mock.calls.length).toBe(1);
+        expect(finalizedFields().auth).toBe('dGVzdC1hdXRoLWtleQ==');
+        expect(finalizedFields().nonce).toBeTruthy();
     });
 
     it('should store auth as "unencrypted" for unencrypted file', async () => {
@@ -537,10 +744,8 @@ describe('POST /upload/complete', () => {
         const app = createApp();
         await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
 
-        const authCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'auth' && call[2] === 'unencrypted',
-        );
-        expect(authCalls.length).toBe(1);
+        expect(finalizedFields().auth).toBe('unencrypted');
+        expect(finalizedFields().nonce).toBe('');
     });
 
     it('should reject re-completion of an encrypted file with a different authKey', async () => {
@@ -668,8 +873,9 @@ describe('POST /upload/complete', () => {
         expect(body.error).toContain('Upload ID not found');
     });
 
-    it('should store actualSize under the fileSize field', async () => {
+    it('should fall back to actualSize under fileSize when the object HEAD is unavailable', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.length.mockRejectedValue(new Error('HEAD failed'));
 
         const app = createApp();
         const res = await app.handle(
@@ -677,14 +883,8 @@ describe('POST /upload/complete', () => {
         );
 
         expect(res.status).toBe(200);
-        const fileSizeCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'fileSize' && call[2] === '12345678',
-        );
-        expect(fileSizeCalls.length).toBe(1);
-        const staleSizeCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'size',
-        );
-        expect(staleSizeCalls.length).toBe(0);
+        expect(finalizedFields().fileSize).toBe('12345678');
+        expect(finalizedFields().size).toBeUndefined();
     });
 
     it('should return 400 when too many parts are sent', async () => {
@@ -825,10 +1025,7 @@ describe('POST /upload/complete', () => {
         const body = await res.json();
         expect(body.success).toBe(true);
         // auth must have been stored so the file becomes downloadable
-        const authCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[1] === 'auth',
-        );
-        expect(authCalls.length).toBe(1);
+        expect(finalizedFields().auth).toBeTruthy();
     });
 
     it('should return 404 for NoSuchUpload error', async () => {
@@ -912,6 +1109,139 @@ describe('POST /upload/complete', () => {
         expect(body.error).toContain('smaller than the 5MB minimum');
         expect(body.status).toBe(400);
     });
+
+    // --- #36: the limit binds to real stored bytes ---------------------------
+
+    it('should reject and delete an object whose stored size exceeds MAX_FILE_SIZE', async () => {
+        // Attacker declared a tiny fileSize at /upload/url, then PUT 50TB to the
+        // pre-signed URL (which constrains only Bucket/Key) and reports a small
+        // actualSize here
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.length.mockResolvedValue(50_000_000_000_000);
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', actualSize: 1 }));
+
+        expect(res.status).toBe(413);
+        const body = await res.json();
+        expect(body.error).toContain('exceeds maximum');
+        // The over-size bytes must not stay billable/downloadable
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+        expect(mockStorage.del.mock.calls[0][0]).toBe('abc123');
+        // And the file must never be finalized into a downloadable state
+        expect(mockRedis.hSetIfExists.mock.calls.length).toBe(0);
+    });
+
+    it('should derive the stored fileSize from the object HEAD, not the client claim', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.length.mockResolvedValue(987_654_321);
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', actualSize: 1 }));
+
+        expect(res.status).toBe(200);
+        expect(finalizedFields().fileSize).toBe('987654321');
+    });
+
+    it('should accept a stored size exactly at MAX_FILE_SIZE', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.length.mockResolvedValue(1_000_000_000_000); // 1TB
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
+
+        expect(res.status).toBe(200);
+        expect(finalizedFields().fileSize).toBe('1000000000000');
+    });
+
+    // --- #7: finalization must not resurrect an expired key ------------------
+
+    it('should 404 instead of resurrecting metadata that expired during completion', async () => {
+        // A long CompleteMultipartUpload can straddle a short TTL. An unguarded
+        // HSET recreates the hash with NO TTL, no owner and no providerId —
+        // an immortal, undeletable, mis-routed file.
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 2 }),
+        );
+        mockRedis.hSetIfExists.mockResolvedValue(false);
+
+        const parts = [
+            { PartNumber: 1, ETag: '"etag1"' },
+            { PartNumber: 2, ETag: '"etag2"' },
+        ];
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123', parts }));
+
+        expect(res.status).toBe(404);
+        const body = await res.json();
+        expect(body.error).toContain('File not found');
+    });
+
+    it('should write every finalization field in ONE EXISTS-guarded call', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.length.mockResolvedValue(4242);
+
+        const app = createApp();
+        await app.handle(jsonPost('/upload/complete', { id: 'abc123', metadata: 'bWV0YQ==' }));
+
+        // Unguarded per-field setField writes are what resurrect an expired key
+        expect(mockStorage.setField.mock.calls.length).toBe(0);
+        expect(mockRedis.hSetIfExists.mock.calls.length).toBe(1);
+        expect(finalizedFields()).toEqual({
+            metadata: 'bWV0YQ==',
+            auth: 'unencrypted',
+            nonce: '',
+            fileSize: '4242',
+        });
+    });
+
+    // --- #15: the server owns the expiry -------------------------------------
+
+    it('should return the authoritative remaining lifetime from the Redis TTL', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.getTTL.mockResolvedValue(3600);
+
+        const before = Date.now();
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        // The TTL started at /upload/url — a client computing now + timeLimit
+        // would show an expiry the server will not honor
+        expect(body.ttl).toBe(3600);
+        expect(body.expiresAt).toBeGreaterThanOrEqual(before + 3_600_000);
+        expect(body.expiresAt).toBeLessThanOrEqual(Date.now() + 3_600_000);
+        expect(mockStorage.getTTL.mock.calls[0][0]).toBe('abc123');
+    });
+
+    it('should report a zero lifetime rather than "forever" when no TTL is set', async () => {
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false }));
+        mockStorage.getTTL.mockResolvedValue(-1);
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
+
+        const body = await res.json();
+        expect(body.ttl).toBe(0);
+    });
+
+    it('should return the remaining lifetime on an idempotent re-completion too', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: false, auth: 'unencrypted' }),
+        );
+        mockStorage.getTTL.mockResolvedValue(120);
+
+        const app = createApp();
+        const res = await app.handle(jsonPost('/upload/complete', { id: 'abc123' }));
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.ttl).toBe(120);
+        // Still idempotent — nothing rewritten
+        expect(mockRedis.hSetIfExists.mock.calls.length).toBe(0);
+    });
 });
 
 describe('POST /upload/abort/:id', () => {
@@ -920,6 +1250,109 @@ describe('POST /upload/abort/:id', () => {
         mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
         mockStorage.del.mockReset();
         mockStorage.del.mockResolvedValue(undefined);
+        mockStorage.getMetadata.mockReset();
+        mockStorage.getMetadata.mockResolvedValue(null);
+        mockStorage.getField.mockReset();
+        mockStorage.getField.mockResolvedValue(null);
+        mockRedis.hDel.mockReset();
+        mockRedis.hDel.mockResolvedValue(undefined);
+    });
+
+    // --- #52: abort must be bound to the upload owner -----------------------
+
+    it('should reject an abort with no upload token when one is stored', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }),
+        );
+
+        // A leaked uploadId alone must not let a third party kill the upload
+        expect(res.status).toBe(401);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+        expect(mockStorage.del.mock.calls.length).toBe(0);
+    });
+
+    it('should reject an abort with the wrong upload token', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/abort/abc123', {
+                uploadId: 'mp-upload-id',
+                uploadToken: 'b'.repeat(32),
+            }),
+        );
+
+        expect(res.status).toBe(401);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should accept an abort carrying the correct upload token', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/abort/abc123', {
+                uploadId: 'mp-upload-id',
+                uploadToken: UPLOAD_TOKEN,
+            }),
+        );
+
+        expect(res.status).toBe(200);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
+    });
+
+    it('should reject an abort whose uploadId does not match the stored one', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'real-upload-id' }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/abort/abc123', { uploadId: 'attacker-upload-id' }),
+        );
+
+        // The uploadId was previously passed straight through to S3 unverified
+        expect(res.status).toBe(400);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should still abort uploads created before upload tokens existed', async () => {
+        // Backward compatibility: an in-flight upload from before the deploy has
+        // no stored hash, and must remain abortable
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(null);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }),
+        );
+
+        expect(res.status).toBe(200);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
+    });
+
+    it('should drop the reap record after a successful abort', async () => {
+        const app = createApp();
+        await app.handle(jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }));
+
+        const reapDeletes = mockRedis.hDel.mock.calls.filter(
+            (call: unknown[]) => call[0] === REAP_KEY,
+        );
+        expect(reapDeletes.length).toBe(1);
     });
 
     it('should abort upload and clean up storage (decrementing provider counter)', async () => {
@@ -959,10 +1392,90 @@ describe('POST /upload/abort/:id', () => {
 describe('POST /upload/multipart/:id/resume', () => {
     beforeEach(() => {
         mockStorage.getMetadata.mockReset();
+        mockStorage.getField.mockReset();
+        mockStorage.getField.mockResolvedValue(null);
         mockStorage.getSignedMultipartUploadUrl.mockReset();
         mockStorage.getSignedMultipartUploadUrl.mockResolvedValue(
             'https://s3.example.com/part?signed=true',
         );
+    });
+
+    // --- #52: resume must be bound to the upload owner ----------------------
+
+    it('should reject a resume with no upload token when one is stored', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/multipart/abc123/resume', {
+                uploadId: 'mp-upload-id',
+                completedPartNumbers: [1],
+            }),
+        );
+
+        // Otherwise a leaked uploadId mints fresh pre-signed PUT URLs for every
+        // unfinished part — arbitrary bytes injected before the uploader completes
+        expect(res.status).toBe(401);
+        expect(mockStorage.getSignedMultipartUploadUrl.mock.calls.length).toBe(0);
+    });
+
+    it('should reject a resume with the wrong upload token', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/multipart/abc123/resume', {
+                uploadId: 'mp-upload-id',
+                uploadToken: 'b'.repeat(32),
+                completedPartNumbers: [],
+            }),
+        );
+
+        expect(res.status).toBe(401);
+        expect(mockStorage.getSignedMultipartUploadUrl.mock.calls.length).toBe(0);
+    });
+
+    it('should accept a resume carrying the correct upload token', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 3 }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/multipart/abc123/resume', {
+                uploadId: 'mp-upload-id',
+                uploadToken: UPLOAD_TOKEN,
+                completedPartNumbers: [1],
+            }),
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.parts.length).toBe(2);
+    });
+
+    it('should still resume uploads created before upload tokens existed', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 3 }),
+        );
+        mockStorage.getField.mockResolvedValue(null);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/multipart/abc123/resume', {
+                uploadId: 'mp-upload-id',
+                completedPartNumbers: [1, 2],
+            }),
+        );
+
+        expect(res.status).toBe(200);
     });
 
     it('should generate URLs for remaining parts (filter completed)', async () => {
@@ -1069,6 +1582,87 @@ describe('POST /upload/speedtest', () => {
         mockStorage.getSignedMultipartUploadUrl.mockResolvedValue(
             'https://s3.example.com/part?signed=true',
         );
+        mockStorage.abortMultipartUpload.mockReset();
+        mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
+        mockRedis.hSet.mockReset();
+        mockRedis.hSet.mockResolvedValue(undefined);
+        speedTestRateLimiter.reset();
+    });
+
+    // --- #11: unauthenticated write amplification ---------------------------
+
+    it('should rate limit repeated speed tests from the same client', async () => {
+        const app = createApp();
+        const headers = { 'cf-connecting-ip': '203.0.113.9' };
+        const statuses: number[] = [];
+
+        for (let i = 0; i < 6; i++) {
+            const res = await app.handle(
+                new Request('http://localhost/upload/speedtest', { method: 'POST', headers }),
+            );
+            statuses.push(res.status);
+        }
+
+        // Each accepted call mints 5 unbounded pre-signed UploadPart URLs
+        expect(statuses.slice(0, 5)).toEqual([200, 200, 200, 200, 200]);
+        expect(statuses[5]).toBe(429);
+        expect(mockStorage.createMultipartUpload.mock.calls.length).toBe(5);
+    });
+
+    it('should rate limit per client IP, not globally', async () => {
+        const app = createApp();
+        for (let i = 0; i < 5; i++) {
+            await app.handle(
+                new Request('http://localhost/upload/speedtest', {
+                    method: 'POST',
+                    headers: { 'cf-connecting-ip': '203.0.113.9' },
+                }),
+            );
+        }
+
+        const other = await app.handle(
+            new Request('http://localhost/upload/speedtest', {
+                method: 'POST',
+                headers: { 'cf-connecting-ip': '198.51.100.4' },
+            }),
+        );
+        expect(other.status).toBe(200);
+    });
+
+    it('should pin the speed test to the active provider', async () => {
+        const app = createApp();
+        await app.handle(new Request('http://localhost/upload/speedtest', { method: 'POST' }));
+
+        // createMultipartUpload(id, objectExpires, providerId)
+        expect(mockStorage.createMultipartUpload.mock.calls[0][2]).toBe('default');
+        for (const call of mockStorage.getSignedMultipartUploadUrl.mock.calls) {
+            expect(call[4]).toBe('default');
+        }
+    });
+
+    it('should register the speed test for server-side sweeping', async () => {
+        const app = createApp();
+        await app.handle(new Request('http://localhost/upload/speedtest', { method: 'POST' }));
+
+        // Cleanup must not depend on the client ever coming back
+        const records = reapRecords();
+        expect(records.length).toBe(1);
+        expect(records[0].kind).toBe('speedtest');
+        expect(records[0].uploadId).toBe('test-upload-id');
+        expect(records[0].providerId).toBe('default');
+    });
+
+    it('should abort the created multipart when part signing fails', async () => {
+        mockStorage.getSignedMultipartUploadUrl.mockRejectedValue(new Error('S3 down'));
+
+        const app = createApp();
+        const res = await app.handle(
+            new Request('http://localhost/upload/speedtest', { method: 'POST' }),
+        );
+
+        const body = await res.json();
+        expect(body.error).toContain('Speed test setup failed');
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
     });
 
     it('should return testId, uploadId, and 5 parts', async () => {
@@ -1114,6 +1708,80 @@ describe('POST /upload/speedtest/cleanup', () => {
     beforeEach(() => {
         mockStorage.abortMultipartUpload.mockReset();
         mockStorage.abortMultipartUpload.mockResolvedValue(undefined);
+        mockRedis.hGet.mockReset();
+        mockRedis.hGet.mockResolvedValue(null);
+        mockRedis.hDel.mockReset();
+        mockRedis.hDel.mockResolvedValue(undefined);
+    });
+
+    it('should reject a cleanup for an id that is not a speed test', async () => {
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/speedtest/cleanup', {
+                testId: 'realfileid',
+                uploadId: 'victim-upload-id',
+            }),
+        );
+
+        // This route aborts an arbitrary uploadId — it must not accept real file ids
+        expect(res.status).toBe(400);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should abort against the provider pinned at creation time', async () => {
+        mockRedis.hGet.mockResolvedValue(
+            JSON.stringify({
+                kind: 'speedtest',
+                id: '__speedtest__abc123',
+                providerId: 'backup-provider',
+                uploadId: 'test-upload-id',
+                expiresAt: Date.now() + 60_000,
+            }),
+        );
+
+        const app = createApp();
+        await app.handle(
+            jsonPost('/upload/speedtest/cleanup', {
+                testId: '__speedtest__abc123',
+                uploadId: 'test-upload-id',
+            }),
+        );
+
+        // Resolving "active" here aborts the wrong bucket after a provider change,
+        // swallows the NoSuchUpload, and leaks the real test parts
+        expect(mockStorage.abortMultipartUpload.mock.calls[0][2]).toBe('backup-provider');
+    });
+
+    it('should keep the sweep record when the abort fails so the reaper retries', async () => {
+        mockStorage.abortMultipartUpload.mockRejectedValue(new Error('S3 error'));
+
+        const app = createApp();
+        await app.handle(
+            jsonPost('/upload/speedtest/cleanup', {
+                testId: '__speedtest__abc123',
+                uploadId: 'test-upload-id',
+            }),
+        );
+
+        const reapDeletes = mockRedis.hDel.mock.calls.filter(
+            (call: unknown[]) => call[0] === REAP_KEY,
+        );
+        expect(reapDeletes.length).toBe(0);
+    });
+
+    it('should drop the sweep record after a successful cleanup', async () => {
+        const app = createApp();
+        await app.handle(
+            jsonPost('/upload/speedtest/cleanup', {
+                testId: '__speedtest__abc123',
+                uploadId: 'test-upload-id',
+            }),
+        );
+
+        const reapDeletes = mockRedis.hDel.mock.calls.filter(
+            (call: unknown[]) => call[0] === REAP_KEY,
+        );
+        expect(reapDeletes.length).toBe(1);
     });
 
     it('should call abortMultipartUpload to clean up', async () => {
