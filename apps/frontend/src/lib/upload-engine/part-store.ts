@@ -138,7 +138,8 @@ interface OpfsDirectoryHandle {
     keys(): AsyncIterableIterator<string>;
 }
 
-const UPLOADS_DIR = 'uploads';
+/** Root OPFS directory holding one `uploads/<fileId>` dir per upload. */
+export const UPLOADS_DIR = 'uploads';
 
 const tmpName = (partNumber: number) => `part-${partNumber}.tmp`;
 const binName = (partNumber: number) => `part-${partNumber}.bin`;

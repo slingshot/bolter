@@ -8,10 +8,15 @@ import { UploadedFilesList } from '@/components/UploadedFilesList';
 import { UploadProgress } from '@/components/UploadProgress';
 import { UploadSettings } from '@/components/UploadSettings';
 import { Button } from '@/components/ui/button';
-import { Canceller, FileReadError, resumeUpload, uploadFiles } from '@/lib/api';
+import { Canceller, FileReadError, resumeEngineUpload, resumeUpload, uploadFiles } from '@/lib/api';
 import { Keychain } from '@/lib/crypto';
 import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
+import {
+    discardEngineUpload,
+    type EngineResumeCandidate,
+    engineStartupMaintenance,
+} from '@/lib/upload-engine/client';
 import {
     cleanupExpiredUploads,
     discardResumableUpload,
@@ -47,6 +52,7 @@ export function HomePage() {
     } = useAppStore();
 
     const resumeFileInputRef = useRef<HTMLInputElement>(null);
+    const [engineResumable, setEngineResumable] = useState<EngineResumeCandidate | null>(null);
 
     // Check for any resumable upload on mount
     useEffect(() => {
@@ -55,6 +61,18 @@ export function HomePage() {
             .then((state) => setResumableUpload(state))
             .catch(() => setResumableUpload(null));
     }, [setResumableUpload]);
+
+    // Worker-engine maintenance on mount: surface source-free resumes
+    // ("Finish upload — no file selection needed") and garbage-collect
+    // orphaned OPFS staging directories (dirs whose upload lock is held by
+    // another tab are skipped).
+    useEffect(() => {
+        engineStartupMaintenance()
+            .then((candidates) => {
+                setEngineResumable(candidates.find((c) => c.action === 'finish') ?? null);
+            })
+            .catch(() => setEngineResumable(null));
+    }, []);
 
     const handleResumeFileSelected = useCallback(
         async (file: File) => {
@@ -170,6 +188,99 @@ export function HomePage() {
             // Intentionally ignored — best-effort cleanup
         });
     }, [resumableUpload, setResumableUpload]);
+
+    // Finish a worker-engine upload whose remaining bytes are all staged (or
+    // whose completion just needs replaying) — no file selection needed.
+    const handleEngineFinish = useCallback(async () => {
+        if (!engineResumable) {
+            return;
+        }
+
+        const canceller = new Canceller();
+        const keychain =
+            engineResumable.encrypted && engineResumable.secretKeyB64
+                ? new Keychain(engineResumable.secretKeyB64)
+                : new Keychain();
+
+        setUploading(true);
+        setUploadError(null);
+        setCanceller(canceller);
+        setKeychain(keychain);
+
+        try {
+            const result = await resumeEngineUpload(
+                engineResumable.fileId,
+                (progress) => setUploadProgress(progress),
+                canceller,
+            );
+
+            const uploaded: UploadedFile = {
+                id: result.id,
+                url: result.url,
+                secretKey: keychain.secretKeyB64,
+                ownerToken: result.ownerToken,
+                name: engineResumable.fileName,
+                size: engineResumable.size,
+                // The server TTL started at /upload/url — anchor the expiry at
+                // the lease's creation, not at completion.
+                expiresAt: resolveExpiresAt(
+                    result,
+                    engineResumable.timeLimit,
+                    engineResumable.createdAt,
+                ),
+                downloadLimit: engineResumable.downloadLimit,
+                downloadCount: 0,
+                encrypted: engineResumable.encrypted,
+            };
+
+            addUploadedFile(uploaded);
+            setUploadedFile(uploaded);
+            setEngineResumable(null);
+
+            addToast({
+                title: 'Upload resumed and completed!',
+                description: 'Your file is ready to share.',
+                variant: 'success',
+            });
+        } catch (e: unknown) {
+            const message = e instanceof Error ? e.message : String(e);
+            if (message !== 'Upload cancelled') {
+                setUploadError(message);
+                addToast({
+                    title: 'Resume failed',
+                    description: message,
+                    variant: 'destructive',
+                });
+            }
+        } finally {
+            setUploading(false);
+            setUploadProgress(null);
+            setCanceller(null);
+            setKeychain(null);
+        }
+    }, [
+        engineResumable,
+        setUploading,
+        setUploadError,
+        setCanceller,
+        setKeychain,
+        setUploadProgress,
+        addUploadedFile,
+        addToast,
+    ]);
+
+    const handleEngineStartFresh = useCallback(() => {
+        if (!engineResumable) {
+            return;
+        }
+        const { fileId } = engineResumable;
+        setEngineResumable(null);
+        // Aborts the server-side multipart via the lease's credentials, then
+        // clears engine state and the OPFS staging directory.
+        discardEngineUpload(fileId).catch(() => {
+            // Intentionally ignored — best-effort cleanup
+        });
+    }, [engineResumable]);
 
     const handleUpload = useCallback(async () => {
         if (files.length === 0) {
@@ -383,7 +494,34 @@ export function HomePage() {
                             </div>
                         )}
 
-                        {!isUploading && !resumableUpload && (
+                        {!isUploading && !resumableUpload && engineResumable && (
+                            <div className="bg-overlay-subtle border border-border-medium rounded-element p-6 flex flex-col items-center gap-4 text-center">
+                                <Upload className="h-8 w-8 text-content-secondary" />
+                                <div>
+                                    <p className="text-paragraph-sm font-medium text-content-primary mb-1">
+                                        Finish upload &mdash; no file selection needed
+                                    </p>
+                                    <p className="text-paragraph-xs text-content-secondary">
+                                        <span className="font-medium">
+                                            {engineResumable.fileName}
+                                        </span>{' '}
+                                        ({formatBytes(engineResumable.size)}) &mdash; every
+                                        remaining byte is already saved, so this upload can finish
+                                        right away.
+                                    </p>
+                                </div>
+                                <div className="flex gap-3 w-full">
+                                    <Button className="flex-1" onClick={handleEngineFinish}>
+                                        Finish upload
+                                    </Button>
+                                    <Button variant="ghost" onClick={handleEngineStartFresh}>
+                                        Start fresh
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+
+                        {!isUploading && !resumableUpload && !engineResumable && (
                             <>
                                 <DropZone />
 

@@ -27,6 +27,7 @@ vi.mock('@/lib/api', () => {
         Canceller,
         FileReadError,
         resumeUpload: (...args: unknown[]) => resumeUpload(...args),
+        resumeEngineUpload: vi.fn(),
         uploadFiles: vi.fn(),
         deleteFile: vi.fn().mockResolvedValue(true),
         getDownloadStatus: vi.fn().mockResolvedValue({ status: 'error' }),
@@ -35,8 +36,11 @@ vi.mock('@/lib/api', () => {
     };
 });
 
-vi.mock('@/lib/crypto', () => ({
-    // Accepts an optional secretKeyB64 (the encrypted-resume path) and ignores it.
+// Partial mock: the upload-engine modules Home now pulls in need the real ECE
+// constants; only Keychain is stubbed (accepts and ignores an optional
+// secretKeyB64, the encrypted-resume path).
+vi.mock('@/lib/crypto', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/lib/crypto')>()),
     Keychain: class {
         secretKeyB64 = 'secret-key-b64';
     },

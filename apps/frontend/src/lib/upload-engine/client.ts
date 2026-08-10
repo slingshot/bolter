@@ -15,6 +15,7 @@
  */
 
 import type { EngineResult } from './engine';
+import { OpfsPartStore, UPLOADS_DIR } from './part-store';
 import type {
     ClientToWorker,
     EngineJob,
@@ -22,7 +23,13 @@ import type {
     EngineProbeResult,
     WorkerToClient,
 } from './protocol';
-import type { CompletionEnvelope } from './state';
+import { planResume } from './resume';
+import {
+    type CompletionEnvelope,
+    type EngineLease,
+    type EngineStateStore,
+    openEngineState,
+} from './state';
 
 /** `localStorage[ENGINE_KILL_SWITCH_KEY] === 'off'` disables the engine. */
 export const ENGINE_KILL_SWITCH_KEY = 'bolter:upload-engine';
@@ -136,6 +143,49 @@ export function runEngineInWorker(
     hooks: EngineClientHooks,
     canceller: { onCancel(cb: () => void): void },
 ): Promise<EngineResult> {
+    return runWorkerJob(
+        { type: 'start', job, envelope },
+        { fileId: job.fileId, uploadId: job.uploadId, uploadToken: job.uploadToken },
+        hooks,
+        canceller,
+    );
+}
+
+/**
+ * Resume a persisted engine upload in a fresh worker (`executeResume` runs
+ * in-worker: completion replay or finish-staged). The lease supplies the
+ * uploadId/uploadToken the cancel-escalation abort needs.
+ */
+export async function resumeEngineUploadInWorker(
+    fileId: string,
+    hooks: EngineClientHooks,
+    canceller: { onCancel(cb: () => void): void },
+): Promise<EngineResult> {
+    const lease = await getEngineLease(fileId);
+    if (!lease) {
+        throw new Error(`no engine lease for upload ${fileId} — nothing to resume`);
+    }
+    return runWorkerJob(
+        { type: 'resume', fileId },
+        { fileId, uploadId: lease.uploadId, uploadToken: lease.uploadToken },
+        hooks,
+        canceller,
+    );
+}
+
+/** Credentials the cancel-escalation path needs for the main-thread abort. */
+interface WorkerAbortIdentity {
+    fileId: string;
+    uploadId: string;
+    uploadToken?: string;
+}
+
+function runWorkerJob(
+    initial: ClientToWorker,
+    identity: WorkerAbortIdentity,
+    hooks: EngineClientHooks,
+    canceller: { onCancel(cb: () => void): void },
+): Promise<EngineResult> {
     const worker = workerFactory();
     return new Promise<EngineResult>((resolve, reject) => {
         let settled = false;
@@ -211,7 +261,11 @@ export function runEngineInWorker(
             escalationTimer = setTimeout(() => {
                 settle(() => {
                     worker.terminate();
-                    void abortEngineUpload(job.fileId, job.uploadId, job.uploadToken).catch(
+                    void abortEngineUpload(
+                        identity.fileId,
+                        identity.uploadId,
+                        identity.uploadToken,
+                    ).catch(
                         () => undefined, // best-effort — the bucket lifecycle rule reaps leftovers
                     );
                     reject(new Error('Upload cancelled'));
@@ -219,7 +273,7 @@ export function runEngineInWorker(
             }, CANCEL_ACK_TIMEOUT_MS);
         });
 
-        post({ type: 'start', job, envelope });
+        post(initial);
     });
 }
 
@@ -240,5 +294,188 @@ export async function abortEngineUpload(
     });
     if (!response.ok) {
         throw new Error(`failed to abort upload: HTTP ${response.status}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine persistence access + startup maintenance (resume offers, OPFS GC)
+// ---------------------------------------------------------------------------
+
+/** The engine lease for `fileId`, or undefined when none (or no IndexedDB). */
+export async function getEngineLease(fileId: string): Promise<EngineLease | undefined> {
+    try {
+        const state = await openEngineState();
+        return await state.getLease(fileId);
+    } catch {
+        return undefined; // no engine DB → nothing the engine could resume
+    }
+}
+
+/** True when `fileId` belongs to the worker engine (routing for resumes). */
+export async function hasEngineLease(fileId: string): Promise<boolean> {
+    return (await getEngineLease(fileId)) !== undefined;
+}
+
+/**
+ * A persisted engine upload the resume UI can offer. `action: 'finish'`
+ * covers both `replay-complete` and `finish-staged` plans — neither needs the
+ * source re-picked ("Finish upload — no file selection needed"). The
+ * `need-source-*` actions are surfaced for later tasks (persisted-handle
+ * one-click resume; multi-file start-fresh).
+ */
+export interface EngineResumeCandidate {
+    fileId: string;
+    fileName: string;
+    size: number; // original input bytes (manifest sum)
+    encrypted: boolean;
+    secretKeyB64?: string;
+    timeLimit: number;
+    downloadLimit: number;
+    createdAt: number;
+    action: 'finish' | 'need-source-single' | 'need-source-multi';
+}
+
+/**
+ * Startup maintenance: plan a resume offer for each engine lease, then
+ * garbage-collect OPFS staging directories with no lease — skipping any
+ * directory whose `upload:<fileId>` Web Lock is held by a live holder [R12].
+ * Never throws; an environment without OPFS/IndexedDB simply yields no
+ * candidates.
+ */
+export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[]> {
+    let state: EngineStateStore;
+    try {
+        state = await openEngineState();
+    } catch {
+        return [];
+    }
+    const leases = await state.listLeases().catch(() => [] as EngineLease[]);
+    const live = new Set<string>();
+    const candidates: EngineResumeCandidate[] = [];
+    for (const lease of leases) {
+        // Every leased directory stays live — including the lease-only crash
+        // window before the envelope lands, which may be another tab's
+        // just-started upload.
+        live.add(lease.fileId);
+        try {
+            const [envelope, checkpoint, parts] = await Promise.all([
+                state.getEnvelope(lease.fileId),
+                state.getCheckpoint(lease.fileId),
+                state.getParts(lease.fileId),
+            ]);
+            if (!envelope) {
+                continue;
+            }
+            const plan = planResume(lease, envelope, checkpoint, parts);
+            if (plan.action === 'unrecoverable') {
+                continue;
+            }
+            candidates.push({
+                fileId: lease.fileId,
+                fileName:
+                    envelope.manifest.length === 1
+                        ? envelope.manifest[0].name
+                        : (envelope.zipFilename ?? `${envelope.manifest.length} files`),
+                size: envelope.manifest.reduce((sum, entry) => sum + entry.size, 0),
+                encrypted: envelope.encrypted,
+                secretKeyB64: envelope.secretKeyB64,
+                timeLimit: envelope.timeLimit,
+                downloadLimit: envelope.downloadLimit,
+                createdAt: lease.createdAt,
+                action:
+                    plan.action === 'need-source'
+                        ? plan.kind === 'multi'
+                            ? 'need-source-multi'
+                            : 'need-source-single'
+                        : 'finish',
+            });
+        } catch {
+            // Unreadable records: keep the staged bytes, offer nothing.
+        }
+    }
+    await collectOrphanedStaging(live).catch(() => undefined);
+    return candidates;
+}
+
+/**
+ * Discard a persisted engine upload: best-effort server-side abort (the lease
+ * holds the only uploadId/uploadToken copy), then clear engine state and the
+ * OPFS staging directory. Never throws — the bucket lifecycle rule and the
+ * startup GC reap anything a failed step leaves behind.
+ */
+export async function discardEngineUpload(fileId: string): Promise<void> {
+    try {
+        const state = await openEngineState();
+        const lease = await state.getLease(fileId);
+        if (lease) {
+            await abortEngineUpload(fileId, lease.uploadId, lease.uploadToken).catch(
+                () => undefined,
+            );
+        }
+        await state.clearUpload(fileId);
+    } catch {
+        // best-effort — startup GC covers leftovers
+    }
+    await new OpfsPartStore(fileId).destroy().catch(() => undefined);
+}
+
+// Minimal structural OPFS surface (directory iteration works on the main
+// thread; only sync access handles are worker-only).
+interface MaintenanceDirectoryHandle {
+    getDirectoryHandle(name: string): Promise<MaintenanceDirectoryHandle>;
+    keys(): AsyncIterableIterator<string>;
+}
+
+async function listStagedUploadIds(): Promise<string[]> {
+    const storage = globalThis.navigator?.storage;
+    if (!storage || typeof storage.getDirectory !== 'function') {
+        return [];
+    }
+    try {
+        const root = (await storage.getDirectory()) as unknown as MaintenanceDirectoryHandle;
+        const uploads = await root.getDirectoryHandle(UPLOADS_DIR);
+        const ids: string[] = [];
+        for await (const name of uploads.keys()) {
+            ids.push(name);
+        }
+        return ids;
+    } catch {
+        return []; // no uploads directory → nothing staged
+    }
+}
+
+/**
+ * `true` when another context holds the `upload:<fileId>` Web Lock. An
+ * `ifAvailable` grant is released immediately — this is a probe, not the
+ * upload-lifetime lock (that one is held by the running upload itself).
+ */
+async function uploadLockHeldElsewhere(fileId: string): Promise<boolean> {
+    const locks = globalThis.navigator?.locks;
+    if (!locks || typeof locks.request !== 'function') {
+        return false;
+    }
+    try {
+        const held = await locks.request(
+            `upload:${fileId}`,
+            { ifAvailable: true },
+            (lock) => lock === null,
+        );
+        return held === true;
+    } catch {
+        return true; // cannot verify → do not delete
+    }
+}
+
+/** Delete `uploads/<id>` dirs with no lease and no live lock holder [R12]. */
+async function collectOrphanedStaging(liveFileIds: Set<string>): Promise<void> {
+    const staged = await listStagedUploadIds();
+    const keep = new Set(liveFileIds);
+    for (const id of staged) {
+        if (!keep.has(id) && (await uploadLockHeldElsewhere(id))) {
+            keep.add(id);
+        }
+    }
+    if (staged.some((id) => !keep.has(id))) {
+        await OpfsPartStore.gc(keep);
     }
 }
