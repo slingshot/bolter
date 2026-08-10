@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { ProviderInUseError, providerRegistry } from '../storage/provider-registry';
-import { resolveProviderById } from '../storage/resolve-provider';
 
 // --- Mock redis (only the surface the registry / resolver touch) ---
 
@@ -10,7 +9,7 @@ const mockRedis = {
     hSet: mock((_key: string, _field: string, _value: string) => Promise.resolve()),
     hSetMultiple: mock((_key: string, _data: Record<string, string>) => Promise.resolve()),
     del: mock((_key: string) => Promise.resolve()),
-    delAndDecrement: mock((_key: string, _counterKey: string) => Promise.resolve(true)),
+    delIfPresent: mock((_key: string) => Promise.resolve(true)),
     exists: mock((_key: string) => Promise.resolve(false)),
     sAdd: mock((_key: string, ..._members: string[]) => Promise.resolve()),
     sMembers: mock((_key: string) => Promise.resolve([] as string[])),
@@ -22,6 +21,29 @@ const mockRedis = {
 };
 
 mock.module('../storage/redis', () => ({ redis: mockRedis }));
+
+mock.module('../lib/sentry', () => ({
+    captureError: mock(() => undefined),
+    addBreadcrumb: mock(() => undefined),
+}));
+
+// --- The REAL storage facade ---
+//
+// These tests deliberately exercise the production wiring
+// (storage.setField -> providerRegistry.trackFile -> getFileCount ->
+// removeProvider) rather than a re-implementation of it: re-implementing the
+// facade in the test is precisely what would let the tracking write silently
+// go missing while the tests stayed green.
+//
+// Earlier test files in the same process register a `mock.module` for
+// `../storage` (which resolves to storage/index.ts), and those registrations
+// are global and permanent. A query-suffixed specifier resolves past the mock
+// registry to the real file; its own imports (./provider-registry, ./redis)
+// still resolve normally, so it shares the real registry singleton and the
+// mocked redis above.
+const { storage, resolveProviderById } = (await import(
+    '../storage/index.ts?real=provider-storage'
+)) as typeof import('../storage/index');
 
 // --- Mock S3Storage so provider instances are identifiable by bucket ---
 
@@ -90,7 +112,7 @@ function resetRedisMocks(): void {
     mockRedis.hSet.mockResolvedValue(undefined);
     mockRedis.hSetMultiple.mockResolvedValue(undefined);
     mockRedis.del.mockResolvedValue(undefined);
-    mockRedis.delAndDecrement.mockResolvedValue(true);
+    mockRedis.delIfPresent.mockResolvedValue(true);
     mockRedis.exists.mockResolvedValue(false);
     mockRedis.sAdd.mockResolvedValue(undefined);
     mockRedis.sMembers.mockResolvedValue([]);
@@ -208,6 +230,27 @@ describe('providerRegistry.getFileCount (finding #8)', () => {
 
         expect(await providerRegistry.getFileCount('backup')).toBe(0);
     });
+
+    it('sweeps a large set in batches instead of one round-trip per member', async () => {
+        const members = Array.from({ length: 600 }, (_, i) => `file-${i}`);
+        mockRedis.sMembers.mockResolvedValue(members);
+        // Every other id has TTL-expired
+        mockRedis.exists.mockImplementation((key: string) =>
+            Promise.resolve(Number(key.slice('file-'.length)) % 2 === 0),
+        );
+
+        expect(await providerRegistry.getFileCount('backup')).toBe(300);
+
+        // 600 probes must not cost 600 sequential round-trips, and every stale
+        // id must still be pruned exactly once
+        expect(mockRedis.exists).toHaveBeenCalledTimes(600);
+        const pruned = mockRedis.sRem.mock.calls.flatMap((call) => call.slice(1));
+        expect(mockRedis.sRem.mock.calls.length).toBeLessThan(10);
+        expect(pruned.length).toBe(300);
+        expect(new Set(pruned).size).toBe(300);
+        expect(pruned).toContain('file-1');
+        expect(pruned).not.toContain('file-2');
+    });
 });
 
 describe('providerRegistry.removeProvider (finding #8)', () => {
@@ -287,11 +330,103 @@ describe('providerRegistry.incrementFileCount (finding #8)', () => {
         expect(mockRedis.sAdd).toHaveBeenCalledWith('provider:backup:files', 'file-a');
     });
 
-    it('stays backwards compatible when no file id is supplied', async () => {
+    it('still bumps the raw counter when no file id is supplied', async () => {
         await providerRegistry.incrementFileCount('backup');
 
         expect(mockRedis.incrBy).toHaveBeenCalledWith('provider:backup:filecount', 1);
         expect(mockRedis.sAdd).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Finding #8 — the production write path must actually populate the live-file
+// set. Without this the in-use guard silently reads 0 forever and DELETE
+// /providers/:id (no ?force) deletes a provider that still holds live files.
+// These drive the REAL storage facade, not a stand-in for it.
+// ---------------------------------------------------------------------------
+
+describe('storage.setField provider tracking (finding #8)', () => {
+    beforeEach(async () => {
+        resetRedisMocks();
+        await initRegistry(['default', 'backup']);
+        resetRedisMocks();
+    });
+
+    afterEach(() => {
+        providerRegistry.destroy();
+    });
+
+    it('registers the file on its provider when the upload pins providerId', async () => {
+        // Exactly what POST /upload/url does for every upload
+        await storage.setField('file-a', 'providerId', 'backup');
+
+        expect(mockRedis.hSet).toHaveBeenCalledWith('file-a', 'providerId', 'backup');
+        expect(mockRedis.sAdd).toHaveBeenCalledWith('provider:backup:files', 'file-a');
+    });
+
+    it('does not touch the live-file set for any other metadata field', async () => {
+        await storage.setField('file-a', 'fileSize', '1024');
+        await storage.setField('file-a', 'owner', 'owner-token');
+
+        expect(mockRedis.sAdd).not.toHaveBeenCalled();
+    });
+
+    it('never fails the upload when the tracking write fails', async () => {
+        mockRedis.sAdd.mockRejectedValue(new Error('redis blip'));
+
+        await storage.setField('file-a', 'providerId', 'backup');
+
+        expect(mockRedis.hSet).toHaveBeenCalledWith('file-a', 'providerId', 'backup');
+    });
+
+    it('makes the in-use guard refuse to delete a provider holding live files', async () => {
+        // A tiny in-memory Redis for just the set + key existence, so the whole
+        // chain runs for real: setField -> trackFile -> getFileCount ->
+        // removeProvider's guard.
+        const sets = new Map<string, Set<string>>();
+        const liveKeys = new Set<string>();
+        mockRedis.sAdd.mockImplementation((key: string, ...members: string[]) => {
+            const set = sets.get(key) ?? new Set<string>();
+            for (const m of members) {
+                set.add(m);
+            }
+            sets.set(key, set);
+            return Promise.resolve();
+        });
+        mockRedis.sMembers.mockImplementation((key: string) =>
+            Promise.resolve([...(sets.get(key) ?? [])]),
+        );
+        mockRedis.sRem.mockImplementation((key: string, ...members: string[]) => {
+            const set = sets.get(key);
+            for (const m of members) {
+                set?.delete(m);
+            }
+            return Promise.resolve();
+        });
+        mockRedis.exists.mockImplementation((key: string) => Promise.resolve(liveKeys.has(key)));
+
+        await storage.setField('file-a', 'providerId', 'backup');
+        await storage.setField('file-b', 'providerId', 'backup');
+        liveKeys.add('file-a');
+        liveKeys.add('file-b');
+
+        expect(await providerRegistry.getFileCount('backup')).toBe(2);
+
+        let thrown: unknown;
+        try {
+            await providerRegistry.removeProvider('backup');
+        } catch (e) {
+            thrown = e;
+        }
+        expect(thrown).toBeInstanceOf(ProviderInUseError);
+        expect((thrown as ProviderInUseError).fileCount).toBe(2);
+        expect(providerRegistry.getProviderConfig('backup')).toBeDefined();
+
+        // ...and once those files TTL-expire the same provider becomes
+        // deletable without force, with the stale ids pruned from the set
+        liveKeys.clear();
+        await providerRegistry.removeProvider('backup');
+        expect(providerRegistry.getProviderConfig('backup')).toBeUndefined();
     });
 });
 
@@ -310,41 +445,36 @@ describe('providerRegistry.deleteFileMetadata (finding #24)', () => {
         providerRegistry.destroy();
     });
 
-    it('deletes the hash and decrements through one conditional operation', async () => {
-        mockRedis.delAndDecrement.mockResolvedValue(true);
+    it('deletes the hash, then decrements and untracks only on a real removal', async () => {
+        mockRedis.delIfPresent.mockResolvedValue(true);
 
         const removed = await providerRegistry.deleteFileMetadata('backup', 'file-a');
 
         expect(removed).toBe(true);
-        expect(mockRedis.delAndDecrement).toHaveBeenCalledWith(
-            'file-a',
-            'provider:backup:filecount',
-        );
-        // The decrement is inside the conditional op, never an extra blind one
-        expect(mockRedis.decrBy).not.toHaveBeenCalled();
+        expect(mockRedis.delIfPresent).toHaveBeenCalledWith('file-a');
+        expect(mockRedis.decrBy).toHaveBeenCalledWith('provider:backup:filecount', 1);
         expect(mockRedis.sRem).toHaveBeenCalledWith('provider:backup:files', 'file-a');
     });
 
     it('does not decrement when another caller already removed the key', async () => {
-        mockRedis.delAndDecrement.mockResolvedValue(false);
+        mockRedis.delIfPresent.mockResolvedValue(false);
 
         const removed = await providerRegistry.deleteFileMetadata('backup', 'file-a');
 
         expect(removed).toBe(false);
         expect(mockRedis.decrBy).not.toHaveBeenCalled();
+        expect(mockRedis.sRem).not.toHaveBeenCalled();
     });
 
     it('decrements exactly once when two deletes race for the same file', async () => {
-        // Emulate Redis DEL semantics: only the first caller removes the key,
-        // and only that caller's decrement runs
+        // Emulate Redis DEL semantics: only the first caller removes the key
         let alreadyDeleted = false;
-        mockRedis.delAndDecrement.mockImplementation(async (_key: string, counterKey: string) => {
+        mockRedis.delIfPresent.mockImplementation(() => {
             if (alreadyDeleted) {
-                return false;
+                return Promise.resolve(false);
             }
             alreadyDeleted = true;
-            await mockRedis.decrBy(counterKey, 1);
-            return true;
+            return Promise.resolve(true);
         });
 
         const results = await Promise.all([
@@ -357,8 +487,17 @@ describe('providerRegistry.deleteFileMetadata (finding #24)', () => {
     });
 
     it('never fails a delete because the set bookkeeping failed', async () => {
-        mockRedis.delAndDecrement.mockResolvedValue(true);
+        mockRedis.delIfPresent.mockResolvedValue(true);
         mockRedis.sRem.mockRejectedValue(new Error('redis blip'));
+
+        expect(await providerRegistry.deleteFileMetadata('backup', 'file-a')).toBe(true);
+    });
+
+    it('never fails a delete because the counter update failed', async () => {
+        // The metadata hash is gone by then — the counter is explicitly
+        // best-effort, as it was before it moved behind this method
+        mockRedis.delIfPresent.mockResolvedValue(true);
+        mockRedis.decrBy.mockRejectedValue(new Error('redis blip'));
 
         expect(await providerRegistry.deleteFileMetadata('backup', 'file-a')).toBe(true);
     });

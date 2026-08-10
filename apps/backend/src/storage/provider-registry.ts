@@ -87,6 +87,9 @@ function filesKey(id: string): string {
     return `${PROVIDER_KEY_PREFIX}${id}:files`;
 }
 
+/** How many liveness probes / prunes to keep in flight per round-trip batch. */
+const LIVENESS_SWEEP_CHUNK = 256;
+
 // --- Secret encryption ---
 
 function getEncryptionKey(): Buffer | null {
@@ -586,9 +589,18 @@ export class ProviderRegistry {
      * counter. Files normally end their life by Redis TTL expiry, which no
      * listener observes, so the counter is only ever incremented in practice
      * and drifts upward forever — gating deletion on it eventually makes a
-     * provider permanently undeletable even with zero live files. Membership is
-     * checked against the actual metadata hashes here and expired ids are
-     * pruned, so the answer is exact and self-healing.
+     * provider permanently undeletable even with zero live files. Every member
+     * here is checked against the actual metadata hash and expired ids are
+     * pruned, so an id that has aged out is never counted and the set stays
+     * bounded by the live file population.
+     *
+     * The set is written by `trackFile` (from `storage.setField(id,
+     * 'providerId', ...)`, the single point where a file is pinned to a
+     * provider) and unwritten by `deleteFileMetadata`. Both are best-effort:
+     * a Redis blip on either can leave the count low, so treat this as a
+     * safety guard against deleting a provider that is obviously still in use,
+     * not as an exact inventory. It is deliberately biased toward
+     * under-counting — an over-count is what made providers undeletable.
      */
     async getFileCount(id: string): Promise<number> {
         const fileIds = await redis.sMembers(filesKey(id));
@@ -598,17 +610,26 @@ export class ProviderRegistry {
 
         const stale: string[] = [];
         let live = 0;
-        for (const fileId of fileIds) {
-            if (await redis.exists(fileId)) {
-                live++;
-            } else {
-                stale.push(fileId);
+
+        // Batched, not one sequential EXISTS per member: a provider with
+        // thousands of files would otherwise cost thousands of serial
+        // round-trips on an admin DELETE. Commands issued in the same tick are
+        // pipelined by the client, and the chunk bounds how many are in flight.
+        for (let i = 0; i < fileIds.length; i += LIVENESS_SWEEP_CHUNK) {
+            const chunk = fileIds.slice(i, i + LIVENESS_SWEEP_CHUNK);
+            const present = await Promise.all(chunk.map((fileId) => redis.exists(fileId)));
+            for (let j = 0; j < chunk.length; j++) {
+                if (present[j]) {
+                    live++;
+                } else {
+                    stale.push(chunk[j]);
+                }
             }
         }
 
-        if (stale.length > 0) {
-            // Prune ids whose metadata already expired so the set stays bounded
-            await redis.sRem(filesKey(id), ...stale);
+        // Prune ids whose metadata already expired so the set stays bounded
+        for (let i = 0; i < stale.length; i += LIVENESS_SWEEP_CHUNK) {
+            await redis.sRem(filesKey(id), ...stale.slice(i, i + LIVENESS_SWEEP_CHUNK));
         }
 
         return live;
@@ -670,14 +691,26 @@ export class ProviderRegistry {
     // --- File count tracking ---
 
     /**
-     * Record a new file on a provider. `fileId` is optional for backwards
-     * compatibility, but passing it is what makes `getFileCount` able to see
-     * TTL expiry — the raw counter alone can never shrink on its own.
+     * Record that `fileId` now lives on `providerId`. This is what makes
+     * `getFileCount` able to see TTL expiry — the raw counter alone can never
+     * shrink on its own. Called from `storage.setField` when a file's
+     * `providerId` is written, which is the one place every upload pins itself
+     * to a provider.
+     */
+    async trackFile(providerId: string, fileId: string): Promise<void> {
+        await redis.sAdd(filesKey(providerId), fileId);
+    }
+
+    /**
+     * Bump the raw upload counter for a provider and register the file in its
+     * live-file set. `fileId` is optional only so the counter can still be
+     * bumped by callers that do not have one; tracking does not depend on it
+     * (see `trackFile`).
      */
     async incrementFileCount(providerId: string, fileId?: string): Promise<void> {
         await redis.incrBy(filecountKey(providerId), 1);
         if (fileId) {
-            await redis.sAdd(filesKey(providerId), fileId);
+            await this.trackFile(providerId, fileId);
         }
     }
 
@@ -690,18 +723,33 @@ export class ProviderRegistry {
     }
 
     /**
-     * Delete a file's metadata hash and decrement this provider's counter in a
-     * single conditional operation, so only the caller that actually removed
-     * the key decrements. Also drops the id from the provider's live-file set
-     * (idempotent, and never fatal — bookkeeping must not fail a delete).
-     * Returns true when this call removed the key.
+     * Delete a file's metadata hash, then decrement this provider's counter
+     * and drop the id from its live-file set — but only when THIS call is the
+     * one that actually removed the key, so two concurrent deletes of the same
+     * file cannot each decrement.
+     *
+     * Both bookkeeping legs are non-fatal by design: the metadata hash is
+     * already gone once `delIfPresent` resolves, so failing the call here would
+     * report a failed delete for a delete that succeeded. A `DEL` failure does
+     * propagate. Returns true when this call removed the key.
      */
     async deleteFileMetadata(providerId: string, fileId: string): Promise<boolean> {
-        const removed = await redis.delAndDecrement(fileId, filecountKey(providerId));
+        const removed = await redis.delIfPresent(fileId);
+        if (!removed) {
+            return false;
+        }
+
+        await this.decrementFileCount(providerId).catch((err) => {
+            logger.warn(
+                { providerId, fileId, error: err },
+                'Failed to decrement provider file counter; count may drift',
+            );
+        });
         await redis.sRem(filesKey(providerId), fileId).catch(() => {
             // Non-critical — getFileCount prunes stale members on read
         });
-        return removed;
+
+        return true;
     }
 
     // --- Cleanup ---
