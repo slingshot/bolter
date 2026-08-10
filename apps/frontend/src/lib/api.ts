@@ -574,6 +574,44 @@ export interface UploadResult {
     url: string;
     ownerToken: string;
     duration: number;
+    /**
+     * Authoritative expiry from `/upload/complete` (audit #15).
+     *
+     * The server starts the metadata TTL at `/upload/url`, not at completion,
+     * so a long or resumed upload finishes with materially less lifetime left
+     * than `timeLimit` suggests. These are the server's own numbers; absent
+     * when talking to a backend that predates them, in which case callers fall
+     * back to an estimate anchored at upload start.
+     */
+    expiresAt?: number;
+    ttl?: number;
+}
+
+/** `/upload/complete` response fields this client consumes. */
+export interface CompleteResponse {
+    expiresAt?: number;
+    ttl?: number;
+}
+
+/**
+ * Read the authoritative lifetime from a `/upload/complete` response body,
+ * tolerating an older backend that does not send it (audit #15).
+ */
+export async function readCompletionLifetime(response: Response): Promise<CompleteResponse> {
+    try {
+        const body = (await response.json()) as CompleteResponse | null;
+        if (!body) {
+            return {};
+        }
+        return {
+            expiresAt: typeof body.expiresAt === 'number' ? body.expiresAt : undefined,
+            ttl: typeof body.ttl === 'number' ? body.ttl : undefined,
+        };
+    } catch {
+        // A completion that succeeded but returned an unreadable body must not
+        // fail the upload — the object is already finalized.
+        return {};
+    }
 }
 
 export interface UploadOptions {
@@ -606,6 +644,8 @@ interface UploadUrlResponse {
     multipart: boolean;
     id: string;
     owner: string;
+    /** Bearer credential authorizing abort/resume of THIS upload (audit #52). */
+    uploadToken?: string;
     uploadId?: string;
     parts?: PartInfo[];
     partSize?: number;
@@ -1281,6 +1321,7 @@ export async function uploadFiles(
                     fileId: uploadInfo.id,
                     uploadId: uploadInfo.uploadId || '',
                     ownerToken: uploadInfo.owner,
+                    uploadToken: uploadInfo.uploadToken,
                     fileName: files[0].name,
                     fileSize: files[0].size,
                     fileLastModified: files[0].lastModified,
@@ -1347,7 +1388,11 @@ export async function uploadFiles(
 
                 // Abort the multipart upload
                 if (uploadInfo.uploadId) {
-                    await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+                    await abortMultipartUpload(
+                        uploadInfo.id,
+                        uploadInfo.uploadId,
+                        uploadInfo.uploadToken,
+                    );
                 }
 
                 // Request a new single-part upload URL
@@ -1450,7 +1495,7 @@ export async function uploadFiles(
             throw err;
         }
 
-        await completeResponse.json();
+        const completionLifetime = await readCompletionLifetime(completeResponse);
         uploadSucceeded = true;
 
         // Clean up persisted upload state
@@ -1469,6 +1514,7 @@ export async function uploadFiles(
             url: downloadUrl,
             ownerToken: uploadInfo.owner,
             duration: Date.now() - startTime,
+            ...completionLifetime,
         };
     } finally {
         cleanupStatusPoll();
@@ -1488,7 +1534,11 @@ export async function uploadFiles(
         // part uploaders, so this must live here rather than on the happy path.
         if (canceller.cancelled && uploadInfo.multipart) {
             if (uploadInfo.uploadId) {
-                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+                await abortMultipartUpload(
+                    uploadInfo.id,
+                    uploadInfo.uploadId,
+                    uploadInfo.uploadToken,
+                );
             }
             deleteUploadState(uploadInfo.id).catch(() => {
                 // Intentionally ignored — best-effort cleanup
@@ -1501,7 +1551,11 @@ export async function uploadFiles(
             // Single-file uploads are left intact — their persisted state
             // powers the resume prompt on the next visit.
             if (uploadInfo.uploadId) {
-                await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+                await abortMultipartUpload(
+                    uploadInfo.id,
+                    uploadInfo.uploadId,
+                    uploadInfo.uploadToken,
+                );
             }
         } else if (!uploadSucceeded && !uploadInfo.multipart) {
             // Single-part uploads have no uploadId to abort and are never
@@ -1581,6 +1635,9 @@ export async function resumeUpload(
         body: JSON.stringify({
             uploadId: state.uploadId,
             completedPartNumbers: trulyCompletedParts.map((p) => p.PartNumber),
+            // Authorizes the re-signing of part URLs (audit #52). Absent for
+            // records persisted before v4, which the backend still accepts.
+            ...(state.uploadToken ? { uploadToken: state.uploadToken } : {}),
         }),
     });
 
@@ -1808,7 +1865,7 @@ export async function resumeUpload(
         throw new Error(`Failed to complete resumed upload: ${await completeResponse.text()}`);
     }
 
-    await completeResponse.json();
+    const completionLifetime = await readCompletionLifetime(completeResponse);
 
     // Clean up persisted state
     await deleteUploadState(state.fileId);
@@ -1820,6 +1877,10 @@ export async function resumeUpload(
         url: downloadUrl,
         ownerToken: state.ownerToken,
         duration: Date.now() - startTime,
+        // Resumed uploads are exactly the case #15 describes: the TTL started
+        // days ago at /upload/url, so the server's number is the only correct
+        // one here.
+        ...completionLifetime,
     };
 }
 
@@ -2933,13 +2994,25 @@ async function releaseUploadAllocation(id: string, ownerToken: string): Promise<
 /**
  * Abort a multipart upload
  */
-async function abortMultipartUpload(id: string, uploadId: string): Promise<void> {
+async function abortMultipartUpload(
+    id: string,
+    uploadId: string,
+    uploadToken?: string,
+): Promise<void> {
     try {
-        await fetch(`${API_BASE_URL}/upload/abort/${id}`, {
+        const response = await fetch(`${API_BASE_URL}/upload/abort/${id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ uploadId }),
+            // uploadToken authorizes the abort (audit #52). Omitted for records
+            // written before it was persisted; the backend accepts those.
+            body: JSON.stringify(uploadToken ? { uploadId, uploadToken } : { uploadId }),
         });
+        // A non-ok abort used to be swallowed, so a 500 left the server-side
+        // multipart orphaned while the client believed it had cleaned up.
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error(`Abort failed: HTTP ${response.status} ${detail}`.trim());
+        }
     } catch (e) {
         console.warn('Failed to abort multipart upload:', e);
         captureError(e, {

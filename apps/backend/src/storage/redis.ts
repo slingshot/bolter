@@ -144,6 +144,30 @@ export class RedisStorage {
         return client.hIncrBy(key, field, increment);
     }
 
+    /**
+     * EXISTS-guarded HINCRBY (audit #7, trigger 3).
+     *
+     * A bare HINCRBY *creates* the hash when the key is absent. Download
+     * counting reads metadata and then increments as two round trips, so a
+     * delete or a TTL expiry landing in between would recreate the key as an
+     * immortal `{dl:1}` hash — no TTL, no `owner` (undeletable), no
+     * `providerId` (mis-routed). Guarding the increment keeps the deletion
+     * final.
+     *
+     * @returns the new counter value, or `null` when the key no longer exists.
+     */
+    async hIncrByIfExists(key: string, field: string, increment: number): Promise<number | null> {
+        const client = await this.getClient();
+        const result = await client.eval(
+            "if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end return redis.call('HINCRBY', KEYS[1], ARGV[1], ARGV[2])",
+            {
+                keys: [key],
+                arguments: [field, String(increment)],
+            },
+        );
+        return typeof result === 'number' && result >= 0 ? result : null;
+    }
+
     async hSetMultiple(key: string, data: Record<string, string>): Promise<void> {
         const client = await this.getClient();
         await client.hSet(key, data);
