@@ -46,12 +46,14 @@ function stripControlCharacters(value: string): string {
  * are stripped before the name reaches the archive.
  */
 export function sanitizeZipEntryName(rawName: string, fallback = 'unnamed'): string {
+    // Strip every leading separator and Windows drive prefix in one pass —
+    // `C:`, `/C:`, and stacked forms like `C:C:/x`, which a fixed sequence of
+    // single replacements would leave a literal `C:` directory segment for.
+    // The alternation branches are single-character-ish and unambiguous, so
+    // there is no backtracking blowup on a long run of separators.
     const normalized = stripControlCharacters(rawName)
         .replace(/\\/g, '/')
-        // Strip any leading separators and a Windows drive prefix (`C:`, `/C:`)
-        .replace(/^\/+/, '')
-        .replace(/^[A-Za-z]:/, '')
-        .replace(/^\/+/, '');
+        .replace(/^(?:\/|[A-Za-z]:)+/, '');
 
     const segments = normalized
         .split('/')
@@ -120,6 +122,12 @@ export function createNameDeduplicator(): (rawName: string) => string {
 export const ZIP32_MAX_BYTES = 0xffffffff;
 
 /**
+ * Largest entry count representable in the 16-bit end-of-central-directory
+ * counters of a plain (non-ZIP64) zip archive.
+ */
+export const ZIP32_MAX_ENTRIES = 0xffff;
+
+/**
  * Upper-bound the size of a STORE-compressed archive: per entry a local file
  * header (30 bytes + name), a data descriptor (16 bytes) and a central
  * directory record (46 bytes + name), plus the 22-byte end-of-central-directory.
@@ -144,6 +152,15 @@ export function projectZipArchiveSize(entries: { name: string; size: number }[])
  * download credit is preserved.
  */
 export function assertZipFitsWithoutZip64(entries: { name: string; size: number }[]): void {
+    // The EOCD entry counters are 16-bit and wrap just as silently as the size
+    // fields. The uploader controls the metadata file list and the server does
+    // not cap it, so this is reachable from a hand-crafted /upload/complete.
+    if (entries.length > ZIP32_MAX_ENTRIES) {
+        throw new Error(
+            `Cannot build the zip: ${entries.length} files exceeds the ${ZIP32_MAX_ENTRIES}-entry limit of the zip format used here. Download the files individually instead.`,
+        );
+    }
+
     for (const entry of entries) {
         if (entry.size >= ZIP32_MAX_BYTES) {
             throw new Error(
@@ -341,6 +358,21 @@ export function createStreamingZip(
     // reach the per-file streams. dispose() is that missing link.
     const dispose = async (): Promise<void> => {
         await Promise.all(progressHandles.map((handle) => handle.cancel()));
+        // Drop the client-zip output too when nothing holds a lock on it (the
+        // consumer releases its reader on cancel), so the suspended generator
+        // is torn down rather than left for GC. Deliberately not awaited:
+        // dispose() runs on the upload's cancellation path and must never be
+        // able to hang it inside a third-party stream's cancel algorithm.
+        if (!stream.locked) {
+            try {
+                void stream.cancel().catch(() => {
+                    // Best-effort cleanup — an already errored stream is fine.
+                });
+            } catch {
+                // cancel() throws synchronously if the stream got locked in
+                // between; the per-file sources are already released.
+            }
+        }
     };
 
     return { stream, filename, estimatedSize, dispose };
@@ -357,6 +389,12 @@ interface ProgressStreamHandle {
  *
  * The source reader is acquired on the first pull rather than eagerly, so a
  * zip whose entries are never consumed leaves its source streams unlocked.
+ * The wrapper is built with `highWaterMark: 0` for that to mean anything: the
+ * default strategy (highWaterMark 1) makes a ReadableStream pull one chunk as
+ * soon as it is constructed, so every source would be read from — and locked —
+ * a microtask after `createStreamingZip` returned, no matter how lazy `pull`
+ * itself is. With a highWaterMark of 0, `pull` only runs once a consumer
+ * actually asks for bytes.
  */
 function createProgressStream(
     stream: ReadableStream<Uint8Array>,
@@ -379,27 +417,30 @@ function createProgressStream(
         }
     };
 
-    const progressStream = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-            if (cancelled) {
-                controller.close();
-                return;
-            }
-            if (!reader) {
-                reader = stream.getReader();
-            }
-            const { done, value } = await reader.read();
-            if (done) {
-                controller.close();
-                return;
-            }
-            onBytes(value.length);
-            controller.enqueue(value);
+    const progressStream = new ReadableStream<Uint8Array>(
+        {
+            async pull(controller) {
+                if (cancelled) {
+                    controller.close();
+                    return;
+                }
+                if (!reader) {
+                    reader = stream.getReader();
+                }
+                const { done, value } = await reader.read();
+                if (done) {
+                    controller.close();
+                    return;
+                }
+                onBytes(value.length);
+                controller.enqueue(value);
+            },
+            cancel(reason) {
+                return cancel(reason);
+            },
         },
-        cancel(reason) {
-            return cancel(reason);
-        },
-    });
+        { highWaterMark: 0 },
+    );
 
     return { stream: progressStream, cancel };
 }
@@ -536,6 +577,22 @@ export async function createZipFromFiles(fileSlices: FileSlice[]): Promise<Blob>
 }
 
 /**
+ * Flatten a derived archive filename to a single, separator-free path segment.
+ *
+ * The archive's own name is derived from the same uploader-controlled metadata
+ * as the entry names, and it ends up in a `download` attribute / Save dialog.
+ * Browsers do neutralize separators there, but deriving a clean name costs
+ * nothing and keeps the guarantee local to this module.
+ */
+function sanitizeArchiveBaseName(baseName: string): string {
+    const flattened = stripControlCharacters(baseName)
+        .replace(/[\\/]+/g, '_')
+        .trim();
+    // A base made only of separators or whitespace carries no information
+    return flattened.replace(/^_+|_+$/g, '') === '' ? 'download' : flattened;
+}
+
+/**
  * Generate a sensible zip filename from the list of files
  */
 export function generateZipFilename(files: FileInfo[]): string {
@@ -548,7 +605,7 @@ export function generateZipFilename(files: FileInfo[]): string {
         const name = files[0].name;
         const lastDot = name.lastIndexOf('.');
         const baseName = lastDot > 0 ? name.slice(0, lastDot) : name;
-        return `${baseName}.zip`;
+        return `${sanitizeArchiveBaseName(baseName)}.zip`;
     }
 
     // Find common prefix among filenames
@@ -557,7 +614,7 @@ export function generateZipFilename(files: FileInfo[]): string {
 
     if (commonPrefix.length >= 3) {
         // Use common prefix if it's meaningful (at least 3 chars)
-        return `${commonPrefix.replace(/[_\-\s]+$/, '')}.zip`;
+        return `${sanitizeArchiveBaseName(commonPrefix.replace(/[_\-\s]+$/, ''))}.zip`;
     }
 
     // Otherwise use generic name with file count

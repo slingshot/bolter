@@ -28,6 +28,7 @@ import {
     createZipFromUploadFiles,
     type FileInfo,
     generateZipFilename,
+    type StreamingZip,
     sliceConcatenatedBlob,
 } from './zip';
 
@@ -806,18 +807,22 @@ export async function uploadFiles(
     let zipFilename: string | null = null;
     let streamingZipStream: ReadableStream<Uint8Array> | null = null;
     let estimatedZipSize = 0;
+    // Retained (not destructured away) so the cancellation / terminal-failure
+    // paths can call dispose() — nothing else reaches the per-file source
+    // streams the zip is reading from.
+    let streamingZip: StreamingZip | null = null;
 
     if (isMultiFile) {
         if (useStreamingZip) {
             // Large files: use streaming zip to avoid memory issues
             // Progress will be reported during upload as bytes are processed
-            const streamingResult = createStreamingZip(files, (processed, total) => {
+            streamingZip = createStreamingZip(files, (processed, total) => {
                 // Report zipping progress as percentage
                 onZipProgress?.(Math.round((processed / total) * 100));
             });
-            streamingZipStream = streamingResult.stream;
-            zipFilename = streamingResult.filename;
-            estimatedZipSize = streamingResult.estimatedSize;
+            streamingZipStream = streamingZip.stream;
+            zipFilename = streamingZip.filename;
+            estimatedZipSize = streamingZip.estimatedSize;
         } else {
             // Small files: use buffered zip for compression benefits and exact sizing
             const zipResult = await createZipFromUploadFiles(files, onZipProgress);
@@ -877,42 +882,52 @@ export async function uploadFiles(
         stream = createFileStream(files, keychain, encrypted);
     }
 
-    // Run preflight speed test for multipart uploads to determine optimal part size.
-    // Single-part uploads (<100MB) don't need this since there's no part sizing decision.
-    let preferredPartSize: number | undefined;
-    if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
-        onSpeedTest?.('started');
-        console.log('[Upload] Running preflight speed test...');
-        const measuredSpeed = await measureUploadSpeed();
-        const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
-        preferredPartSize = getPreferredPartSize(measuredSpeed);
-        console.log(
-            `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
-        );
-        onSpeedTest?.('done', speedMbps);
-    }
+    // Everything below the zip construction must release the zip's per-file
+    // source streams on failure. The main upload has a finally block for that;
+    // this window (preflight + URL request) sits ahead of it, and `stream` is
+    // already being pumped by then, so it needs its own guard.
+    let uploadInfo: UploadUrlResponse;
+    try {
+        // Run preflight speed test for multipart uploads to determine optimal part size.
+        // Single-part uploads (<100MB) don't need this since there's no part sizing decision.
+        let preferredPartSize: number | undefined;
+        if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+            onSpeedTest?.('started');
+            console.log('[Upload] Running preflight speed test...');
+            const measuredSpeed = await measureUploadSpeed();
+            const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
+            preferredPartSize = getPreferredPartSize(measuredSpeed);
+            console.log(
+                `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+            );
+            onSpeedTest?.('done', speedMbps);
+        }
 
-    // Request upload URLs
-    const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            fileSize: totalSize,
-            encrypted,
-            timeLimit,
-            dlimit: downloadLimit,
-            preferredPartSize,
-        }),
-    });
+        // Request upload URLs
+        const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                fileSize: totalSize,
+                encrypted,
+                timeLimit,
+                dlimit: downloadLimit,
+                preferredPartSize,
+            }),
+        });
 
-    if (!uploadResponse.ok) {
-        throw new Error(`HTTP ${uploadResponse.status}`);
-    }
+        if (!uploadResponse.ok) {
+            throw new Error(`HTTP ${uploadResponse.status}`);
+        }
 
-    let uploadInfo: UploadUrlResponse = await uploadResponse.json();
+        uploadInfo = await uploadResponse.json();
 
-    if (!uploadInfo.useSignedUrl) {
-        throw new Error('Pre-signed URLs not available');
+        if (!uploadInfo.useSignedUrl) {
+            throw new Error('Pre-signed URLs not available');
+        }
+    } catch (e) {
+        await streamingZip?.dispose();
+        throw e;
     }
 
     // Track progress
@@ -1266,6 +1281,15 @@ export async function uploadFiles(
         };
     } finally {
         cleanupStatusPoll();
+        // Cancelled or terminally failed: release the streaming zip's per-file
+        // source streams. Neither client-zip's own cancel handler (a no-op for
+        // plain-Array entries) nor the reader.releaseLock() in
+        // uploadMultipartStream reaches them, so without this the readers of
+        // every already-started file stay locked and every remaining source
+        // stays open until GC.
+        if (!uploadSucceeded) {
+            await streamingZip?.dispose();
+        }
         // If cancelled, abort the server-side multipart upload (S3 parts +
         // Redis metadata would otherwise linger until TTL) and clean up
         // persisted state — the user intentionally cancelled, so don't offer

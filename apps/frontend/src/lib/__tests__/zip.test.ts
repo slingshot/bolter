@@ -7,9 +7,11 @@ import {
     createZipFromFiles,
     createZipFromUploadFiles,
     type FileSlice,
+    generateZipFilename,
     projectZipArchiveSize,
     sanitizeZipEntryName,
     ZIP32_MAX_BYTES,
+    ZIP32_MAX_ENTRIES,
 } from '@/lib/zip';
 
 const encoder = new TextEncoder();
@@ -146,6 +148,9 @@ describe('sanitizeZipEntryName (finding 33)', () => {
             'Windows/System32/evil.dll',
         );
         expect(sanitizeZipEntryName('C:evil.dll')).toBe('evil.dll');
+        // Stacked prefixes: a single strip pass leaves a literal `C:` segment
+        expect(sanitizeZipEntryName('C:C:/evil.dll')).toBe('evil.dll');
+        expect(sanitizeZipEntryName('/C:/D:/evil.dll')).toBe('evil.dll');
     });
 
     it('normalizes backslash separators and drops "." segments', () => {
@@ -245,6 +250,23 @@ describe('assertZipFitsWithoutZip64 (finding 22)', () => {
         ).toThrow(/exceeds the 4 GiB limit/);
     });
 
+    it('rejects more entries than the 16-bit EOCD counters can hold', () => {
+        // The uploader controls the metadata file list and the server does not
+        // cap it, so an over-long list is reachable — and JSZip would wrap the
+        // count silently, exactly like the size fields.
+        const entries = Array.from({ length: ZIP32_MAX_ENTRIES + 1 }, (_, i) => ({
+            name: `f${i}.txt`,
+            size: 1,
+        }));
+        expect(() => assertZipFitsWithoutZip64(entries)).toThrow(/entry limit/);
+
+        const atLimit = Array.from({ length: ZIP32_MAX_ENTRIES }, (_, i) => ({
+            name: `f${i}.txt`,
+            size: 1,
+        }));
+        expect(() => assertZipFitsWithoutZip64(atLimit)).not.toThrow();
+    });
+
     it('projects a plausible archive size', () => {
         // 22 (EOCD) + 30 + 5 (name) + 16 (descriptor) + 46 + 5 (name) + 100
         expect(projectZipArchiveSize([{ name: 'a.txt', size: 100 }])).toBe(
@@ -294,11 +316,18 @@ describe('createStreamingZip (findings 4, 33, 34)', () => {
         expect(Object.keys(await readStreamingZipEntries(stream))).toEqual(['home/user/.profile']);
     });
 
-    it('does not lock the per-file source streams at construction time', () => {
+    it('does not lock the per-file source streams at construction time', async () => {
         const a = instrumentedFile('a.txt', 'aaa');
         const b = instrumentedFile('b.txt', 'bbb');
 
         createStreamingZip([a.file, b.file]);
+
+        // Drain the microtask queue before asserting. A ReadableStream built
+        // with the default queuing strategy (highWaterMark 1) pulls one chunk
+        // as soon as it is constructed, so a synchronous assertion here would
+        // pass even with eagerly-acquired readers — the getReader() call just
+        // hadn't happened yet.
+        await new Promise((resolve) => setTimeout(resolve, 0));
 
         // Pre-fix, createProgressStream called getReader() eagerly for every
         // file, locking all source streams before a single byte was requested.
@@ -345,5 +374,33 @@ describe('createStreamingZip (findings 4, 33, 34)', () => {
         const zip = createStreamingZip([a.file]);
         await expect(zip.dispose()).resolves.toBeUndefined();
         await expect(zip.dispose()).resolves.toBeUndefined();
+    });
+});
+
+describe('generateZipFilename', () => {
+    it('keeps ordinary derived names intact', () => {
+        expect(
+            generateZipFilename([
+                { name: 'holiday-01.jpg', size: 1, type: 'image/jpeg' },
+                { name: 'holiday-02.jpg', size: 1, type: 'image/jpeg' },
+            ]),
+        ).toBe('holiday-0.zip');
+        expect(generateZipFilename([{ name: 'report.pdf', size: 1, type: '' }])).toBe('report.zip');
+        expect(
+            generateZipFilename([
+                { name: 'a.txt', size: 1, type: '' },
+                { name: 'b.txt', size: 1, type: '' },
+            ]),
+        ).toBe('files-2.zip');
+    });
+
+    it('flattens separators and control characters out of the derived name', () => {
+        // The archive name is derived from the same uploader-controlled
+        // metadata as the entry names and lands in a Save dialog.
+        expect(generateZipFilename([{ name: '../../etc/passwd.tar', size: 1, type: '' }])).toBe(
+            '.._.._etc_passwd.zip',
+        );
+        expect(generateZipFilename([{ name: 'a\u0000b.bin', size: 1, type: '' }])).toBe('ab.zip');
+        expect(generateZipFilename([{ name: '/', size: 1, type: '' }])).toBe('download.zip');
     });
 });
