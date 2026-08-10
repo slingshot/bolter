@@ -129,6 +129,66 @@ export function verifyUploadToken(provided: unknown, storedHash: string): boolea
     return timingSafeEqual(providedDigest, storedDigest);
 }
 
+/**
+ * Whether a stored upload token is *required* on abort/resume, or only verified
+ * and reported.
+ *
+ * The token is minted and stored unconditionally, but rejecting requests that
+ * lack it is opt-in for one release. The shipped client does not send
+ * `uploadToken` yet, and rejecting it outright regresses two documented
+ * behaviors for every upload created by a build that stores the hash:
+ *
+ *  - cancel: `abortMultipartUpload` does not check `response.ok`, so a 401 is
+ *    swallowed and reported as a successful cancel while the S3 multipart, the
+ *    metadata, and the provider file counter are all left behind;
+ *  - resume: any non-OK response makes the client `deleteUploadState()` and
+ *    throw "Upload session expired", destroying the IndexedDB resume state and
+ *    orphaning the multipart — resumability stops working entirely.
+ *
+ * So until the client sends the token, an unverified abort/resume is logged and
+ * allowed. Set `UPLOAD_TOKEN_ENFORCED=true` (after the client change ships) to
+ * turn the same check into a 401. Read per-request so the flag can be flipped
+ * without a code change.
+ */
+export function uploadTokenEnforced(): boolean {
+    return process.env.UPLOAD_TOKEN_ENFORCED === 'true';
+}
+
+/**
+ * Gate a mutation of an in-flight upload (abort / resume) on the upload token.
+ *
+ * Returns true when the request may proceed. Uploads created before the
+ * `uploadAuth` field existed have no stored hash and are always allowed, so
+ * in-flight uploads survive the deploy that introduces the token.
+ */
+async function authorizeUploadMutation(
+    id: string,
+    provided: unknown,
+    route: 'abort' | 'resume',
+    requestId: string,
+): Promise<boolean> {
+    const storedTokenHash = await storage.getField(id, 'uploadAuth');
+    if (!storedTokenHash) {
+        return true;
+    }
+    if (verifyUploadToken(provided, storedTokenHash)) {
+        return true;
+    }
+
+    // Never log the token itself — only whether one was supplied at all
+    const tokenPresent = typeof provided === 'string' && provided.length > 0;
+    if (!uploadTokenEnforced()) {
+        logger.warn(
+            { requestId, id, route, tokenPresent },
+            'Unauthorized upload mutation allowed — set UPLOAD_TOKEN_ENFORCED=true to reject',
+        );
+        return true;
+    }
+
+    logger.warn({ requestId, id, route, tokenPresent }, 'Rejected — invalid upload token');
+    return false;
+}
+
 // --- Speed-test rate limiting (#11) ---------------------------------------
 // `POST /upload/speedtest` is unauthenticated and each call mints 5 pre-signed
 // UploadPart URLs with no size constraint — an unbounded, repeatable write
@@ -1067,12 +1127,9 @@ export const uploadRoutes = new Elysia()
             const fileInfo = await storage.getMetadata(id);
 
             if (fileInfo) {
-                // Only the uploader may abort. Uploads created before this field
-                // existed have no stored hash — allow those so in-flight uploads
-                // survive the deploy that introduces the token.
-                const storedTokenHash = await storage.getField(id, 'uploadAuth');
-                if (storedTokenHash && !verifyUploadToken(uploadToken, storedTokenHash)) {
-                    logger.warn({ requestId, id }, 'Abort rejected — invalid upload token');
+                // Only the uploader may abort (enforced once UPLOAD_TOKEN_ENFORCED
+                // is on; logged-and-allowed until the client sends the token)
+                if (!(await authorizeUploadMutation(id, uploadToken, 'abort', requestId))) {
                     set.status = 401;
                     return { error: 'Invalid upload token' };
                 }
@@ -1112,7 +1169,7 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Abort multipart upload',
                 description:
-                    'Aborts an in-progress multipart upload, cleaning up uploaded parts from S3 and removing metadata from Redis. Requires the `uploadToken` issued by `/upload/url`.',
+                    'Aborts an in-progress multipart upload, cleaning up uploaded parts from S3 and removing metadata from Redis. Send the `uploadToken` issued by `/upload/url`; a missing or wrong token is logged and allowed until the deployment sets `UPLOAD_TOKEN_ENFORCED=true`, after which it is rejected with 401.',
             },
             body: t.Object({
                 uploadId: t.String(),
@@ -1157,10 +1214,10 @@ export const uploadRoutes = new Elysia()
             // Only the uploader may mint fresh pre-signed PUT URLs for the
             // unfinished parts — otherwise anyone holding a leaked uploadId
             // could inject bytes into the object before the uploader completes.
-            // Pre-token uploads (no stored hash) stay resumable across deploy.
-            const storedTokenHash = await storage.getField(id, 'uploadAuth');
-            if (storedTokenHash && !verifyUploadToken(uploadToken, storedTokenHash)) {
-                logger.warn({ requestId, id }, 'Resume rejected — invalid upload token');
+            // Enforced once UPLOAD_TOKEN_ENFORCED is on; until then an unverified
+            // resume is logged and allowed, because the client destroys its
+            // IndexedDB resume state on any non-OK response.
+            if (!(await authorizeUploadMutation(id, uploadToken, 'resume', requestId))) {
                 set.status = 401;
                 return { error: 'Invalid upload token' };
             }
@@ -1221,7 +1278,7 @@ export const uploadRoutes = new Elysia()
                 tags: ['Upload'],
                 summary: 'Resume multipart upload',
                 description:
-                    'Generates new pre-signed URLs for remaining parts of an interrupted multipart upload. Skips already-uploaded parts. Requires the `uploadToken` issued by `/upload/url`.',
+                    'Generates new pre-signed URLs for remaining parts of an interrupted multipart upload. Skips already-uploaded parts. Send the `uploadToken` issued by `/upload/url`; a missing or wrong token is logged and allowed until the deployment sets `UPLOAD_TOKEN_ENFORCED=true`, after which it is rejected with 401.',
             },
             body: t.Object({
                 uploadId: t.String(),

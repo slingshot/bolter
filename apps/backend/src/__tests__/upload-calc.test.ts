@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from 'bun:test';
+import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 
@@ -54,6 +54,7 @@ import {
     clampExpireSeconds,
     clientIp,
     FixedWindowRateLimiter,
+    uploadTokenEnforced,
     verifyUploadToken,
 } from '../routes/upload';
 
@@ -306,6 +307,39 @@ describe('verifyUploadToken', () => {
     it('should reject rather than throw on a malformed stored hash', () => {
         expect(verifyUploadToken(token, 'not-a-hash')).toBe(false);
         expect(verifyUploadToken(token, '')).toBe(false);
+    });
+});
+
+describe('uploadTokenEnforced', () => {
+    const previous = process.env.UPLOAD_TOKEN_ENFORCED;
+
+    afterEach(() => {
+        if (previous === undefined) {
+            delete process.env.UPLOAD_TOKEN_ENFORCED;
+        } else {
+            process.env.UPLOAD_TOKEN_ENFORCED = previous;
+        }
+    });
+
+    it('should default to off so the shipped client keeps aborting and resuming', () => {
+        delete process.env.UPLOAD_TOKEN_ENFORCED;
+        expect(uploadTokenEnforced()).toBe(false);
+    });
+
+    it('should only enforce on an exact "true"', () => {
+        for (const value of ['false', '1', 'yes', 'TRUE', '']) {
+            process.env.UPLOAD_TOKEN_ENFORCED = value;
+            expect(uploadTokenEnforced()).toBe(false);
+        }
+        process.env.UPLOAD_TOKEN_ENFORCED = 'true';
+        expect(uploadTokenEnforced()).toBe(true);
+    });
+
+    it('should be read per call so the flag can be flipped at runtime', () => {
+        process.env.UPLOAD_TOKEN_ENFORCED = 'true';
+        expect(uploadTokenEnforced()).toBe(true);
+        process.env.UPLOAD_TOKEN_ENFORCED = 'false';
+        expect(uploadTokenEnforced()).toBe(false);
     });
 });
 

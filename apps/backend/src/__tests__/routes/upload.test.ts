@@ -157,6 +157,25 @@ function reapRecords(): Record<string, unknown>[] {
 const UPLOAD_TOKEN = 'a'.repeat(32);
 const UPLOAD_TOKEN_HASH = createHash('sha256').update(UPLOAD_TOKEN).digest('hex');
 
+/**
+ * Run `fn` with the upload-token rollout flag forced on, then restore it.
+ * Unset (the default) means log-but-allow, so the shipped client — which does
+ * not send `uploadToken` yet — keeps working.
+ */
+async function withUploadTokenEnforced<T>(fn: () => T | Promise<T>): Promise<T> {
+    const previous = process.env.UPLOAD_TOKEN_ENFORCED;
+    process.env.UPLOAD_TOKEN_ENFORCED = 'true';
+    try {
+        return await fn();
+    } finally {
+        if (previous === undefined) {
+            delete process.env.UPLOAD_TOKEN_ENFORCED;
+        } else {
+            process.env.UPLOAD_TOKEN_ENFORCED = previous;
+        }
+    }
+}
+
 // Default metadata returned by getMetadata when a file "exists"
 function makeMetadata(overrides: Partial<FileMetadata> = {}): FileMetadata {
     return {
@@ -1256,11 +1275,16 @@ describe('POST /upload/abort/:id', () => {
         mockStorage.getField.mockResolvedValue(null);
         mockRedis.hDel.mockReset();
         mockRedis.hDel.mockResolvedValue(undefined);
+        loggedObjects.length = 0;
     });
 
     // --- #52: abort must be bound to the upload owner -----------------------
 
-    it('should reject an abort with no upload token when one is stored', async () => {
+    it('should still abort when the client sends no upload token (default rollout mode)', async () => {
+        // The shipped client posts exactly `{ uploadId }` and never checks
+        // response.ok, so a 401 here silently strands the S3 multipart, the
+        // metadata, and the provider file counter. Until the client sends the
+        // token, an unverified abort is logged and allowed.
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
         );
@@ -1271,28 +1295,68 @@ describe('POST /upload/abort/:id', () => {
             jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }),
         );
 
+        expect(res.status).toBe(200);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
+        expect(mockStorage.del.mock.calls.length).toBe(1);
+
+        // ...but the drop is observable, so the rollout can be verified before
+        // UPLOAD_TOKEN_ENFORCED is flipped on
+        const warned = loggedObjects.some((o) => o.route === 'abort' && o.tokenPresent === false);
+        expect(warned).toBe(true);
+    });
+
+    it('should reject an abort with no upload token once enforcement is on', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }));
+        });
+
         // A leaked uploadId alone must not let a third party kill the upload
         expect(res.status).toBe(401);
         expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
         expect(mockStorage.del.mock.calls.length).toBe(0);
     });
 
-    it('should reject an abort with the wrong upload token', async () => {
+    it('should reject an abort with the wrong upload token once enforcement is on', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/abort/abc123', {
+                    uploadId: 'mp-upload-id',
+                    uploadToken: 'b'.repeat(32),
+                }),
+            );
+        });
+
+        expect(res.status).toBe(401);
+        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('should never log the supplied upload token', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
         );
         mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
 
         const app = createApp();
-        const res = await app.handle(
+        await app.handle(
             jsonPost('/upload/abort/abc123', {
                 uploadId: 'mp-upload-id',
-                uploadToken: 'b'.repeat(32),
+                uploadToken: 'c'.repeat(32),
             }),
         );
 
-        expect(res.status).toBe(401);
-        expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(0);
+        expect(JSON.stringify(loggedObjects)).not.toContain('c'.repeat(32));
     });
 
     it('should accept an abort carrying the correct upload token', async () => {
@@ -1301,13 +1365,15 @@ describe('POST /upload/abort/:id', () => {
         );
         mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
 
-        const app = createApp();
-        const res = await app.handle(
-            jsonPost('/upload/abort/abc123', {
-                uploadId: 'mp-upload-id',
-                uploadToken: UPLOAD_TOKEN,
-            }),
-        );
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/abort/abc123', {
+                    uploadId: 'mp-upload-id',
+                    uploadToken: UPLOAD_TOKEN,
+                }),
+            );
+        });
 
         expect(res.status).toBe(200);
         expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
@@ -1330,16 +1396,16 @@ describe('POST /upload/abort/:id', () => {
 
     it('should still abort uploads created before upload tokens existed', async () => {
         // Backward compatibility: an in-flight upload from before the deploy has
-        // no stored hash, and must remain abortable
+        // no stored hash, and must remain abortable even with enforcement on
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ multipart: true, uploadId: 'mp-upload-id' }),
         );
         mockStorage.getField.mockResolvedValue(null);
 
-        const app = createApp();
-        const res = await app.handle(
-            jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }),
-        );
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(jsonPost('/upload/abort/abc123', { uploadId: 'mp-upload-id' }));
+        });
 
         expect(res.status).toBe(200);
         expect(mockStorage.abortMultipartUpload.mock.calls.length).toBe(1);
@@ -1398,13 +1464,18 @@ describe('POST /upload/multipart/:id/resume', () => {
         mockStorage.getSignedMultipartUploadUrl.mockResolvedValue(
             'https://s3.example.com/part?signed=true',
         );
+        loggedObjects.length = 0;
     });
 
     // --- #52: resume must be bound to the upload owner ----------------------
 
-    it('should reject a resume with no upload token when one is stored', async () => {
+    it('should still resume when the client sends no upload token (default rollout mode)', async () => {
+        // The shipped client posts exactly `{ uploadId, completedPartNumbers }`
+        // and treats ANY non-OK response as fatal: it deletes the IndexedDB
+        // resume state and throws "Upload session expired", orphaning the S3
+        // multipart. Rejecting by default would kill resumability outright.
         mockStorage.getMetadata.mockResolvedValue(
-            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 3 }),
         );
         mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
 
@@ -1416,26 +1487,52 @@ describe('POST /upload/multipart/:id/resume', () => {
             }),
         );
 
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.parts.length).toBe(2);
+
+        const warned = loggedObjects.some((o) => o.route === 'resume' && o.tokenPresent === false);
+        expect(warned).toBe(true);
+    });
+
+    it('should reject a resume with no upload token once enforcement is on', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
+        );
+        mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
+
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/multipart/abc123/resume', {
+                    uploadId: 'mp-upload-id',
+                    completedPartNumbers: [1],
+                }),
+            );
+        });
+
         // Otherwise a leaked uploadId mints fresh pre-signed PUT URLs for every
         // unfinished part — arbitrary bytes injected before the uploader completes
         expect(res.status).toBe(401);
         expect(mockStorage.getSignedMultipartUploadUrl.mock.calls.length).toBe(0);
     });
 
-    it('should reject a resume with the wrong upload token', async () => {
+    it('should reject a resume with the wrong upload token once enforcement is on', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 5 }),
         );
         mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
 
-        const app = createApp();
-        const res = await app.handle(
-            jsonPost('/upload/multipart/abc123/resume', {
-                uploadId: 'mp-upload-id',
-                uploadToken: 'b'.repeat(32),
-                completedPartNumbers: [],
-            }),
-        );
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/multipart/abc123/resume', {
+                    uploadId: 'mp-upload-id',
+                    uploadToken: 'b'.repeat(32),
+                    completedPartNumbers: [],
+                }),
+            );
+        });
 
         expect(res.status).toBe(401);
         expect(mockStorage.getSignedMultipartUploadUrl.mock.calls.length).toBe(0);
@@ -1447,14 +1544,16 @@ describe('POST /upload/multipart/:id/resume', () => {
         );
         mockStorage.getField.mockResolvedValue(UPLOAD_TOKEN_HASH);
 
-        const app = createApp();
-        const res = await app.handle(
-            jsonPost('/upload/multipart/abc123/resume', {
-                uploadId: 'mp-upload-id',
-                uploadToken: UPLOAD_TOKEN,
-                completedPartNumbers: [1],
-            }),
-        );
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/multipart/abc123/resume', {
+                    uploadId: 'mp-upload-id',
+                    uploadToken: UPLOAD_TOKEN,
+                    completedPartNumbers: [1],
+                }),
+            );
+        });
 
         expect(res.status).toBe(200);
         const body = await res.json();
@@ -1467,13 +1566,15 @@ describe('POST /upload/multipart/:id/resume', () => {
         );
         mockStorage.getField.mockResolvedValue(null);
 
-        const app = createApp();
-        const res = await app.handle(
-            jsonPost('/upload/multipart/abc123/resume', {
-                uploadId: 'mp-upload-id',
-                completedPartNumbers: [1, 2],
-            }),
-        );
+        const res = await withUploadTokenEnforced(() => {
+            const app = createApp();
+            return app.handle(
+                jsonPost('/upload/multipart/abc123/resume', {
+                    uploadId: 'mp-upload-id',
+                    completedPartNumbers: [1, 2],
+                }),
+            );
+        });
 
         expect(res.status).toBe(200);
     });
