@@ -16,6 +16,7 @@ const mockRedis = {
     exists: mock(() => Promise.resolve(false)),
     ttl: mock(() => Promise.resolve(-1)),
     hIncrBy: mock(() => Promise.resolve(0)),
+    capTTLAtDownloadLimit: mock(() => Promise.resolve(true)),
 };
 
 const mockStorage = {
@@ -113,7 +114,13 @@ mock.module('../../middleware/auth', () => ({
 // ---------------------------------------------------------------------------
 import { Elysia } from 'elysia';
 import { config } from '../../config';
-import { downloadRoutes, streamContentLength } from '../../routes/download';
+import {
+    clampDownloadLimit,
+    downloadRoutes,
+    LIMIT_GRACE_SECONDS,
+    OBJECT_CONTENT_LENGTH_HEADER,
+    streamContentLength,
+} from '../../routes/download';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -186,6 +193,10 @@ describe('GET /download/direct/:id', () => {
         mockStorage.setField.mockResolvedValue(undefined);
         mockStorage.getTTL.mockReset();
         mockStorage.getTTL.mockResolvedValue(86400);
+        mockRedis.expire.mockReset();
+        mockRedis.expire.mockResolvedValue(undefined);
+        mockRedis.capTTLAtDownloadLimit.mockReset();
+        mockRedis.capTTLAtDownloadLimit.mockResolvedValue(true);
     });
 
     it('should redirect (302) for unencrypted file', async () => {
@@ -259,14 +270,12 @@ describe('GET /download/direct/:id', () => {
     it('should cap metadata TTL as a backstop when scheduling deletion at the limit', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 9, dlimit: 10 }));
         mockStorage.incrementDownloadCount.mockResolvedValue(10);
-        mockRedis.expire.mockReset();
-        mockRedis.expire.mockResolvedValue(undefined);
 
         const app = createApp();
         const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
 
         expect(res.status).toBe(302);
-        expect(mockRedis.expire).toHaveBeenCalledWith('abc123', 300);
+        expect(mockRedis.capTTLAtDownloadLimit).toHaveBeenCalledWith('abc123', LIMIT_GRACE_SECONDS);
     });
 
     it('should return 410 when incremented counter exceeds limit', async () => {
@@ -282,50 +291,20 @@ describe('GET /download/direct/:id', () => {
         expect(body.error).toContain('Download limit reached');
     });
 
-    // --- #51: the TTL-cap chain must complete before the response returns ---
+    // --- #51: the TTL cap must not race an owner /params raise ---
 
-    it('should persist expiresAt and cap the TTL BEFORE responding at the limit', async () => {
+    it('should apply the cap in a single atomic step, not a read-then-write chain', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 9, dlimit: 10 }));
         mockStorage.incrementDownloadCount.mockResolvedValue(10);
-        mockRedis.expire.mockReset();
-        mockRedis.expire.mockResolvedValue(undefined);
-        // Give the TTL lookup a real (macrotask) latency so an un-awaited chain
-        // is demonstrably still pending when the handler returns
-        mockStorage.getTTL.mockReset();
-        mockStorage.getTTL.mockImplementation(
-            () => new Promise<number>((resolve) => setTimeout(() => resolve(86400), 5)),
-        );
 
         const app = createApp();
         const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
 
         expect(res.status).toBe(302);
-        // A /params raise racing this response must be able to observe
-        // expiresAt; pre-fix the chain was fire-and-forget and had not run yet,
-        // so /params skipped the TTL restore and the metadata expired at ~300s
-        // while the grace timer preserved the object (orphaning it in S3).
-        const expiresAtCalls = mockStorage.setField.mock.calls.filter(
-            (call: unknown[]) => call[0] === 'abc123' && call[1] === 'expiresAt',
-        );
-        expect(expiresAtCalls.length).toBe(1);
-        expect(parseInt(expiresAtCalls[0][2] as string, 10)).toBeGreaterThan(
-            Math.floor(Date.now() / 1000),
-        );
-        expect(mockRedis.expire).toHaveBeenCalledWith('abc123', 300);
-    });
-
-    it('should not cap the TTL when the natural expiry is already inside the grace window', async () => {
-        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 9, dlimit: 10 }));
-        mockStorage.incrementDownloadCount.mockResolvedValue(10);
-        mockRedis.expire.mockReset();
-        mockRedis.expire.mockResolvedValue(undefined);
-        mockStorage.getTTL.mockReset();
-        mockStorage.getTTL.mockResolvedValue(120);
-
-        const app = createApp();
-        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
-
-        expect(res.status).toBe(302);
+        expect(mockRedis.capTTLAtDownloadLimit.mock.calls.length).toBe(1);
+        // The client-side chain is what created the race window — the route
+        // must no longer read the TTL and write expiresAt/EXPIRE separately.
+        expect(mockStorage.getTTL.mock.calls.length).toBe(0);
         const expiresAtCalls = mockStorage.setField.mock.calls.filter(
             (call: unknown[]) => call[1] === 'expiresAt',
         );
@@ -333,16 +312,154 @@ describe('GET /download/direct/:id', () => {
         expect(mockRedis.expire).not.toHaveBeenCalled();
     });
 
-    it('should still respond 302 when the TTL-cap chain fails', async () => {
+    it('should still respond 302 when the TTL cap fails', async () => {
         mockStorage.getMetadata.mockResolvedValue(makeMetadata({ dl: 9, dlimit: 10 }));
         mockStorage.incrementDownloadCount.mockResolvedValue(10);
-        mockStorage.getTTL.mockReset();
-        mockStorage.getTTL.mockImplementation(() => Promise.reject(new Error('redis down')));
+        mockRedis.capTTLAtDownloadLimit.mockImplementationOnce(() =>
+            Promise.reject(new Error('redis down')),
+        );
 
         const app = createApp();
         const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
 
         expect(res.status).toBe(302);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #51 — the real race: an owner /params raise interleaved with the TTL cap
+//
+// Driven against an in-memory hash that behaves like the Redis key, so the
+// assertion is about the surviving TTL rather than about which calls were made.
+// The fake implements BOTH the atomic cap and the primitives the pre-fix
+// `getTTL -> setField('expiresAt') -> expire(300)` chain used, so reverting the
+// route to that chain makes these tests fail rather than error.
+// ---------------------------------------------------------------------------
+
+describe('GET /download/direct/:id + POST /params/:id (#51 interleave)', () => {
+    interface FakeKey {
+        fields: Record<string, string>;
+        ttl: number;
+    }
+
+    function installFake(key: FakeKey) {
+        const readMetadata = () =>
+            ({
+                ...makeMetadata(),
+                dl: parseInt(key.fields.dl, 10),
+                dlimit: parseInt(key.fields.dlimit, 10),
+            }) as FileMetadata;
+
+        mockStorage.getMetadata.mockReset();
+        mockStorage.getMetadata.mockImplementation(() => Promise.resolve(readMetadata()));
+        mockStorage.getField.mockReset();
+        mockStorage.getField.mockImplementation((_id: string, field: string) =>
+            Promise.resolve(key.fields[field] ?? null),
+        );
+        mockStorage.setField.mockReset();
+        mockStorage.setField.mockImplementation((_id: string, field: string, value: string) => {
+            key.fields[field] = value;
+            return Promise.resolve();
+        });
+        mockStorage.getTTL.mockReset();
+        mockStorage.getTTL.mockImplementation(() => Promise.resolve(key.ttl));
+        mockRedis.expire.mockReset();
+        mockRedis.expire.mockImplementation((_id: string, seconds: number) => {
+            key.ttl = seconds;
+            return Promise.resolve();
+        });
+        mockRedis.hDel.mockReset();
+        mockRedis.hDel.mockImplementation((_id: string, field: string) => {
+            delete key.fields[field];
+            return Promise.resolve();
+        });
+        // Same semantics as the Lua script: EXISTS -> re-read dl/dlimit ->
+        // TTL -> write expiresAt -> EXPIRE, all as one indivisible step.
+        mockRedis.capTTLAtDownloadLimit.mockReset();
+        mockRedis.capTTLAtDownloadLimit.mockImplementation((_id: string, grace: number) => {
+            const dl = parseInt(key.fields.dl, 10);
+            const dlimit = parseInt(key.fields.dlimit, 10);
+            if (dl < dlimit || key.ttl <= grace) {
+                return Promise.resolve(false);
+            }
+            key.fields.expiresAt = String(Math.floor(Date.now() / 1000) + key.ttl);
+            key.ttl = grace;
+            return Promise.resolve(true);
+        });
+        mockStorage.getSignedDownloadUrl.mockReset();
+        mockStorage.getSignedDownloadUrl.mockResolvedValue('https://s3.example.com/dl');
+        mockVerifyOwner.mockReset();
+        mockVerifyOwner.mockResolvedValue(true);
+    }
+
+    function raiseLimitTo(app: ReturnType<typeof createApp>, next: number) {
+        return app.handle(jsonPost('/params/abc123', { owner_token: 'owner-token', dlimit: next }));
+    }
+
+    it('leaves the TTL uncapped when the owner raise lands between the increment and the cap', async () => {
+        const key: FakeKey = { fields: { dl: '9', dlimit: '10' }, ttl: 86400 };
+        installFake(key);
+        const app = createApp();
+
+        // Land the owner's raise in exactly the window the audit describes:
+        // after incrementDownloadCount has committed dl >= dlimit, before the
+        // cap runs. Pre-fix this is where /params reads a null expiresAt, skips
+        // the TTL restore, and the chain caps the key to 300s anyway.
+        mockStorage.incrementDownloadCount.mockReset();
+        mockStorage.incrementDownloadCount.mockImplementation(async () => {
+            key.fields.dl = String(parseInt(key.fields.dl, 10) + 1);
+            const raised = await raiseLimitTo(app, 20);
+            expect(raised.status).toBe(200);
+            return parseInt(key.fields.dl, 10);
+        });
+
+        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
+        expect(res.status).toBe(302);
+
+        // The owner re-enabled the file, so its metadata must keep its natural
+        // expiry. Capped to the 300s grace window it would be dropped by Redis
+        // while the grace timer (dl < dlimit) preserves the S3 object —
+        // orphaning the object behind a 404 link.
+        expect(key.fields.dlimit).toBe('20');
+        expect(key.ttl).toBe(86400);
+    });
+
+    it('restores the original expiry when the owner raise lands after the cap', async () => {
+        const key: FakeKey = { fields: { dl: '9', dlimit: '10' }, ttl: 86400 };
+        installFake(key);
+        mockStorage.incrementDownloadCount.mockReset();
+        mockStorage.incrementDownloadCount.mockImplementation(() => {
+            key.fields.dl = String(parseInt(key.fields.dl, 10) + 1);
+            return Promise.resolve(parseInt(key.fields.dl, 10));
+        });
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
+        expect(res.status).toBe(302);
+        // Cap applied, original expiry preserved for /params to restore from
+        expect(key.ttl).toBe(LIMIT_GRACE_SECONDS);
+        expect(key.fields.expiresAt).toBeDefined();
+
+        expect((await raiseLimitTo(app, 20)).status).toBe(200);
+        expect(key.ttl).toBeGreaterThan(LIMIT_GRACE_SECONDS);
+    });
+
+    it('does not cap when the raise commits before the download reaches the limit', async () => {
+        const key: FakeKey = { fields: { dl: '9', dlimit: '10' }, ttl: 86400 };
+        installFake(key);
+        const app = createApp();
+
+        expect((await raiseLimitTo(app, 20)).status).toBe(200);
+        mockStorage.incrementDownloadCount.mockReset();
+        mockStorage.incrementDownloadCount.mockImplementation(() => {
+            key.fields.dl = String(parseInt(key.fields.dl, 10) + 1);
+            return Promise.resolve(parseInt(key.fields.dl, 10));
+        });
+
+        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
+        expect(res.status).toBe(302);
+        expect(key.ttl).toBe(86400);
+        expect(key.fields.expiresAt).toBeUndefined();
     });
 });
 
@@ -529,13 +646,14 @@ describe('GET /download/:id (stream)', () => {
         const res = await app.handle(new Request('http://localhost/download/abc123'));
 
         expect(res.status).toBe(200);
-        // Pre-fix the response was chunked with no Content-Length, so the
-        // client read contentLength === 0 and skipped its only hard truncation
-        // check — a severed transfer was saved as a complete file.
+        // Content-Length is emitted too, but Bun drops it for streamed bodies —
+        // the header the client can actually read is the custom one. See the
+        // wire-level round-trip test in download-stream-wire.test.ts.
         expect(res.headers.get('content-length')).toBe('3');
+        expect(res.headers.get(OBJECT_CONTENT_LENGTH_HEADER)).toBe('3');
     });
 
-    it('should emit Content-Length: 0 for a zero-byte object', async () => {
+    it('should emit a zero length for a zero-byte object', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ encrypted: false, dl: 0, dlimit: 10 }),
         );
@@ -545,10 +663,10 @@ describe('GET /download/:id (stream)', () => {
         const res = await app.handle(new Request('http://localhost/download/abc123'));
 
         expect(res.status).toBe(200);
-        expect(res.headers.get('content-length')).toBe('0');
+        expect(res.headers.get(OBJECT_CONTENT_LENGTH_HEADER)).toBe('0');
     });
 
-    it('should omit Content-Length when the storage layer reports no length', async () => {
+    it('should omit the length headers when the storage layer reports no length', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ encrypted: false, dl: 0, dlimit: 10 }),
         );
@@ -559,6 +677,7 @@ describe('GET /download/:id (stream)', () => {
 
         expect(res.status).toBe(200);
         expect(res.headers.get('content-length')).toBeNull();
+        expect(res.headers.get(OBJECT_CONTENT_LENGTH_HEADER)).toBeNull();
     });
 });
 
@@ -629,7 +748,7 @@ describe('GET /download/blob/:id', () => {
         expect(body.error).toContain('File not found');
     });
 
-    it('should emit Content-Length from the stream ContentLength tag (#39)', async () => {
+    it('should emit the object length from the stream ContentLength tag (#39)', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ encrypted: false, dl: 0, dlimit: 10 }),
         );
@@ -640,9 +759,10 @@ describe('GET /download/blob/:id', () => {
 
         expect(res.status).toBe(200);
         expect(res.headers.get('content-length')).toBe('4');
+        expect(res.headers.get(OBJECT_CONTENT_LENGTH_HEADER)).toBe('4');
     });
 
-    it('should omit Content-Length when the storage layer reports no length (#39)', async () => {
+    it('should omit the length headers when the storage layer reports no length (#39)', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({ encrypted: false, dl: 0, dlimit: 10 }),
         );
@@ -653,6 +773,7 @@ describe('GET /download/blob/:id', () => {
 
         expect(res.status).toBe(200);
         expect(res.headers.get('content-length')).toBeNull();
+        expect(res.headers.get(OBJECT_CONTENT_LENGTH_HEADER)).toBeNull();
     });
 });
 
@@ -665,6 +786,8 @@ describe('POST /download/complete/:id', () => {
         mockStorage.del.mockResolvedValue(undefined);
         mockStorage.getField.mockReset();
         mockStorage.getField.mockResolvedValue(null);
+        mockRedis.capTTLAtDownloadLimit.mockReset();
+        mockRedis.capTTLAtDownloadLimit.mockResolvedValue(true);
         mockVerifyAuth.mockReset();
         mockVerifyAuth.mockResolvedValue({ valid: true, nonce: 'test-nonce' });
     });
@@ -710,8 +833,10 @@ describe('POST /download/complete/:id', () => {
         expect(body.dlimit).toBe(10);
 
         expect(mockStorage.del.mock.calls.length).toBe(1);
-        // TTL backstop caps consumed metadata if the delete failed
-        expect(mockRedis.expire).toHaveBeenCalledWith('abc123', 300);
+        // TTL backstop caps consumed metadata if the delete failed. Uses the
+        // same atomic cap as the direct route so `expiresAt` is persisted for
+        // /params to restore from, and so a concurrent raise is respected.
+        expect(mockRedis.capTTLAtDownloadLimit).toHaveBeenCalledWith('abc123', LIMIT_GRACE_SECONDS);
     });
 
     it('should return 404 when file not found', async () => {
@@ -1311,5 +1436,51 @@ describe('POST /password/:id', () => {
 
         expect(res.status).toBe(400);
         expect(mockStorage.setField.mock.calls.length).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #5 — dlimit clamping. Lives beside the route that applies it rather than in a
+// shared helper module: /upload/url owns the other half of this finding and a
+// second agent must not have to coordinate on a common file.
+// ---------------------------------------------------------------------------
+
+describe('clampDownloadLimit (#5)', () => {
+    it('passes through an in-range positive integer', () => {
+        expect(clampDownloadLimit(5)).toBe(5);
+    });
+
+    it('clamps an over-max limit down to config.maxDownloads', () => {
+        expect(clampDownloadLimit(1_000_000_000)).toBe(config.maxDownloads);
+    });
+
+    it('clamps zero and negative limits up to 1 so a file is never insta-bricked', () => {
+        expect(clampDownloadLimit(0)).toBe(1);
+        expect(clampDownloadLimit(-1)).toBe(1);
+        expect(clampDownloadLimit(-1_000_000)).toBe(1);
+    });
+
+    it('truncates fractional limits to an integer', () => {
+        expect(clampDownloadLimit(3.9)).toBe(3);
+        expect(clampDownloadLimit(0.5)).toBe(1);
+    });
+
+    it('never produces a value that round-trips through Redis as exponential notation', () => {
+        // `String(1e21)` is '1e+21', which parseInt reads back as 1 — a
+        // single-use self-destruct. Clamping keeps the stored form decimal.
+        const stored = String(clampDownloadLimit(1e21));
+        expect(stored).not.toContain('e');
+        expect(parseInt(stored, 10)).toBe(clampDownloadLimit(1e21));
+    });
+
+    it('falls back to the configured default for non-finite input', () => {
+        expect(clampDownloadLimit(Number.NaN)).toBe(config.defaultDownloads);
+        expect(clampDownloadLimit(Number.POSITIVE_INFINITY)).toBe(config.defaultDownloads);
+    });
+
+    it('is idempotent', () => {
+        for (const value of [-5, 0, 1, 7, 1e12]) {
+            expect(clampDownloadLimit(clampDownloadLimit(value))).toBe(clampDownloadLimit(value));
+        }
     });
 });

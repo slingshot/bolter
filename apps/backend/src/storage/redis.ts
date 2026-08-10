@@ -177,6 +177,48 @@ export class RedisStorage {
         );
         return result === 1;
     }
+
+    /**
+     * Cap the metadata TTL to the limit-reached grace window, preserving the
+     * original expiry in `expiresAt` so `/params` can restore it on a raise.
+     *
+     * Everything happens in one script on purpose. Done as a client-side
+     * `TTL -> HSET expiresAt -> EXPIRE` chain (awaited or not), an owner's
+     * `/params` raise can land between the `dl >= dlimit` decision and the
+     * `expiresAt` write: `/params` writes the new `dlimit` first and only then
+     * reads `expiresAt`, so it sees null, skips the TTL restore, and the chain
+     * still caps the key to 300s. The grace timer then spares the object
+     * (`dl < dlimit`) while Redis drops the metadata — an orphaned object behind
+     * a 404 link. Re-reading `dl`/`dlimit` inside the same atomic step means a
+     * raise either commits first (no cap at all) or commits after (`expiresAt`
+     * is already there to restore from).
+     *
+     * Returns true when the cap was applied. No-ops (returning false) when the
+     * key is gone, when the limit is no longer reached, or when the natural TTL
+     * is already inside the grace window.
+     */
+    async capTTLAtDownloadLimit(key: string, graceSeconds: number): Promise<boolean> {
+        const client = await this.getClient();
+        const result = await client.eval(
+            [
+                "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end",
+                "local dl = tonumber(redis.call('HGET', KEYS[1], 'dl'))",
+                "local dlimit = tonumber(redis.call('HGET', KEYS[1], 'dlimit'))",
+                'if dl == nil or dlimit == nil or dl < dlimit then return 0 end',
+                'local grace = tonumber(ARGV[1])',
+                "local ttl = redis.call('TTL', KEYS[1])",
+                'if ttl <= grace then return 0 end',
+                "redis.call('HSET', KEYS[1], 'expiresAt', tostring(tonumber(ARGV[2]) + ttl))",
+                "redis.call('EXPIRE', KEYS[1], grace)",
+                'return 1',
+            ].join('\n'),
+            {
+                keys: [key],
+                arguments: [String(graceSeconds), String(Math.floor(Date.now() / 1000))],
+            },
+        );
+        return result === 1;
+    }
 }
 
 export const redis = new RedisStorage();

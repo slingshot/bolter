@@ -4,7 +4,7 @@ import { Elysia, t } from 'elysia';
 import { config } from './config';
 import { captureError } from './lib/sentry';
 import { logger } from './logger';
-import { downloadRoutes } from './routes/download';
+import { downloadRoutes, OBJECT_CONTENT_LENGTH_HEADER } from './routes/download';
 import { plausibleRoutes } from './routes/plausible';
 import { providerRoutes } from './routes/providers';
 import { uploadRoutes } from './routes/upload';
@@ -43,7 +43,11 @@ export const app = new Elysia()
             credentials: true,
             methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
             allowedHeaders: ['Content-Type', 'Authorization', 'baggage', 'sentry-trace'],
-            exposeHeaders: ['WWW-Authenticate'],
+            // X-Object-Content-Length carries the object size on the fallback
+            // stream routes (Bun drops Content-Length for streamed bodies) and
+            // is not CORS-safelisted, so it must be exposed explicitly or the
+            // client's truncation guard has nothing to compare against
+            exposeHeaders: ['WWW-Authenticate', OBJECT_CONTENT_LENGTH_HEADER],
         }),
     )
 

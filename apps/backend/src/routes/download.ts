@@ -1,16 +1,38 @@
 import { Elysia, t } from 'elysia';
-import { clampDownloadLimit } from '../lib/download-limit';
+import { config } from '../config';
 import { captureError } from '../lib/sentry';
 import { downloadLogger as logger } from '../logger';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
 import { storage } from '../storage';
 
+/** Grace window (seconds) a limit-reached file is kept before deletion. */
+export const LIMIT_GRACE_SECONDS = 300;
+
+/**
+ * Length of the object body, advertised on the fallback stream routes so the
+ * client's truncation guard has something to compare against.
+ *
+ * It is deliberately NOT `Content-Length`: Bun's HTTP layer serialises every
+ * `ReadableStream` body with `transfer-encoding: chunked` and silently drops an
+ * explicit `Content-Length`, whichever way it is set (`set.headers`, the
+ * `Response` constructor, a `direct` stream, an async generator — all verified
+ * against Bun 1.3.14). A custom header survives that serialisation, so this is
+ * the only length the client can actually read on the fallback path.
+ *
+ * `Content-Length` is still emitted alongside it: it costs nothing, it is
+ * correct in-process and behind any proxy that re-frames the body, and it keeps
+ * the response self-describing if Bun ever stops stripping it.
+ *
+ * Must stay in the CORS `exposeHeaders` list (`app.ts`) — unlike
+ * `Content-Length` it is not CORS-safelisted, so a cross-origin client cannot
+ * read it otherwise.
+ */
+export const OBJECT_CONTENT_LENGTH_HEADER = 'X-Object-Content-Length';
+
 /**
  * `S3Storage.getStream` tags the stream it returns with the object's
  * `ContentLength`; the storage facade passes the object straight through, so
- * read the tag defensively here. Emitting `Content-Length` on the fallback
- * stream routes is what lets the client's truncation guard fire — a chunked
- * response reports `contentLength === 0` and the guard is skipped.
+ * read the tag defensively here.
  */
 export function streamContentLength(stream: ReadableStream<Uint8Array>): number | undefined {
     const { contentLength } = stream as ReadableStream<Uint8Array> & { contentLength?: unknown };
@@ -20,16 +42,66 @@ export function streamContentLength(stream: ReadableStream<Uint8Array>): number 
 }
 
 /**
+ * Wrap an object stream in the response the fallback download routes return.
+ *
+ * A bare `ReadableStream` must never be returned from an Elysia handler: it is
+ * routed through `handleStream`, which `JSON.stringify`s each `Uint8Array`
+ * chunk — a 262,144-byte object comes back as ~2.5 MB of `{"0":7,"1":7,…}` text
+ * with `content-type: application/octet-stream, text/plain`. Returning an
+ * explicit `Response` keeps the body binary.
+ */
+export function objectStreamResponse(stream: ReadableStream<Uint8Array>): Response {
+    const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
+    const contentLength = streamContentLength(stream);
+    if (contentLength !== undefined) {
+        headers['Content-Length'] = String(contentLength);
+        headers[OBJECT_CONTENT_LENGTH_HEADER] = String(contentLength);
+    }
+    return new Response(stream, { status: 200, headers });
+}
+
+/**
+ * Clamp a client-supplied download limit to a usable positive integer within
+ * the deployment's `MAX_DOWNLOADS`.
+ *
+ * Stored verbatim, a hostile `dlimit` breaks every `dl >= dlimit` gate: a huge
+ * value makes the limit unreachable (unlimited egress), a negative or zero
+ * value bricks the file instantly, and a float round-trips through Redis as an
+ * exponential string that `parseInt` reads back as a different number
+ * (`1e21` -> `'1e+21'` -> `1`). Truncating and clamping keeps the stored value
+ * a small decimal integer that always survives the round-trip.
+ */
+export function clampDownloadLimit(dlimit: number): number {
+    if (!Number.isFinite(dlimit)) {
+        return config.defaultDownloads;
+    }
+    return Math.min(Math.max(Math.trunc(dlimit), 1), config.maxDownloads);
+}
+
+/**
  * Schedule deletion of a limit-reached file after a 5-minute grace window.
  * The timer re-checks the limit at fire time (the owner may have raised
  * dlimit via /params meanwhile). As a restart-surviving backstop the metadata
  * TTL is capped to the same window, preserving the original expiry in an
  * `expiresAt` field so /params can restore it.
  *
- * The TTL-cap chain is awaited before the caller responds: if `expiresAt` were
- * written lazily, a `/params` raise landing in that window would read a null
- * `expiresAt`, skip the TTL restore, and let the metadata expire at ~300s while
- * the grace timer preserves the object — orphaning it in the bucket.
+ * The cap is a single atomic Redis script rather than a
+ * `getTTL -> setField -> expire` chain, because the chain races the owner's
+ * `/params` raise no matter whether it is awaited: `/params` writes the new
+ * `dlimit` and only then reads `expiresAt`, so a raise landing inside the chain
+ * reads a null `expiresAt`, skips the TTL restore, and the chain proceeds to
+ * cap the metadata to 300s anyway. At T+300s the grace timer sees `dl < dlimit`
+ * and keeps the object while Redis drops the metadata — the object is orphaned
+ * in the bucket behind a 404 link.
+ *
+ * Doing the `dl >= dlimit` re-check, the `expiresAt` write and the `EXPIRE` in
+ * one atomic step closes that window in both directions:
+ *   - raise commits before the script -> the script observes `dl < dlimit` and
+ *     does not cap at all, so there is nothing to restore;
+ *   - raise commits after the script  -> `expiresAt` is already persisted, so
+ *     `/params` restores the original TTL.
+ * It also collapses the added latency on the hot download path to one round
+ * trip.
  */
 async function scheduleLimitDeletion(id: string): Promise<void> {
     setTimeout(() => {
@@ -48,16 +120,17 @@ async function scheduleLimitDeletion(id: string): Promise<void> {
                     level: 'warning',
                 });
             });
-    }, 300000); // 5 min delay
+    }, LIMIT_GRACE_SECONDS * 1000); // 5 min delay
 
     try {
-        const ttl = await storage.getTTL(id);
-        if (ttl > 300) {
-            await storage.setField(id, 'expiresAt', String(Math.floor(Date.now() / 1000) + ttl));
-            await storage.redis.expire(id, 300);
-        }
-    } catch {
+        await storage.redis.capTTLAtDownloadLimit(id, LIMIT_GRACE_SECONDS);
+    } catch (e) {
         // Non-critical — natural TTL still applies
+        captureError(e, {
+            operation: 'download.cap-ttl',
+            extra: { id },
+            level: 'warning',
+        });
     }
 }
 
@@ -301,12 +374,7 @@ export const downloadRoutes = new Elysia()
                 return { error: 'File not found' };
             }
 
-            set.headers['Content-Type'] = 'application/octet-stream';
-            const contentLength = streamContentLength(stream);
-            if (contentLength !== undefined) {
-                set.headers['Content-Length'] = String(contentLength);
-            }
-            return stream;
+            return objectStreamResponse(stream);
         },
         {
             detail: {
@@ -352,12 +420,7 @@ export const downloadRoutes = new Elysia()
                 return { error: 'File not found' };
             }
 
-            set.headers['Content-Type'] = 'application/octet-stream';
-            const contentLength = streamContentLength(stream);
-            if (contentLength !== undefined) {
-                set.headers['Content-Length'] = String(contentLength);
-            }
-            return stream;
+            return objectStreamResponse(stream);
         },
         {
             detail: {
@@ -415,8 +478,12 @@ export const downloadRoutes = new Elysia()
                     });
                 }
                 // Backstop: if the delete failed, cap the metadata TTL so
-                // consumed metadata cannot outlive the failure by days
-                storage.redis.expire(id, 300).catch(() => {
+                // consumed metadata cannot outlive the failure by days. Same
+                // atomic cap the direct route uses — a bare EXPIRE would leave
+                // no `expiresAt` for /params to restore from, and would cap even
+                // if the owner raised dlimit in the meantime (a no-op once the
+                // delete succeeded, since the key is gone).
+                await storage.redis.capTTLAtDownloadLimit(id, LIMIT_GRACE_SECONDS).catch(() => {
                     // Non-critical — natural TTL still applies
                 });
                 return { deleted: true, dl: newDl, dlimit };
