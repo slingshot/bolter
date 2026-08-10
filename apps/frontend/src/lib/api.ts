@@ -17,7 +17,9 @@ import {
 import { FileReadError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
 import {
+    computeContentFingerprint,
     deleteUploadState,
+    discardUploadState,
     type PersistedUpload,
     saveUploadState,
     updateCompletedPart,
@@ -54,13 +56,58 @@ const DOWNLOAD_STALL_TIMEOUT = 60_000; // Abort download attempt if no bytes for
 const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
 const SPEEDTEST_TIMEOUT = 10_000; // Run for up to 10 seconds
 
-function waitForOnline(): Promise<void> {
-    if (navigator.onLine) {
+/**
+ * Wait until the browser reports connectivity again.
+ *
+ * Races the `online` event against cancellation: without that, cancelling while
+ * offline leaves the retry awaiting an event that may never arrive, so
+ * `allDonePromise` never resolves, `uploadFiles` never settles and the UI stays
+ * stuck in "uploading" with no server-side cleanup.
+ */
+function waitForOnline(canceller?: Canceller): Promise<void> {
+    if (navigator.onLine || canceller?.cancelled) {
         return Promise.resolve();
     }
     console.log('[Upload] Offline — waiting for connection...');
     return new Promise((resolve) => {
-        window.addEventListener('online', () => resolve(), { once: true });
+        let settled = false;
+        let unsubscribe: (() => void) | undefined;
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            window.removeEventListener('online', finish);
+            unsubscribe?.();
+            resolve();
+        };
+        window.addEventListener('online', finish);
+        unsubscribe = canceller?.onCancel(finish);
+    });
+}
+
+/**
+ * Sleep that resolves early when the upload is cancelled, so a cancel during a
+ * retry backoff doesn't leave the UI frozen for up to MAX_RETRY_DELAY.
+ */
+function cancellableDelay(ms: number, canceller?: Canceller): Promise<void> {
+    if (canceller?.cancelled) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        let unsubscribe: (() => void) | undefined;
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            unsubscribe?.();
+            resolve();
+        };
+        const timer = setTimeout(finish, ms);
+        unsubscribe = canceller?.onCancel(finish);
     });
 }
 
@@ -71,9 +118,12 @@ function waitForOnline(): Promise<void> {
  * path and concurrency to give a realistic speed reading.
  * Returns measured speed in bytes/second, or 0 on failure.
  */
-async function measureUploadSpeed(): Promise<number> {
+async function measureUploadSpeed(canceller?: Canceller): Promise<number> {
     let testId: string | null = null;
     let uploadId: string | null = null;
+    if (canceller?.cancelled) {
+        return 0;
+    }
     try {
         // Get pre-signed S3 URLs for a multipart speed test
         const res = await fetch(`${API_BASE_URL}/upload/speedtest`, { method: 'POST' });
@@ -96,23 +146,29 @@ async function measureUploadSpeed(): Promise<number> {
         let settled = false;
 
         const speed = await new Promise<number>((resolve) => {
+            let unsubscribeCancel: (() => void) | undefined;
             const finish = () => {
                 if (settled) {
                     return;
                 }
                 settled = true;
+                unsubscribeCancel?.();
                 const totalBytes = partBytes.reduce((a, b) => a + b, 0);
                 const elapsed = (Date.now() - startTime) / 1000;
                 resolve(elapsed > 0 ? totalBytes / elapsed : 0);
             };
 
-            // Abort all XHRs after timeout
-            const timeout = setTimeout(() => {
+            const abortAll = () => {
                 for (const xhr of xhrs) {
                     if (xhr.readyState !== XMLHttpRequest.DONE) {
                         xhr.abort();
                     }
                 }
+            };
+
+            // Abort all XHRs after timeout
+            const timeout = setTimeout(() => {
+                abortAll();
                 finish();
             }, SPEEDTEST_TIMEOUT);
 
@@ -121,6 +177,9 @@ async function measureUploadSpeed(): Promise<number> {
             for (let i = 0; i < data.parts.length; i++) {
                 const xhr = new XMLHttpRequest();
                 xhrs.push(xhr);
+                // Registered so Cancel during "Checking speed…" actually stops
+                // the test instead of pushing up to 500MB of throwaway data
+                canceller?.addXhr(xhr);
 
                 xhr.upload.addEventListener('progress', (e) => {
                     if (e.lengthComputable) {
@@ -133,6 +192,7 @@ async function measureUploadSpeed(): Promise<number> {
                 // failed parts and finish() early while other parts are still
                 // in flight (leaving them running unmeasured and unaborted).
                 xhr.addEventListener('loadend', () => {
+                    canceller?.removeXhr(xhr);
                     if (xhr.status >= 200 && xhr.status < 300) {
                         partBytes[i] = SPEEDTEST_PART_SIZE;
                     }
@@ -147,6 +207,14 @@ async function measureUploadSpeed(): Promise<number> {
                 xhr.open('PUT', data.parts[i].url);
                 xhr.send(blob);
             }
+
+            // Cancel may land after the XHRs were registered but before any of
+            // them reaches a terminal state — stop waiting immediately.
+            unsubscribeCancel = canceller?.onCancel(() => {
+                clearTimeout(timeout);
+                abortAll();
+                finish();
+            });
         });
 
         return speed;
@@ -227,9 +295,36 @@ async function uploadMultipartSliced(
         resolveAllDone = resolve;
     });
     let totalPartsFinished = 0;
-    const totalPartsQueued = parts.length;
+    // Counted per part actually pushed, not `parts.length`: a skipped empty
+    // slice would otherwise leave finished permanently below queued and
+    // `allDonePromise` would never resolve (deadlock with no error).
+    let totalPartsQueued = 0;
+    let queueSealed = false;
+    // First permanent part failure. The upload can no longer complete, so every
+    // remaining part is wasted bandwidth — stop starting new ones.
+    let fatalPartError: Error | null = null;
+
+    const markPartFinished = (): void => {
+        totalPartsFinished++;
+        if (queueSealed && totalPartsFinished >= totalPartsQueued) {
+            resolveAllDone();
+        }
+    };
+
+    // Drop every not-yet-started part, still counting it as finished so the
+    // completion promise resolves and uploadFiles actually settles.
+    const drainPendingQueue = (): void => {
+        while (pendingQueue.length > 0) {
+            pendingQueue.shift();
+            markPartFinished();
+        }
+    };
 
     const processQueue = (): void => {
+        if (canceller.cancelled || fatalPartError) {
+            drainPendingQueue();
+            return;
+        }
         while (pendingQueue.length > 0 && activeUploads < maxConcurrent) {
             const item = pendingQueue.shift();
             if (!item) {
@@ -246,6 +341,9 @@ async function uploadMultipartSliced(
         partUrl: string,
     ): Promise<void> => {
         try {
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
             const result = await uploadPartWithRetry(
                 partBlob,
                 partUrl,
@@ -296,12 +394,12 @@ async function uploadMultipartSliced(
             });
             partErrors[partNum] = { error: message, size: partBlob.size };
             failedPartNumbers.push(partNum);
+            if (!canceller.cancelled && !fatalPartError) {
+                fatalPartError = error instanceof Error ? error : new Error(message);
+            }
         } finally {
             activeUploads--;
-            totalPartsFinished++;
-            if (totalPartsFinished === totalPartsQueued) {
-                resolveAllDone();
-            }
+            markPartFinished();
             processQueue();
         }
     };
@@ -316,16 +414,34 @@ async function uploadMultipartSliced(
         // Skip empty slices (shouldn't happen, but defensive)
         if (partBlob.size === 0) {
             console.warn(`[Upload] Skipping empty slice for part ${part.partNumber}`);
+            captureError(new Error(`Skipped empty slice for part ${part.partNumber}`), {
+                operation: 'upload.empty-slice.sliced',
+                extra: {
+                    partNumber: part.partNumber,
+                    partSize,
+                    fileSize: file.size,
+                    totalParts: parts.length,
+                },
+                level: 'warning',
+            });
             continue;
         }
 
+        totalPartsQueued++;
         pendingQueue.push({ blob: partBlob, partNum: part.partNumber, url: part.url });
     }
 
+    // No more parts will be added — resolveAllDone() may now fire.
+    queueSealed = true;
+
     processQueue();
 
-    if (totalPartsQueued > 0) {
+    if (totalPartsQueued > 0 && totalPartsFinished < totalPartsQueued) {
         await allDonePromise;
+    }
+
+    if (canceller.cancelled) {
+        throw new Error('Upload cancelled');
     }
 
     if (failedPartNumbers.length > 0) {
@@ -492,6 +608,7 @@ interface UploadUrlResponse {
 export class Canceller {
     cancelled = false;
     private xhrs: XMLHttpRequest[] = [];
+    private listeners: Array<() => void> = [];
 
     cancel() {
         this.cancelled = true;
@@ -503,6 +620,37 @@ export class Canceller {
                 xhr.abort();
             }
         }
+        // Wake anything parked on a non-XHR wait (offline wait, retry backoff).
+        const listeners = [...this.listeners];
+        this.listeners = [];
+        for (const listener of listeners) {
+            try {
+                listener();
+            } catch (e) {
+                console.warn('[Upload] Cancel listener threw:', e);
+            }
+        }
+    }
+
+    /**
+     * Register a callback fired once when the upload is cancelled. Returns an
+     * unsubscribe function. Fires immediately if cancellation already happened,
+     * so there is no window where a waiter can be registered too late.
+     */
+    onCancel(listener: () => void): () => void {
+        if (this.cancelled) {
+            listener();
+            return () => {
+                /* already fired */
+            };
+        }
+        this.listeners.push(listener);
+        return () => {
+            const index = this.listeners.indexOf(listener);
+            if (index > -1) {
+                this.listeners.splice(index, 1);
+            }
+        };
     }
 
     addXhr(xhr: XMLHttpRequest) {
@@ -883,13 +1031,19 @@ export async function uploadFiles(
     if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
         onSpeedTest?.('started');
         console.log('[Upload] Running preflight speed test...');
-        const measuredSpeed = await measureUploadSpeed();
+        const measuredSpeed = await measureUploadSpeed(canceller);
         const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
         preferredPartSize = getPreferredPartSize(measuredSpeed);
         console.log(
             `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
         );
         onSpeedTest?.('done', speedMbps);
+    }
+
+    // Cancelling during "Checking speed…" must stop here — otherwise the
+    // server-side multipart + metadata get created for an upload nobody wants
+    if (canceller.cancelled) {
+        throw new Error('Upload cancelled');
     }
 
     // Request upload URLs
@@ -1066,6 +1220,13 @@ export async function uploadFiles(
     let uploadSucceeded = false;
 
     try {
+        // A cancel that landed while /upload/url was in flight: the server-side
+        // multipart and metadata now exist, so throw from inside the try and let
+        // the finally abort them.
+        if (canceller.cancelled) {
+            throw new Error('Upload cancelled');
+        }
+
         if (uploadInfo.multipart && uploadInfo.parts) {
             // Only persist resumability state for single-file uploads.
             // Multi-file uploads create a streaming zip that can't be
@@ -1080,6 +1241,16 @@ export async function uploadFiles(
                           ECE_ENCRYPTED_RECORD_SIZE) *
                       ECE_RECORD_SIZE
                     : uploadInfo.partSize || 0;
+                // Content fingerprint so a resume can prove the re-selected file
+                // is the same file — (name, size, mtime) is not an identity and
+                // a same-tuple different file would be spliced onto the prefix.
+                let contentFingerprint: string | undefined;
+                try {
+                    contentFingerprint = await computeContentFingerprint(files[0]);
+                } catch (e) {
+                    console.warn('[Upload] Failed to fingerprint file for resume:', e);
+                }
+
                 const persistState: PersistedUpload = {
                     fileId: uploadInfo.id,
                     uploadId: uploadInfo.uploadId || '',
@@ -1087,6 +1258,7 @@ export async function uploadFiles(
                     fileName: files[0].name,
                     fileSize: files[0].size,
                     fileLastModified: files[0].lastModified,
+                    contentFingerprint,
                     encrypted,
                     partSize: uploadInfo.partSize || 0,
                     plaintextPartSize,
@@ -1183,11 +1355,15 @@ export async function uploadFiles(
                 // Use the new file ID and owner from the fallback response
                 uploadInfo = fallbackInfo;
 
-                uploadResult = await uploadSinglePart(
+                uploadResult = await uploadSinglePartWithRetry(
                     multipartResult.fallbackBlob,
                     fallbackInfo.url,
                     (loaded) => updateProgress(1, loaded),
                     canceller,
+                    () => {
+                        totalRetryCount++;
+                        updateProgress(1, partProgress[1] ?? 0);
+                    },
                 );
             } else {
                 uploadResult = multipartResult;
@@ -1195,11 +1371,15 @@ export async function uploadFiles(
         } else {
             // Single part upload
             const blob = await new Response(stream).blob();
-            uploadResult = await uploadSinglePart(
+            uploadResult = await uploadSinglePartWithRetry(
                 blob,
                 uploadInfo.url,
                 (loaded) => updateProgress(1, loaded),
                 canceller,
+                () => {
+                    totalRetryCount++;
+                    updateProgress(1, partProgress[1] ?? 0);
+                },
             );
         }
 
@@ -1288,6 +1468,12 @@ export async function uploadFiles(
             if (uploadInfo.uploadId) {
                 await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
             }
+        } else if (!uploadSucceeded && !uploadInfo.multipart) {
+            // Single-part uploads have no uploadId to abort and are never
+            // persisted for resume, so a terminal failure (or a cancel) would
+            // otherwise strand the /upload/url metadata and the provider file
+            // counter until TTL. Release the allocation explicitly.
+            await releaseUploadAllocation(uploadInfo.id, uploadInfo.owner);
         }
     }
 }
@@ -1335,6 +1521,24 @@ export async function resumeUpload(
         : state.plaintextPartSize || state.partSize;
     const skipBytes = contiguousCount * plaintextPartSize;
 
+    // Verify the selected file really is the one whose prefix was uploaded.
+    // (name, size, mtime) is not an identity: a different file with the same
+    // tuple would be spliced tail-onto-prefix, and because the key and ECE
+    // record counter are reused the hybrid decrypts cleanly into a corrupt file.
+    if (contiguousCount > 0) {
+        if (!state.contentFingerprint) {
+            throw new Error(
+                'This interrupted upload was saved by an older version and cannot be safely resumed. Please start a new upload.',
+            );
+        }
+        const fingerprint = await computeContentFingerprint(file);
+        if (fingerprint !== state.contentFingerprint) {
+            throw new Error(
+                'The selected file does not match the interrupted upload. Please choose the original file or start a new upload.',
+            );
+        }
+    }
+
     // Request new pre-signed URLs for remaining parts
     const resumeResponse = await fetch(`${API_BASE_URL}/upload/multipart/${state.fileId}/resume`, {
         method: 'POST',
@@ -1346,9 +1550,19 @@ export async function resumeUpload(
     });
 
     if (!resumeResponse.ok) {
-        // Upload expired or invalid — clean up and throw
-        await deleteUploadState(state.fileId);
-        throw new Error('Upload session expired. Please start a new upload.');
+        // Only 400/404/410 mean the session is genuinely dead (the backend
+        // returns 404 for missing metadata and 400 for an uploadId mismatch).
+        // A 5xx/429 — or an edge 502/503 during a deploy — is transient, and
+        // discarding state there destroys the completed-part list, the uploadId
+        // and, for encrypted uploads, the only copy of the secret key.
+        const status = resumeResponse.status;
+        if (status === 400 || status === 404 || status === 410) {
+            await deleteUploadState(state.fileId);
+            throw new Error('Upload session expired. Please start a new upload.');
+        }
+        throw new Error(
+            `Resume temporarily unavailable (HTTP ${status}) — your progress is saved, please try again.`,
+        );
     }
 
     const resumeInfo: {
@@ -1378,10 +1592,16 @@ export async function resumeUpload(
     let lastPartProgressTime = Date.now();
     const partProgress: Record<number, number> = {};
 
-    // Account for already-completed data in progress
-    // Use encrypted part size for progress since that's what's actually uploaded
-    const alreadyUploaded = contiguousCount * state.partSize;
-    const totalSize = state.totalParts * state.partSize;
+    // Account for already-completed data in progress.
+    // Parts were cut at the *effective* (record-aligned) part size, so that —
+    // not the raw allocated partSize — is how many bytes each completed part
+    // actually holds at S3.
+    const uploadedPartSize = getEffectivePartSize(state.partSize, state.encrypted);
+    const alreadyUploaded = contiguousCount * uploadedPartSize;
+    const remainingPlaintext = Math.max(0, file.size - skipBytes);
+    const totalSize =
+        alreadyUploaded +
+        (state.encrypted ? calculateEncryptedSize(remainingPlaintext) : remainingPlaintext);
 
     const updateProgress = (partNum: number, loaded: number) => {
         partProgress[partNum] = loaded;
@@ -1460,6 +1680,7 @@ export async function resumeUpload(
     // stream, so skip straight to completion. (uploadMultipartStream cannot
     // handle an empty part list: its read loop would never drain the stream.)
     let newlyUploadedParts: { PartNumber: number; ETag: string }[] = [];
+    let newlyUploadedBytes = 0;
     if (resumeInfo.parts.length > 0) {
         const multipartResult = await uploadMultipartStream(
             stream,
@@ -1480,7 +1701,15 @@ export async function resumeUpload(
             throw new Error('Resume failed: unexpected fallback');
         }
         newlyUploadedParts = multipartResult.parts || [];
+        newlyUploadedBytes = multipartResult.actualSize;
     }
+
+    // True object size: bytes of the contiguous completed prefix plus the bytes
+    // actually streamed now. The old `totalParts * partSize` was allocated
+    // capacity, which overstates the size of essentially every resumed upload
+    // (the final part is nearly always partial) and makes every download report
+    // a spurious size mismatch.
+    const actualUploadedSize = alreadyUploaded + newlyUploadedBytes;
 
     if (cancel.cancelled) {
         throw new Error('Upload cancelled');
@@ -1522,7 +1751,7 @@ export async function resumeUpload(
             id: state.fileId,
             metadata: metadataString,
             ...(state.encrypted && keychain && { authKey: await keychain.authKeyB64() }),
-            actualSize: totalSize,
+            actualSize: actualUploadedSize,
             parts: allParts,
         }),
     });
@@ -1616,7 +1845,11 @@ function createBlobStream(
 }
 
 /**
- * Upload a single part
+ * Upload the whole payload with one PUT.
+ *
+ * Mirrors uploadPart's resilience: progress-based stall detection (paused while
+ * offline) rather than a hard timeout, and a cancelled check before the request
+ * is opened. Retry/backoff lives in uploadSinglePartWithRetry.
  */
 function uploadSinglePart(
     blob: Blob,
@@ -1624,22 +1857,76 @@ function uploadSinglePart(
     onProgress: (loaded: number) => void,
     canceller: Canceller,
 ): Promise<{ actualSize: number }> {
+    if (canceller.cancelled) {
+        return Promise.reject(new Error('Upload cancelled'));
+    }
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         canceller.addXhr(xhr);
 
+        let stallTimer: ReturnType<typeof setTimeout>;
+        let stalledAbort = false;
+        let settled = false;
+
+        const cleanup = () => {
+            clearTimeout(stallTimer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
+            canceller.removeXhr(xhr);
+        };
+
+        const fail = (err: Error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            reject(err);
+        };
+
+        const resetStallTimer = () => {
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+                stalledAbort = true;
+                cleanup();
+                xhr.abort();
+                fail(new Error('Upload stalled'));
+            }, STALL_TIMEOUT);
+        };
+
+        // Pause stall detection while offline — the retry layer waits for
+        // connectivity instead of burning the retry budget on a dead link
+        const handleOffline = () => {
+            clearTimeout(stallTimer);
+        };
+        const handleOnline = () => {
+            resetStallTimer();
+        };
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('online', handleOnline);
+
         xhr.upload.addEventListener('progress', (e) => {
+            resetStallTimer();
             if (e.lengthComputable) {
                 onProgress(e.loaded);
             }
         });
 
+        xhr.addEventListener('loadstart', resetStallTimer);
+
         xhr.addEventListener('loadend', () => {
-            canceller.removeXhr(xhr);
+            cleanup();
+            if (settled) {
+                return;
+            }
             if (xhr.status >= 200 && xhr.status < 300) {
+                settled = true;
                 resolve({ actualSize: blob.size });
-            } else {
-                const err = new Error(`HTTP ${xhr.status}`);
+            } else if (!stalledAbort) {
+                let errorDetails = `HTTP ${xhr.status}`;
+                if (xhr.statusText) {
+                    errorDetails += ` (${xhr.statusText})`;
+                }
+                const err = new Error(errorDetails);
                 captureError(err, {
                     operation: 'upload.single',
                     extra: {
@@ -1648,24 +1935,90 @@ function uploadSinglePart(
                         blobSize: blob.size,
                         responsePreview: xhr.responseText?.substring(0, 200),
                     },
+                    level: 'warning',
                 });
-                reject(err);
+                fail(err);
             }
         });
 
         xhr.addEventListener('error', () => {
-            canceller.removeXhr(xhr);
+            cleanup();
             const err = new Error('Network error');
             captureError(err, {
                 operation: 'upload.single.network',
                 extra: { blobSize: blob.size },
+                level: 'warning',
             });
-            reject(err);
+            fail(err);
         });
 
         xhr.open('PUT', url);
         xhr.send(blob);
     });
+}
+
+/**
+ * Single-part upload with the same retry budget, backoff and offline pausing as
+ * the multipart path. Without this a single dropped packet on a 90MB upload
+ * discards the whole transfer with no retry and no resume record.
+ */
+async function uploadSinglePartWithRetry(
+    blob: Blob,
+    url: string,
+    onProgress: (loaded: number) => void,
+    canceller: Canceller,
+    onRetry?: () => void,
+): Promise<{ actualSize: number }> {
+    for (let attempt = 0; ; attempt++) {
+        if (canceller.cancelled) {
+            throw new Error('Upload cancelled');
+        }
+        try {
+            return await uploadSinglePart(blob, url, onProgress, canceller);
+        } catch (error: unknown) {
+            if (canceller.cancelled) {
+                throw error;
+            }
+            const err = error instanceof Error ? error : new Error(String(error));
+            const isRetryable = isRetryableError(err);
+            console.warn(
+                `[Upload] Single-part upload failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${err.message}`,
+                { retryable: isRetryable, blobSize: blob.size },
+            );
+
+            if (attempt >= MAX_RETRIES || !isRetryable) {
+                captureError(err, {
+                    operation: 'upload.single.exhausted',
+                    extra: {
+                        blobSize: blob.size,
+                        retriesAttempted: attempt,
+                        maxRetries: MAX_RETRIES,
+                        isRetryable,
+                        errorMessage: err.message,
+                    },
+                });
+                throw err;
+            }
+
+            await waitForOnline(canceller);
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
+
+            const delay = Math.min(
+                RETRY_DELAY_BASE * 2 ** attempt + Math.random() * 1000,
+                MAX_RETRY_DELAY,
+            );
+            console.log(`[Upload] Retrying single-part upload in ${(delay / 1000).toFixed(1)}s...`);
+            onRetry?.();
+            await cancellableDelay(delay, canceller);
+
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
+            onProgress(0); // Reset progress
+        }
+    }
 }
 
 /** Result from multipart upload - either completed parts or a fallback blob for single-part retry */
@@ -1739,6 +2092,32 @@ async function uploadMultipartStream(
     // Safari where few-part uploads finish before the stream is drained).
     let flushComplete = false;
 
+    // First permanent part failure (retries exhausted or non-retryable). The
+    // upload can never complete once this is set, so the read loop must stop
+    // instead of streaming, encrypting and uploading every remaining part.
+    let fatalPartError: Error | null = null;
+
+    const markPartFinished = (): void => {
+        totalPartsFinished++;
+        console.log(
+            `[Upload] Progress: ${totalPartsFinished}/${totalPartsQueued} parts finished, ${activeUploads} active`,
+        );
+        // Check if all done — only after the flush has finished
+        // processing the final buffered part (flushComplete guard).
+        if (flushComplete && totalPartsFinished >= totalPartsQueued) {
+            resolveAllDone();
+        }
+    };
+
+    // Drop every not-yet-started part, still counting it as finished so the
+    // completion promise resolves and the caller actually settles.
+    const drainPendingQueue = (): void => {
+        while (pendingQueue.length > 0) {
+            pendingQueue.shift();
+            markPartFinished();
+        }
+    };
+
     // Upload a single part and manage concurrency
     const doUploadPart = async (
         partBlob: Blob,
@@ -1746,6 +2125,9 @@ async function uploadMultipartStream(
         partUrl: string,
     ): Promise<void> => {
         try {
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
             console.log(
                 `[Upload] Part ${partNum} starting (${(partBlob.size / (1024 * 1024)).toFixed(1)}MB)`,
             );
@@ -1788,18 +2170,12 @@ async function uploadMultipartStream(
                 size: partBlob.size,
             };
             failedPartNumbers.push(partNum);
+            if (!canceller.cancelled && !fatalPartError) {
+                fatalPartError = error instanceof Error ? error : new Error(message);
+            }
         } finally {
             activeUploads--;
-            totalPartsFinished++;
-            console.log(
-                `[Upload] Progress: ${totalPartsFinished}/${totalPartsQueued} parts finished, ${activeUploads} active`,
-            );
-
-            // Check if all done — only after the flush has finished
-            // processing the final buffered part (flushComplete guard).
-            if (flushComplete && totalPartsFinished === totalPartsQueued) {
-                resolveAllDone();
-            }
+            markPartFinished();
 
             // Start next queued upload if any
             processQueue();
@@ -1811,6 +2187,10 @@ async function uploadMultipartStream(
 
     // Process the queue, starting uploads up to maxConcurrent
     const processQueue = (): void => {
+        if (canceller.cancelled || fatalPartError) {
+            drainPendingQueue();
+            return;
+        }
         while (pendingQueue.length > 0 && activeUploads < maxConcurrent) {
             const item = pendingQueue.shift();
             if (!item) {
@@ -1884,6 +2264,35 @@ async function uploadMultipartStream(
         bufferedItem = { blob, partNum, url };
     };
 
+    // Build the aggregated part-failure error the caller surfaces.
+    const buildPartFailureError = (): Error => {
+        const error: UploadError = {
+            message: `Failed to upload ${failedPartNumbers.length} parts: ${[...failedPartNumbers].sort((a, b) => a - b).join(', ')}`,
+            failedParts: [...failedPartNumbers].sort((a, b) => a - b),
+            partErrors,
+            retryable: true,
+        };
+        onError?.(error);
+        return new Error(error.message);
+    };
+
+    // Short-circuit: once a part has permanently failed the upload is doomed,
+    // so stop reading/encrypting/uploading the rest of the payload and report
+    // the failure now instead of after every remaining byte has transferred.
+    const throwIfPartFailedPermanently = (): void => {
+        if (!fatalPartError) {
+            return;
+        }
+        console.error(
+            '[Upload] Aborting read loop — a part failed permanently:',
+            fatalPartError.message,
+        );
+        drainPendingQueue();
+        flushComplete = true;
+        resolveAllDone();
+        throw buildPartFailureError();
+    };
+
     let currentPartIndex = 0;
     let currentPartData: Uint8Array[] = [];
     let currentPartSize = 0;
@@ -1893,6 +2302,10 @@ async function uploadMultipartStream(
         let streamDone = false;
 
         while (currentPartIndex < parts.length) {
+            throwIfPartFailedPermanently();
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
             const part = parts[currentPartIndex];
 
             // Add leftover data from previous part (skip if empty)
@@ -1926,6 +2339,8 @@ async function uploadMultipartStream(
                 if (canceller.cancelled) {
                     throw new Error('Upload cancelled');
                 }
+
+                throwIfPartFailedPermanently();
 
                 // Skip empty chunks — WebKit/Safari can emit Uint8Array(0) between
                 // internal buffer refills, which would create 0-byte parts
@@ -1964,7 +2379,13 @@ async function uploadMultipartStream(
                 if (pendingQueue.length + activeUploads >= maxBuffered) {
                     await new Promise<void>((resolve) => {
                         const checkRoom = setInterval(() => {
-                            if (pendingQueue.length + activeUploads < maxBuffered) {
+                            // Cancellation and permanent failure both stop new
+                            // parts from starting, so never park here for them
+                            if (
+                                canceller.cancelled ||
+                                fatalPartError ||
+                                pendingQueue.length + activeUploads < maxBuffered
+                            ) {
                                 clearInterval(checkRoom);
                                 resolve();
                             }
@@ -2021,6 +2442,19 @@ async function uploadMultipartStream(
 
             // Check if final part is too small and we can merge it with a pending part
             if (finalBuffered.blob.size < MIN_PART && pendingQueue.length > 0) {
+                // The merged part no longer holds exactly effectivePartSize bytes,
+                // so the persisted resume math (skip offset = completed parts ×
+                // part size) would resume from the wrong file offset and corrupt
+                // the object. Drop resumability for this upload.
+                //
+                // discardUploadState marks the file ID non-resumable
+                // SYNCHRONOUSLY, before the merge happens, so a later
+                // updateCompletedPart can't win the race against the delete and
+                // resurrect poisoned state (the delete itself is best-effort).
+                if (fileId) {
+                    discardUploadState(fileId);
+                }
+
                 // Merge with the last pending part
                 const lastPending = pendingQueue[pendingQueue.length - 1];
                 totalUploadedSize += finalBuffered.blob.size;
@@ -2030,16 +2464,6 @@ async function uploadMultipartStream(
                 );
                 lastPending.blob = mergedBlob;
                 // Don't queue the tiny buffered item separately
-
-                // The merged part no longer holds exactly effectivePartSize bytes,
-                // so the persisted resume math (skip offset = completed parts ×
-                // part size) would resume from the wrong file offset and corrupt
-                // the object. Drop resumability for this upload.
-                if (fileId) {
-                    deleteUploadState(fileId).catch(() => {
-                        // Intentionally ignored — best-effort cleanup
-                    });
-                }
             } else {
                 // Final part is large enough, or no pending parts to merge with — queue it normally
                 totalUploadedSize += finalBuffered.blob.size;
@@ -2068,16 +2492,13 @@ async function uploadMultipartStream(
             await allDonePromise;
         }
 
+        if (canceller.cancelled) {
+            throw new Error('Upload cancelled');
+        }
+
         // Check for failures
         if (failedPartNumbers.length > 0) {
-            const error: UploadError = {
-                message: `Failed to upload ${failedPartNumbers.length} parts: ${failedPartNumbers.join(', ')}`,
-                failedParts: failedPartNumbers,
-                partErrors,
-                retryable: true,
-            };
-            onError?.(error);
-            throw new Error(error.message);
+            throw buildPartFailureError();
         }
 
         console.log(`[Upload] All ${completedParts.length} parts completed successfully`);
@@ -2223,7 +2644,14 @@ async function uploadPartWithRetry(
         );
 
         if (retryCount < MAX_RETRIES && isRetryable) {
-            await waitForOnline();
+            await waitForOnline(canceller);
+
+            // waitForOnline now returns on cancellation too — bail before
+            // scheduling the backoff instead of parking on a dead retry
+            if (canceller.cancelled) {
+                throw new Error('Upload cancelled');
+            }
+
             const delay = Math.min(
                 RETRY_DELAY_BASE * 2 ** retryCount + Math.random() * 1000,
                 MAX_RETRY_DELAY,
@@ -2233,7 +2661,7 @@ async function uploadPartWithRetry(
 
             onRetry?.();
 
-            await new Promise((resolve) => setTimeout(resolve, delay));
+            await cancellableDelay(delay, canceller);
 
             if (canceller.cancelled) {
                 throw new Error('Upload cancelled');
@@ -2276,6 +2704,11 @@ function uploadPart(
     onProgress: (loaded: number) => void,
     canceller: Canceller,
 ): Promise<{ PartNumber: number; ETag: string; bytesSent: number }> {
+    // Never open a new request for a cancelled upload — Canceller.cancel() only
+    // aborts the XHRs that existed at that instant
+    if (canceller.cancelled) {
+        return Promise.reject(new Error('Upload cancelled'));
+    }
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         canceller.addXhr(xhr);
@@ -2405,6 +2838,33 @@ function isRetryableError(error: Error): boolean {
         msg.includes('http 408') ||
         msg.includes('http 0') // Often indicates network failure
     );
+}
+
+/**
+ * Release the server-side allocation for an upload that will never complete.
+ *
+ * /upload/abort/:id requires a multipart uploadId, which single-part uploads
+ * don't have, so the owner-token delete is the only way to drop the Redis
+ * metadata and decrement the provider file counter.
+ */
+async function releaseUploadAllocation(id: string, ownerToken: string): Promise<void> {
+    if (!id || !ownerToken) {
+        return;
+    }
+    try {
+        await fetch(`${API_BASE_URL}/delete/${id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ owner_token: ownerToken }),
+        });
+    } catch (e) {
+        console.warn('[Upload] Failed to release upload allocation:', e);
+        captureError(e, {
+            operation: 'upload.release-allocation',
+            extra: { fileId: id },
+            level: 'warning',
+        });
+    }
 }
 
 /**
