@@ -12,7 +12,9 @@ import {
     createEncryptionStream,
     ECE_ENCRYPTED_RECORD_SIZE,
     ECE_RECORD_SIZE,
+    ECE_VERSION,
     Keychain,
+    readEceVersion,
 } from './crypto';
 import { FileReadError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
@@ -847,12 +849,16 @@ export async function uploadFiles(
         files: { name: string; size: number; type: string }[];
         zipped?: boolean;
         zipFilename?: string;
+        eceVersion?: number;
     } = {
         files: files.map((f) => ({
             name: f.name,
             size: f.size,
             type: f.type || 'application/octet-stream',
         })),
+        // ECE format marker so the decryptor can fail closed on a missing
+        // final record (truncation) instead of accepting it as legacy data.
+        ...(encrypted && { eceVersion: ECE_VERSION }),
     };
 
     if (isMultiFile && zipFilename) {
@@ -1504,6 +1510,8 @@ export async function resumeUpload(
             files: [
                 { name: file.name, size: file.size, type: file.type || 'application/octet-stream' },
             ],
+            // ECE format marker — see the upload path in uploadFiles().
+            eceVersion: ECE_VERSION,
         };
         metadataString = arrayToB64(await keychain.encryptMetadata(metadata));
     } else {
@@ -2978,7 +2986,9 @@ export async function downloadFile(
     // there is no separate 'decrypting' phase. The 'decrypting' phase is only
     // emitted by the legacy multi-file fallback where buffered decryption is required.
     if (metadata.encrypted && keychain) {
-        const decryptStream = createDecryptionStream(keychain);
+        const decryptStream = createDecryptionStream(keychain, {
+            eceVersion: readEceVersion(metadata),
+        });
         outputStream = bodyStream.pipeThrough(progressStream).pipeThrough(decryptStream);
     } else {
         outputStream = bodyStream.pipeThrough(progressStream);
@@ -3195,7 +3205,9 @@ async function downloadFileLegacyMultiFile(
     if (metadata.encrypted && keychain) {
         onPhase?.('decrypting');
         dlLog('Decrypting legacy multi-file data...', { size: wireBlob.size });
-        const decryptStream = createDecryptionStream(keychain);
+        const decryptStream = createDecryptionStream(keychain, {
+            eceVersion: readEceVersion(metadata),
+        });
         payloadBlob = await collectStreamToBlob(wireBlob.stream().pipeThrough(decryptStream));
     } else {
         payloadBlob = wireBlob;
