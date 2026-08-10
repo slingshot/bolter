@@ -286,6 +286,16 @@ export interface StreamingZip {
     dispose: () => Promise<void>;
 }
 
+export interface StreamingZipOptions {
+    /**
+     * Override the per-file byte source. When provided, each entry's input
+     * stream comes from this factory instead of `file.stream()` — the worker
+     * upload engine injects slice-backed streams here. The returned stream is
+     * still wrapped for progress reporting and dispose() cancellation.
+     */
+    streamFactory?: (file: File) => ReadableStream<Uint8Array>;
+}
+
 /**
  * Create a streaming zip from File objects
  * Uses client-zip which streams data without buffering the entire zip in memory
@@ -296,6 +306,7 @@ export interface StreamingZip {
 export function createStreamingZip(
     files: File[],
     onProgress?: (bytesProcessed: number, totalBytes: number) => void,
+    opts?: StreamingZipOptions,
 ): StreamingZip {
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
     let bytesProcessed = 0;
@@ -318,7 +329,7 @@ export function createStreamingZip(
         entries = renamedFiles.map(({ name, input }) => {
             let fileStream: ReadableStream<Uint8Array>;
             try {
-                fileStream = input.stream();
+                fileStream = opts?.streamFactory?.(input) ?? input.stream();
             } catch (e) {
                 throw new FileReadError(input.name, e);
             }
