@@ -270,6 +270,137 @@ describe('runUploaders', () => {
         expect(progress[progress.length - 1]).toBe(10);
     });
 
+    it('starts the staged-part deletion only after the uploaded+ETag record commits [R11]', async () => {
+        const log: string[] = [];
+        const store = new RecordingPartStore(new MemoryPartStore(), log);
+        await stage(store, 1, makeData(4));
+        const { state } = fakeState(log);
+        let commitRecord: (() => void) | undefined;
+        const gatedState: EngineStateStore = {
+            ...state,
+            putPart(p) {
+                log.push(`putPart:${p.partNumber}:${p.uploaded ? 'uploaded' : 'staged'}`);
+                return new Promise<void>((resolve) => {
+                    commitRecord = resolve;
+                });
+            },
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state: gatedState,
+                uploadPart: () => Promise.resolve({ etag: 'etag-1' }),
+                maxConcurrent: 1,
+            }),
+        );
+        run.catch(() => undefined);
+        await flush();
+
+        // The PUT is done but the record has not committed: the staged bytes
+        // are the only copy of this part, so nothing may have touched them.
+        expect(log).toContain('putPart:1:uploaded');
+        expect(log).not.toContain('deletePart:1');
+        expect(await store.listParts()).toEqual([{ partNumber: 1, size: 4 }]);
+
+        commitRecord?.();
+        expect(await run).toEqual(new Map([[1, 'etag-1']]));
+        await flush();
+        expect(log.indexOf('deletePart:1')).toBeGreaterThan(log.indexOf('putPart:1:uploaded'));
+    });
+
+    it('takes the next part without waiting for the previous deletion to finish', async () => {
+        const log: string[] = [];
+        const inner = new MemoryPartStore();
+        await stage(inner, 1, makeData(4));
+        await stage(inner, 2, makeData(4));
+        let finishFirstDelete: (() => void) | undefined;
+        const store: PartStore = {
+            stagePart: (partNumber, chunks) => inner.stagePart(partNumber, chunks),
+            readPart: (partNumber) => {
+                log.push(`readPart:${partNumber}`);
+                return inner.readPart(partNumber);
+            },
+            deletePart: (partNumber) => {
+                log.push(`deletePart:${partNumber}`);
+                if (partNumber !== 1) {
+                    return inner.deletePart(partNumber);
+                }
+                // A slow OPFS delete: the run must not be behind it.
+                return new Promise<void>((resolve) => {
+                    finishFirstDelete = () => resolve(inner.deletePart(1));
+                });
+            },
+            listParts: () => inner.listParts(),
+            destroy: () => inner.destroy(),
+        };
+        const { state } = fakeState(log);
+
+        const etags = await runUploaders(
+            makeQueue([
+                { partNumber: 1, size: 4 },
+                { partNumber: 2, size: 4 },
+            ]),
+            baseOpts({
+                store,
+                state,
+                uploadPart: (url) => Promise.resolve({ etag: `etag-${url.slice(-1)}` }),
+                maxConcurrent: 1,
+            }),
+        );
+
+        expect(etags).toEqual(
+            new Map([
+                [1, 'etag-1'],
+                [2, 'etag-2'],
+            ]),
+        );
+        // Part 2 was read, uploaded and recorded while part 1's deletion was
+        // still in flight — the deletion is off the critical path entirely.
+        expect(finishFirstDelete).toBeDefined();
+        expect(log.indexOf('deletePart:1')).toBeLessThan(log.indexOf('readPart:2'));
+        finishFirstDelete?.();
+    });
+
+    it('survives a failed staged-part deletion', async () => {
+        const inner = new MemoryPartStore();
+        await stage(inner, 1, makeData(4));
+        const store: PartStore = {
+            stagePart: (partNumber, chunks) => inner.stagePart(partNumber, chunks),
+            readPart: (partNumber) => inner.readPart(partNumber),
+            deletePart: () => Promise.reject(new Error('OPFS removeEntry failed')),
+            listParts: () => inner.listParts(),
+            destroy: () => inner.destroy(),
+        };
+        const { state, partPuts } = fakeState();
+
+        const etags = await runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart: () => Promise.resolve({ etag: 'etag-1' }),
+                maxConcurrent: 1,
+            }),
+        );
+        await flush();
+
+        // The ETag is what completion needs; the orphaned bytes are reaped by
+        // the completion/cancel `destroy()` and by startup GC.
+        expect(etags).toEqual(new Map([[1, 'etag-1']]));
+        expect(partPuts).toEqual([
+            {
+                fileId: 'up_test',
+                partNumber: 1,
+                size: 4,
+                staged: true,
+                uploaded: true,
+                etag: 'etag-1',
+            },
+        ]);
+    });
+
     it('re-reads the staged part so retries are byte-identical', async () => {
         const clock = fakeClock();
         const log: string[] = [];

@@ -512,6 +512,28 @@ describe('reconcileEngineState', () => {
         expect(await h.state.getCheckpoint(FILE_ID)).toEqual(eofCheckpoint(4));
     });
 
+    it('tolerates an uploaded part whose staged bytes outlived it', async () => {
+        // Staged-part deletion is detached once the uploaded+ETag record
+        // commits, so a crash or a failed `removeEntry` can leave the file
+        // behind. The ETag is the truth for such a part — a surviving file
+        // must not rewind production or demote anything.
+        const h = makeHarness(urlsFor(3));
+        await h.state.putCheckpoint(eofCheckpoint(4));
+        await h.state.putPart(uploadedPart(1, 4));
+        await h.store.stagePart(1, chunksOf(makeData(4))); // delete never landed
+        await h.state.putPart(uploadedPart(2, 4));
+        await h.state.putPart(stagedPart(3, 4));
+        await h.store.stagePart(3, chunksOf(makeData(4)));
+
+        const { checkpoint, parts } = await reconcileEngineState(FILE_ID, false, h.state, h.store);
+
+        expect(checkpoint).toEqual(eofCheckpoint(4));
+        expect(parts).toEqual([uploadedPart(1, 4), uploadedPart(2, 4), stagedPart(3, 4)]);
+        expect(planResume(makeLease(), makeEnvelope(), checkpoint, parts)).toEqual({
+            action: 'finish-staged',
+        });
+    });
+
     it('rewinds the checkpoint and demotes records when staged bytes are missing', async () => {
         const h = makeHarness(urlsFor(3));
         await h.state.putCheckpoint(eofCheckpoint(4));

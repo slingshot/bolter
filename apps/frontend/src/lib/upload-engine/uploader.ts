@@ -19,7 +19,8 @@
  * transferred byte resets the inference. A 403-style pre-signed-URL expiry
  * triggers one `refreshUrls()` per part. On success the uploaded+ETag record is persisted
  * **before** the staged bytes are deleted [R11], so a crash between the two
- * re-deletes rather than re-uploads. Progress is coalesced to a wall-clock
+ * re-deletes rather than re-uploads; the delete itself is then detached and
+ * best-effort, so no worker's turnaround waits on storage. Progress is coalesced to a wall-clock
  * cadence and stamped with the time this uploader observed the bytes, so the
  * consumer times throughput by production rather than by delivery.
  *
@@ -283,8 +284,19 @@ export async function runUploaders(
                     uploaded: true,
                     etag,
                 });
-                await opts.store.deletePart(partNumber);
                 etags.set(partNumber, etag);
+                // With that record durable the staged bytes are dead weight,
+                // so releasing them is detached: awaiting an OPFS delete (a
+                // handful of round trips) before pulling the next part put
+                // storage latency directly into this worker's turnaround. A
+                // lost delete costs space, never progress — completion and
+                // cancel both `destroy()` the whole directory, startup GC
+                // reaps orphaned ones, and reconciliation reads an
+                // uploaded+ETag record as intact whether or not its file
+                // survived.
+                opts.store.deletePart(partNumber).catch((err: unknown) => {
+                    console.debug(`[Engine] could not release staged part ${partNumber}:`, err);
+                });
                 return;
             } catch (err) {
                 inFlight.delete(partNumber);
