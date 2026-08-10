@@ -2,53 +2,16 @@ import { cors } from '@elysiajs/cors';
 import { openapi } from '@elysiajs/openapi';
 import { Elysia, t } from 'elysia';
 import { config } from './config';
+// Health probes are unauthenticated, so they must be both memoised (no S3 API
+// amplification under a request flood) and bounded (a dead provider must not
+// stall readiness). See `lib/health.ts` for the full rationale — audit #29.
+import { getHealth } from './lib/health';
 import { captureError } from './lib/sentry';
 import { logger } from './logger';
 import { downloadRoutes } from './routes/download';
 import { plausibleRoutes } from './routes/plausible';
 import { providerRoutes } from './routes/providers';
 import { uploadRoutes } from './routes/upload';
-import { storage } from './storage';
-
-/**
- * Health probes are unauthenticated and every `storage.ping()` fans a
- * HeadBucket out to every registered provider. Cache the result for a short
- * window (and de-duplicate concurrent probes) so a probe loop cannot amplify
- * into an S3 API flood or stall behind a dead provider on every request.
- */
-export const HEALTH_CACHE_TTL_MS = 5_000;
-
-type HealthResult = Awaited<ReturnType<typeof storage.ping>>;
-
-let cachedHealth: { value: HealthResult; at: number } | null = null;
-let inflightHealth: Promise<HealthResult> | null = null;
-
-/** Test seam — drops the memoised health result. */
-export function resetHealthCache(): void {
-    cachedHealth = null;
-    inflightHealth = null;
-}
-
-function getHealth(): Promise<HealthResult> {
-    if (cachedHealth && Date.now() - cachedHealth.at < HEALTH_CACHE_TTL_MS) {
-        return Promise.resolve(cachedHealth.value);
-    }
-    if (inflightHealth) {
-        return inflightHealth;
-    }
-
-    inflightHealth = storage
-        .ping()
-        .then((value) => {
-            cachedHealth = { value, at: Date.now() };
-            return value;
-        })
-        .finally(() => {
-            inflightHealth = null;
-        });
-
-    return inflightHealth;
-}
 
 // CORS must fail closed: reflecting the request Origin with credentials is only
 // ever acceptable for an explicit `NODE_ENV=development` build. An unset or

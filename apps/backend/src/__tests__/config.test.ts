@@ -421,3 +421,60 @@ describe('buildConfig validation (finding #9)', () => {
         expect(tooManyDownloads.errors.some((e) => e.includes('DEFAULT_DOWNLOADS'))).toBe(true);
     });
 });
+
+// ---------------------------------------------------------------------------
+// Finding #29 — health probe timing must be operator-tunable and validated, so
+// a deployment can align the cache TTL with its own probe interval.
+// ---------------------------------------------------------------------------
+
+describe('health probe config (finding #29)', () => {
+    const baseEnv = {
+        NODE_ENV: 'production',
+        S3_BUCKET: 'bucket',
+        S3_ENDPOINT: 'https://s3.example.com',
+    };
+
+    it('defaults the cache TTL to at least the shipped 30s probe interval', () => {
+        const { config: parsed, errors } = buildConfig(baseEnv);
+
+        expect(errors).toEqual([]);
+        expect(parsed.healthCacheTtlSeconds).toBeGreaterThanOrEqual(30);
+    });
+
+    it('defaults to a bounded per-dependency probe timeout', () => {
+        const { config: parsed } = buildConfig(baseEnv);
+
+        expect(parsed.healthProbeTimeoutMs).toBeGreaterThan(0);
+        expect(parsed.healthProbeTimeoutMs).toBeLessThanOrEqual(10_000);
+    });
+
+    it('honours an operator-supplied TTL and timeout', () => {
+        const { config: parsed, errors } = buildConfig({
+            ...baseEnv,
+            HEALTH_CACHE_TTL_SECONDS: '120',
+            HEALTH_PROBE_TIMEOUT_MS: '750',
+        });
+
+        expect(errors).toEqual([]);
+        expect(parsed.healthCacheTtlSeconds).toBe(120);
+        expect(parsed.healthProbeTimeoutMs).toBe(750);
+    });
+
+    it('rejects a malformed or unbounded probe timeout', () => {
+        expect(
+            buildConfig({ ...baseEnv, HEALTH_PROBE_TIMEOUT_MS: 'forever' }).errors.some((e) =>
+                e.includes('HEALTH_PROBE_TIMEOUT_MS'),
+            ),
+        ).toBe(true);
+        expect(
+            buildConfig({ ...baseEnv, HEALTH_PROBE_TIMEOUT_MS: '0' }).errors.some((e) =>
+                e.includes('HEALTH_PROBE_TIMEOUT_MS'),
+            ),
+        ).toBe(true);
+        expect(
+            buildConfig({ ...baseEnv, HEALTH_CACHE_TTL_SECONDS: '5m' }).errors.some((e) =>
+                e.includes('HEALTH_CACHE_TTL_SECONDS'),
+            ),
+        ).toBe(true);
+    });
+});

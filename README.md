@@ -188,10 +188,14 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `DEFAULT_DOWNLOADS` | `1` | Default download limit |
 | `PLAUSIBLE_DOMAINS` | `send.fm` | Site domains the analytics proxy will forward events for, comma separated |
 | `TRUSTED_EDGE_CIDRS` | _(none)_ | CIDR ranges allowed to set `cf-connecting-ip`; when set, the header is only trusted from those peers |
+| `HEALTH_CACHE_TTL_SECONDS` | `30` | How long a `/health*` probe result is reused. Set it to at least your orchestrator's probe interval |
+| `HEALTH_PROBE_TIMEOUT_MS` | `2000` | Per-dependency budget for one health probe; a dependency that exceeds it is reported down |
 
 > **Startup validation.** Every numeric variable above is parsed strictly at boot. Non-numeric (`abc`), unit-suffixed (`10GB`, `6months`), fractional, negative or out-of-range values abort startup with an explicit message instead of silently becoming `NaN` (which disables the limit) or a truncated integer. `S3_BUCKET` and `S3_ENDPOINT` must also be non-empty.
 
 > **CORS fails closed.** `origin: true` with credentials is only enabled for an explicit `NODE_ENV=development` build. In every other case — including an unset or misspelled `NODE_ENV` — the API allows only `BASE_URL` plus `CORS_ORIGINS`, and never sends `Access-Control-Allow-Credentials`. For local development set `NODE_ENV=development` in your `.env.local`, or add `http://localhost:3000` to `CORS_ORIGINS`.
+
+> **Health probes are bounded.** `/health`, `/health/ready` and `/__heartbeat__` are unauthenticated, so they check the **active** storage provider only (never every registered provider), give each dependency a `HEALTH_PROBE_TIMEOUT_MS` budget, and memoise the result for `HEALTH_CACHE_TTL_SECONDS`. A decommissioned bucket that black-holes connections therefore cannot stall readiness, and a probe flood cannot amplify into S3 API charges. If you poll more often than the default 30s TTL, lower `HEALTH_CACHE_TTL_SECONDS` to match; if you poll less often, raise it. `/health/live` never touches storage at all.
 
 ### Storage Provider Management
 

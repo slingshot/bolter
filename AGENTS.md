@@ -123,12 +123,19 @@ Deployment / security:
 - `CORS_ORIGINS` - Comma-separated extra browser origins allowed by CORS; `BASE_URL` is always allowed. Required in production whenever the frontend origin differs from the API origin.
 - `PLAUSIBLE_DOMAINS` - Comma-separated site domains the analytics proxy will forward events for (default: `send.fm`)
 - `TRUSTED_EDGE_CIDRS` - Comma-separated CIDRs of the edge tier allowed to set `cf-connecting-ip`. Unset keeps the legacy always-prefer-`cf-connecting-ip` behaviour.
+- `HEALTH_CACHE_TTL_SECONDS` - How long a health probe result is reused (default: `30`). Set it >= your orchestrator's probe interval, or every scheduled probe misses the cache.
+- `HEALTH_PROBE_TIMEOUT_MS` - Per-dependency budget for one health probe (default: `2000`).
 
 **Startup validation is fail-fast** (`apps/backend/src/config.ts`). `buildConfig(env)` is a pure, unit-tested function: every numeric var is parsed with `Number()` and rejected if non-finite, fractional, negative or out of range (`parseInt` used to turn `MAX_FILE_SIZE='10GB'` into 10 bytes and `'abc'` into `NaN`, which removes the cap because `size > NaN` is always false); `S3_BUCKET`/`S3_ENDPOINT` must be non-empty outside `NODE_ENV=test`; defaults may not exceed their `MAX_*`. All problems are collected and printed, then `process.exit(1)`.
 
 **CORS fails closed** (`apps/backend/src/app.ts`). `origin: true` + `credentials: true` are enabled only for `config.isDevelopment`; otherwise the allow-list is `[baseUrl, ...corsOrigins]` and `Access-Control-Allow-Credentials` is never sent.
 
-**Health probes are cached** (`apps/backend/src/app.ts`). `/health`, `/health/ready` and `/__heartbeat__` share a `HEALTH_CACHE_TTL_MS` (5s) memoised `storage.ping()` with concurrent-probe de-duplication, so unauthenticated probe loops cannot amplify one request into a HeadBucket against every registered provider. `resetHealthCache()` is the test seam. `/health/live` never touches storage.
+**Health probes are bounded, not just cached** (`apps/backend/src/lib/health.ts`). `/health`, `/health/ready` and `/__heartbeat__` share one probe with three properties, because caching alone left half the failure reachable:
+- **Active provider only.** The probe calls `providerRegistry.healthCheckProvider(activeId)`, never `healthCheckAll()`. Readiness never depended on the other providers — `storage.ping()` already discarded every non-active result — so an unauthenticated request could no longer fan a `HeadBucket` out across the whole registry.
+- **Per-dependency timeout.** The S3 client sets no request timeout, so each dependency gets `HEALTH_PROBE_TIMEOUT_MS` (default 2s) and degrades to `false`. A decommissioned, black-holing bucket can no longer hang a probe for the socket timeout and flap readiness.
+- **Stale-while-revalidate.** Results are memoised for `HEALTH_CACHE_TTL_SECONDS` (default 30s, chosen to exceed the shipped 30s compose healthcheck interval — a shorter TTL than the probe interval never hits). The caller that finds the cache stale awaits the refresh; anyone arriving while it is in flight gets the last known result rather than queueing behind it.
+
+`resetHealthCache()` / `setHealthTiming()` / `getHealthTiming()` are the test seams. `/health/live` never touches storage. `storage.ping()` (the whole-registry fan-out) remains available for admin diagnostics but is no longer on any unauthenticated path.
 
 See `.env.example` for full list of configurable limits and UI options.
 

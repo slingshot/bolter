@@ -36,7 +36,17 @@ mock.module('../lib/sentry', () => ({
     }),
 }));
 
+mock.module('../storage/provider-registry', () => ({
+    providerRegistry: {
+        getActiveProviderId: mock(() => 'default'),
+        healthCheckProvider: mock(() => Promise.resolve({ healthy: true, latencyMs: 1 })),
+        healthCheckAll: mock(() => Promise.resolve({ default: true })),
+    },
+    ProviderRegistry: class {},
+}));
+
 import { app } from '../app';
+import { getHealthTiming } from '../lib/health';
 
 // src/__tests__ → src → apps/backend → apps → <repo root>
 const repoRoot = join(import.meta.dir, '..', '..', '..', '..');
@@ -121,5 +131,32 @@ describe('deployment environment (finding #6)', () => {
 
     it('docker-compose allows the frontend origin explicitly now that CORS is closed', () => {
         expect(composeFile).toContain('CORS_ORIGINS=');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Finding #29 — caching health probes is pointless if the TTL is shorter than
+// the interval the shipped deployment actually polls at.
+// ---------------------------------------------------------------------------
+
+describe('health probe cache vs shipped probe interval (finding #29)', () => {
+    /** Interval of the compose healthcheck that hits `/health/ready`. */
+    function readyProbeIntervalSeconds(): number {
+        const block = composeFile
+            .split('healthcheck:')
+            .find((section) => section.includes('localhost:3001/health/ready'));
+        expect(block).toBeDefined();
+        const match = /interval:\s*(\d+)s/.exec(block as string);
+        expect(match).not.toBeNull();
+        return Number((match as RegExpExecArray)[1]);
+    }
+
+    it('caches for at least as long as the compose healthcheck interval', () => {
+        const intervalMs = readyProbeIntervalSeconds() * 1000;
+
+        expect(intervalMs).toBeGreaterThan(0);
+        // Pre-fix the TTL was a hardcoded 5s against a 30s interval, so every
+        // scheduled probe missed the cache and re-ran the provider fan-out.
+        expect(getHealthTiming().cacheTtlMs).toBeGreaterThanOrEqual(intervalMs);
     });
 });

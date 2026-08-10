@@ -44,6 +44,20 @@ export interface Config {
     providerCacheTtlSeconds: number;
     adminApiKey: string;
 
+    // Health probes
+    /**
+     * How long a health probe result is reused. Should be >= the probe interval
+     * of whatever is polling `/health*` (the shipped compose healthcheck uses
+     * 30s), otherwise every scheduled probe misses the cache.
+     */
+    healthCacheTtlSeconds: number;
+    /**
+     * Per-dependency budget for a single health probe. The S3 client sets no
+     * request timeout of its own, so without this a black-holing bucket would
+     * stall every probe for the socket timeout and flap readiness.
+     */
+    healthProbeTimeoutMs: number;
+
     // Analytics proxy
     /** Site domains this deployment is allowed to report Plausible events for. */
     plausibleDomains: string[];
@@ -296,6 +310,22 @@ export function buildConfig(env: Record<string, string | undefined>): ConfigLoad
             { min: 1 },
         ),
         adminApiKey: env.ADMIN_API_KEY || '',
+
+        // Health probes
+        healthCacheTtlSeconds: parseNumericEnv(
+            'HEALTH_CACHE_TTL_SECONDS',
+            env.HEALTH_CACHE_TTL_SECONDS,
+            30,
+            errors,
+            { min: 0, max: 3600 },
+        ),
+        healthProbeTimeoutMs: parseNumericEnv(
+            'HEALTH_PROBE_TIMEOUT_MS',
+            env.HEALTH_PROBE_TIMEOUT_MS,
+            2000,
+            errors,
+            { min: 1, max: 60_000 },
+        ),
 
         // Analytics proxy
         plausibleDomains: parseStringList(env.PLAUSIBLE_DOMAINS, [DEFAULT_PLAUSIBLE_DOMAIN]).map(
