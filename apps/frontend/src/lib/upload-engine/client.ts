@@ -188,14 +188,47 @@ function killSwitchOn(): boolean {
 }
 
 /**
- * Per-upload eligibility probe: kill switch → worker spawn → OPFS
- * `getDirectory` → 1-byte sync-access-handle write/read round trip →
- * `storage.estimate()` (advisory). Any failure means the caller falls through
- * to the legacy pipeline silently. Either outcome is the delegation decision,
- * so it emits the attempt telemetry event [R16].
+ * Worker + OPFS capability is a property of the browser, not of the upload —
+ * it cannot change between two uploads of one session. The first probe's
+ * promise is therefore reused for the rest of the session, negative verdicts
+ * included: an unhappy probe is the expensive one (a spawned-but-hung worker
+ * costs a full `PROBE_TIMEOUT_MS`), and re-paying that on every upload buys
+ * an answer that cannot have changed.
+ */
+let capabilityProbe: Promise<EngineEligibility> | undefined;
+
+/** Test seam: forget the cached capability verdict. */
+export function resetEligibilityCacheForTests(): void {
+    capabilityProbe = undefined;
+}
+
+function probeCapability(): Promise<EngineEligibility> {
+    // `probeEnvironment` resolves rather than rejects on every failure it
+    // anticipates; the catch covers the rest, so one unlucky probe can never
+    // cache a rejected promise for the session.
+    capabilityProbe ??= probeEnvironment().catch(
+        (err): EngineEligibility => ({
+            eligible: false,
+            reason: err instanceof Error ? err.message : String(err),
+        }),
+    );
+    return capabilityProbe;
+}
+
+/**
+ * Per-upload eligibility probe: kill switch → cached capability probe (worker
+ * spawn → OPFS `getDirectory` → 1-byte sync-access-handle write/read round
+ * trip). Any failure means the caller falls through to the legacy pipeline
+ * silently. Either outcome is the delegation decision, so it emits the
+ * attempt telemetry event [R16].
  */
 export async function probeEligibility(): Promise<EngineEligibility> {
-    const result = await probeEnvironment();
+    // The kill switch is deliberately outside the cache: it is flipped by
+    // hand mid-session to move a stuck user back onto the legacy pipeline, so
+    // it has to take effect on the very next upload — not the next reload.
+    const result: EngineEligibility = killSwitchOn()
+        ? { eligible: false, reason: 'kill-switch' }
+        : await probeCapability();
     const attempt = beginTelemetryAttempt(result.eligible ? 'worker' : 'legacy');
     trackUploadAttempt({
         engine: attempt.engine,
@@ -207,9 +240,6 @@ export async function probeEligibility(): Promise<EngineEligibility> {
 }
 
 async function probeEnvironment(): Promise<EngineEligibility> {
-    if (killSwitchOn()) {
-        return { eligible: false, reason: 'kill-switch' };
-    }
     if (typeof Worker === 'undefined') {
         return { eligible: false, reason: 'no-worker' };
     }

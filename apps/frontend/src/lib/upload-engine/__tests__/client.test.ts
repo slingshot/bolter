@@ -11,10 +11,17 @@ vi.mock('@/lib/plausible', () => ({
 import {
     engineStartupMaintenance,
     probeEligibility,
+    resetEligibilityCacheForTests,
     runEngineInWorker,
     setWorkerFactory,
 } from '../client';
-import type { ClientToWorker, EngineJob, WorkerToClient } from '../protocol';
+import type {
+    ClientToWorker,
+    EngineJob,
+    EngineProbeRequest,
+    EngineProbeResult,
+    WorkerToClient,
+} from '../protocol';
 import { type CompletionEnvelope, type EngineLease, openEngineState } from '../state';
 
 /**
@@ -25,17 +32,20 @@ import { type CompletionEnvelope, type EngineLease, openEngineState } from '../s
 class FakeWorker {
     static instances: FakeWorker[] = [];
 
-    onmessage: ((event: { data: WorkerToClient }) => void) | null = null;
+    onmessage: ((event: { data: WorkerToClient | EngineProbeResult }) => void) | null = null;
     onerror: ((event: { message?: string }) => void) | null = null;
-    posted: ClientToWorker[] = [];
+    posted: (ClientToWorker | EngineProbeRequest)[] = [];
     terminated = false;
 
     constructor() {
         FakeWorker.instances.push(this);
     }
 
-    postMessage(message: ClientToWorker): void {
+    postMessage(message: ClientToWorker | EngineProbeRequest): void {
         this.posted.push(message);
+        if (message.type === 'probe') {
+            queueMicrotask(() => this.onmessage?.({ data: { type: 'probe-result', ok: true } }));
+        }
     }
 
     terminate(): void {
@@ -112,6 +122,10 @@ describe('upload-engine client facade', () => {
     beforeEach(() => {
         FakeWorker.instances = [];
         localStorage.removeItem('bolter:upload-engine');
+        resetEligibilityCacheForTests();
+        // happy-dom has no Worker global; the probe's capability check only
+        // needs it to exist — actual spawning goes through the factory.
+        vi.stubGlobal('Worker', FakeWorker);
         setWorkerFactory(() => new FakeWorker() as unknown as Worker);
     });
 
@@ -129,6 +143,55 @@ describe('upload-engine client facade', () => {
             eligible: false,
             reason: 'kill-switch',
         });
+    });
+
+    it('probes worker/OPFS capability once per session', async () => {
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+
+        // Capability is a property of the browser, not of the upload.
+        expect(FakeWorker.instances.length).toBe(1);
+        expect(FakeWorker.instances[0].posted).toEqual([{ type: 'probe' }]);
+        expect(FakeWorker.instances[0].terminated).toBe(true);
+    });
+
+    it('re-reads the kill switch on every probe, cached capability or not', async () => {
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+
+        // Flipped by hand mid-session to move a stuck user off the engine —
+        // caching it would make the escape hatch require a reload.
+        localStorage.setItem('bolter:upload-engine', 'off');
+        await expect(probeEligibility()).resolves.toEqual({
+            eligible: false,
+            reason: 'kill-switch',
+        });
+
+        localStorage.removeItem('bolter:upload-engine');
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+        expect(FakeWorker.instances.length).toBe(1);
+    });
+
+    it('caches an ineligible verdict so a broken worker is probed once', async () => {
+        setWorkerFactory(() => {
+            throw new Error('no workers here');
+        });
+        await expect(probeEligibility()).resolves.toEqual({
+            eligible: false,
+            reason: 'worker-spawn-failed',
+        });
+
+        // A failed probe is the expensive one (spawn failure, or a 5s
+        // PROBE_TIMEOUT_MS hang) — it must not be repaid per upload.
+        setWorkerFactory(() => new FakeWorker() as unknown as Worker);
+        await expect(probeEligibility()).resolves.toEqual({
+            eligible: false,
+            reason: 'worker-spawn-failed',
+        });
+        expect(FakeWorker.instances.length).toBe(0);
+
+        resetEligibilityCacheForTests();
+        await expect(probeEligibility()).resolves.toEqual({ eligible: true });
+        expect(FakeWorker.instances.length).toBe(1);
     });
 
     it('resolves with the done payload and forwards progress/retry to hooks', async () => {

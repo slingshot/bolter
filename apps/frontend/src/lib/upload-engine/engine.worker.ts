@@ -332,9 +332,13 @@ interface ProbeRootHandle {
 
 /**
  * Real-capability probe: OPFS root → 1-byte sync-access-handle write/read
- * round trip → `storage.estimate()` (advisory only — quota can still fail
- * later). Probe files live at the OPFS root, outside the engine's `uploads/`
- * tree, and are removed before the result is posted.
+ * round trip. Probe files live at the OPFS root, outside the engine's
+ * `uploads/` tree, and are removed before the result is posted.
+ *
+ * Quota is deliberately not consulted: `storage.estimate()` is advisory (it
+ * reports a padded, browser-chosen budget that a write can exceed anyway), so
+ * its answer never vetoed the probe — the staged writes have to handle a
+ * quota failure regardless, and asking costs a round trip on every upload.
  */
 async function runProbe(): Promise<EngineProbeResult> {
     const fail = (reason: string): EngineProbeResult => ({
@@ -367,13 +371,6 @@ async function runProbe(): Promise<EngineProbeResult> {
             }
         } finally {
             await root.removeEntry(probeName).catch(() => undefined);
-        }
-        if (typeof storage.estimate === 'function') {
-            try {
-                await storage.estimate();
-            } catch {
-                // advisory only — an estimate failure is not a capability veto
-            }
         }
         return { type: 'probe-result', ok: true };
     } catch (err) {
