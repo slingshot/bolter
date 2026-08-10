@@ -1,9 +1,10 @@
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { describe, expect, it } from 'vitest';
+import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
 import type { EngineDeps } from '../engine';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type { WorkerToClient } from '../protocol';
-import { executeResume, planResume, ResumeNeedsSourceError } from '../resume';
+import { executeResume, planResume, ResumeNeedsSourceError, reconcileEngineState } from '../resume';
 import type {
     CompletionEnvelope,
     EngineLease,
@@ -458,5 +459,121 @@ describe('executeResume', () => {
         );
         expect(h.completions).toEqual([]);
         expect(h.events[h.events.length - 1]).toMatchObject({ type: 'error', retryable: false });
+    });
+
+    it('demotes to need-source when a staged record has no committed bytes', async () => {
+        // Records say finish-staged, but part 2's OPFS bytes are gone (storage
+        // eviction with a surviving DB). Trusting the record used to plan
+        // finish-staged and die on the non-retryable 'part 2 is not committed'
+        // forever; reconciliation must demote and reject with need-source.
+        const h = makeHarness(urlsFor(3));
+        await h.state.putLease(makeLease());
+        await h.state.putEnvelope(makeEnvelope());
+        await h.state.putCheckpoint(eofCheckpoint(4));
+        await h.state.putPart(uploadedPart(1, 4));
+        await h.state.putPart(stagedPart(2, 4)); // record only — bytes evicted
+        await h.state.putPart(stagedPart(3, 4));
+        await h.store.stagePart(3, chunksOf(makeData(4)));
+
+        const run = executeResume(FILE_ID, h.deps, new AbortController().signal);
+        await expect(run).rejects.toBeInstanceOf(ResumeNeedsSourceError);
+        await expect(run).rejects.toMatchObject({ kind: 'single' });
+
+        expect(h.completions).toEqual([]);
+        expect(h.log).not.toContain('destroy');
+        expect(h.events[h.events.length - 1]).toMatchObject({ type: 'error', retryable: false });
+        // Durable heal: the checkpoint rewound to re-produce from part 2, so a
+        // sourced resume can actually finish instead of looping.
+        const checkpoint = await h.state.getCheckpoint(FILE_ID);
+        expect(checkpoint).toMatchObject({ nextPartNumber: 2, eofReached: false });
+        const parts = await h.state.getParts(FILE_ID);
+        expect(parts.find((p) => p.partNumber === 2)).toMatchObject({
+            staged: false,
+            uploaded: false,
+        });
+    });
+});
+
+describe('reconcileEngineState', () => {
+    it('no-ops when every produced part is uploaded or staged with matching bytes', async () => {
+        const h = makeHarness(urlsFor(3));
+        await h.state.putCheckpoint(eofCheckpoint(4));
+        await h.state.putPart(uploadedPart(1, 4));
+        await h.state.putPart(stagedPart(2, 4));
+        await h.store.stagePart(2, chunksOf(makeData(4)));
+        await h.state.putPart(stagedPart(3, 4));
+        await h.store.stagePart(3, chunksOf(makeData(4)));
+
+        const { checkpoint, parts } = await reconcileEngineState(FILE_ID, false, h.state, h.store);
+
+        expect(checkpoint).toEqual(eofCheckpoint(4));
+        expect(parts).toEqual([uploadedPart(1, 4), stagedPart(2, 4), stagedPart(3, 4)]);
+        expect(await h.state.getCheckpoint(FILE_ID)).toEqual(eofCheckpoint(4));
+    });
+
+    it('rewinds the checkpoint and demotes records when staged bytes are missing', async () => {
+        const h = makeHarness(urlsFor(3));
+        await h.state.putCheckpoint(eofCheckpoint(4));
+        await h.state.putPart(uploadedPart(1, 4));
+        await h.state.putPart(stagedPart(2, 4)); // record only — bytes evicted
+        await h.state.putPart(stagedPart(3, 4));
+        await h.store.stagePart(3, chunksOf(makeData(4)));
+
+        const { checkpoint, parts } = await reconcileEngineState(FILE_ID, false, h.state, h.store);
+
+        expect(checkpoint).toEqual({
+            fileId: FILE_ID,
+            nextPartNumber: 2,
+            sourceOffset: 4,
+            eceCounter: 0,
+            eofReached: false,
+            finalRecordEmitted: false,
+        });
+        // Everything above the verified prefix is demoted — including part
+        // 3's intact bytes, which re-production will rewrite anyway.
+        expect(parts).toEqual([
+            uploadedPart(1, 4),
+            { fileId: FILE_ID, partNumber: 2, size: 4, staged: false, uploaded: false },
+            { fileId: FILE_ID, partNumber: 3, size: 4, staged: false, uploaded: false },
+        ]);
+        expect(await h.state.getCheckpoint(FILE_ID)).toEqual(checkpoint);
+        expect(await h.state.getParts(FILE_ID)).toEqual(parts);
+        // The reconciled plan is need-source, never the unwinnable finish-staged.
+        expect(planResume(makeLease(), makeEnvelope(), checkpoint, parts)).toEqual({
+            action: 'need-source',
+            kind: 'single',
+        });
+    });
+
+    it('a committed entry whose size differs from the record also demotes', async () => {
+        const h = makeHarness(urlsFor(2));
+        await h.state.putCheckpoint(eofCheckpoint(3));
+        await h.state.putPart(stagedPart(1, 4));
+        await h.store.stagePart(1, chunksOf(makeData(3))); // 3 bytes vs recorded 4
+
+        const { checkpoint } = await reconcileEngineState(FILE_ID, false, h.state, h.store);
+
+        expect(checkpoint).toMatchObject({ nextPartNumber: 1, sourceOffset: 0 });
+        expect((await h.state.getParts(FILE_ID))[0]).toMatchObject({ staged: false });
+    });
+
+    it('rewinds encrypted uploads to an exact ECE record boundary', async () => {
+        const partSize = 2 * ECE_ENCRYPTED_RECORD_SIZE;
+        const h = makeHarness(urlsFor(2));
+        await h.state.putCheckpoint(eofCheckpoint(3, { sourceOffset: 4 * ECE_RECORD_SIZE }));
+        await h.state.putPart(stagedPart(1, partSize));
+        await h.store.stagePart(1, chunksOf(makeData(partSize)));
+        await h.state.putPart(stagedPart(2, partSize)); // bytes missing
+
+        const { checkpoint } = await reconcileEngineState(FILE_ID, true, h.state, h.store);
+
+        expect(checkpoint).toEqual({
+            fileId: FILE_ID,
+            nextPartNumber: 2,
+            sourceOffset: 2 * ECE_RECORD_SIZE, // plaintext consumed by part 1
+            eceCounter: 2, // two encrypted records already emitted
+            eofReached: false,
+            finalRecordEmitted: false,
+        });
     });
 });

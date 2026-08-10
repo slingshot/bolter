@@ -27,7 +27,7 @@ import type {
     EngineProbeResult,
     WorkerToClient,
 } from './protocol';
-import { planResume } from './resume';
+import { planResume, reconcileEngineState } from './resume';
 import {
     type CompletionEnvelope,
     type EngineLease,
@@ -517,7 +517,27 @@ export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[
             if (!envelope) {
                 continue;
             }
-            const plan = planResume(lease, envelope, checkpoint, parts);
+            // Reconcile OPFS against the DB before planning [R4], under the
+            // upload's Web Lock so a live run in another tab is never walked
+            // over. A busy lock or an OPFS-less environment plans from the
+            // records as-is.
+            let planCheckpoint = checkpoint;
+            let planParts = parts;
+            try {
+                ({ checkpoint: planCheckpoint, parts: planParts } = await acquireUploadLock(
+                    lease.fileId,
+                    () =>
+                        reconcileEngineState(
+                            lease.fileId,
+                            envelope.encrypted,
+                            state,
+                            new OpfsPartStore(lease.fileId),
+                        ),
+                ));
+            } catch {
+                // best-effort — the plan below still runs
+            }
+            const plan = planResume(lease, envelope, planCheckpoint, planParts);
             if (plan.action === 'unrecoverable') {
                 continue;
             }

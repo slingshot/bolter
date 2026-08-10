@@ -22,14 +22,17 @@
  * Worker-safe: no DOM globals.
  */
 
+import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
 import { getConcurrentUploads, isRetryableError } from '@/lib/upload-shared';
 import { finalizeUpload } from './completion';
 import { type EngineDeps, type EngineResult, runEngine } from './engine';
+import type { PartStore } from './part-store';
 import type { EngineJob } from './protocol';
 import type {
     CompletionEnvelope,
     EngineLease,
     EnginePartRecord,
+    EngineStateStore,
     HandleSourceFacts,
     ProducerCheckpoint,
 } from './state';
@@ -88,6 +91,109 @@ export async function verifyHandleFile(
     if (fingerprint !== expected.fingerprint) {
         throw new Error('handle file mismatch: content fingerprint changed');
     }
+}
+
+/** Post-reconciliation view of an upload's durable production state. */
+export interface ReconciledEngineState {
+    checkpoint: ProducerCheckpoint | undefined;
+    parts: EnginePartRecord[];
+}
+
+/**
+ * Reconcile the engine DB against the OPFS part store before planning a
+ * resume [R4]: OPFS, IndexedDB, and S3 share no transaction, so a record can
+ * claim staged bytes that no longer exist (storage eviction with a surviving
+ * DB, a partially failed teardown). Trusting such a record plans
+ * `finish-staged`, and every attempt then dies on the non-retryable
+ * `part N is not committed` — a permanent "Finish upload" card with no exit.
+ *
+ * The walk finds the longest verified prefix — parts `1..k` that are either
+ * durably uploaded (ETag) or staged with byte-for-byte matching committed
+ * OPFS entries — and, when anything above it diverges, rewinds: records above
+ * the prefix are demoted (their bytes/ETags are no longer trusted) and the
+ * producer checkpoint is rewritten to re-produce from the prefix boundary,
+ * exactly as the spec's "staged-but-missing parts are re-produced from the
+ * checkpoint" requires. Demotions land before the checkpoint rewrite so a
+ * crash mid-reconcile re-converges on the next pass.
+ *
+ * Callers must hold the upload's Web Lock (or be the running job) — the walk
+ * is not safe against a live writer.
+ */
+export async function reconcileEngineState(
+    fileId: string,
+    encrypted: boolean,
+    state: Pick<EngineStateStore, 'getParts' | 'putPart' | 'getCheckpoint' | 'putCheckpoint'>,
+    store: Pick<PartStore, 'listParts'>,
+): Promise<ReconciledEngineState> {
+    const [checkpoint, records] = await Promise.all([
+        state.getCheckpoint(fileId),
+        state.getParts(fileId),
+    ]);
+    if (!checkpoint || checkpoint.nextPartNumber <= 1) {
+        // Nothing durably produced — production restarts from scratch anyway.
+        return { checkpoint, parts: records };
+    }
+    const produced = checkpoint.nextPartNumber - 1;
+    const committed = new Map((await store.listParts()).map((p) => [p.partNumber, p.size]));
+    const byNumber = new Map(records.map((r) => [r.partNumber, r]));
+
+    let verifiedPrefix = 0;
+    let payloadOffset = 0;
+    for (let partNumber = 1; partNumber <= produced; partNumber++) {
+        const record = byNumber.get(partNumber);
+        const intact =
+            record !== undefined &&
+            ((record.uploaded && record.etag !== undefined) ||
+                (record.staged && committed.get(partNumber) === record.size));
+        if (!intact) {
+            break;
+        }
+        verifiedPrefix = partNumber;
+        payloadOffset += record.size;
+    }
+    if (verifiedPrefix >= produced) {
+        return { checkpoint, parts: records }; // every produced part is intact
+    }
+    if (encrypted) {
+        // Production restarts on an exact ECE record boundary. Non-final parts
+        // are record multiples so this never walks in practice — defensive.
+        while (verifiedPrefix > 0 && payloadOffset % ECE_ENCRYPTED_RECORD_SIZE !== 0) {
+            const record = byNumber.get(verifiedPrefix);
+            payloadOffset -= record?.size ?? 0;
+            verifiedPrefix -= 1;
+        }
+    }
+
+    // Demote everything above the prefix: bytes and ETags there are no longer
+    // trusted; re-production rewrites the records with fresh truth.
+    const parts: EnginePartRecord[] = [];
+    for (const record of records) {
+        if (record.partNumber <= verifiedPrefix) {
+            parts.push(record);
+            continue;
+        }
+        const demoted: EnginePartRecord = {
+            fileId: record.fileId,
+            partNumber: record.partNumber,
+            size: record.size,
+            staged: false,
+            uploaded: false,
+        };
+        await state.putPart(demoted);
+        parts.push(demoted);
+    }
+    const rewound: ProducerCheckpoint = {
+        fileId,
+        nextPartNumber: verifiedPrefix + 1,
+        sourceOffset: encrypted
+            ? (payloadOffset / ECE_ENCRYPTED_RECORD_SIZE) * ECE_RECORD_SIZE
+            : payloadOffset,
+        eceCounter: encrypted ? payloadOffset / ECE_ENCRYPTED_RECORD_SIZE : 0,
+        eofReached: false,
+        finalRecordEmitted: false,
+    };
+    await state.putCheckpoint(rewound);
+    return { checkpoint: rewound, parts };
 }
 
 export function planResume(
@@ -157,12 +263,33 @@ export async function executeResume(
     if (cancel.aborted) {
         throw new Error('Upload cancelled');
     }
-    const [lease, envelope, checkpoint, parts] = await Promise.all([
+    const [lease, envelope] = await Promise.all([
         deps.state.getLease(fileId),
         deps.state.getEnvelope(fileId),
-        deps.state.getCheckpoint(fileId),
-        deps.state.getParts(fileId),
     ]);
+    // Reconcile OPFS against the DB before planning [R4] — records claiming
+    // staged bytes that are gone must demote the plan to need-source instead
+    // of offering an unfinishable finish-staged. Safe here: the worker holds
+    // the upload's Web Lock for the whole job. Best-effort — a reconcile
+    // failure falls back to planning from the records as-is.
+    let checkpoint: ProducerCheckpoint | undefined;
+    let parts: EnginePartRecord[];
+    if (lease && envelope) {
+        ({ checkpoint, parts } = await reconcileEngineState(
+            fileId,
+            envelope.encrypted,
+            deps.state,
+            deps.store,
+        ).catch(async () => ({
+            checkpoint: await deps.state.getCheckpoint(fileId),
+            parts: await deps.state.getParts(fileId),
+        })));
+    } else {
+        [checkpoint, parts] = await Promise.all([
+            deps.state.getCheckpoint(fileId),
+            deps.state.getParts(fileId),
+        ]);
+    }
     const plan = planResume(lease, envelope, checkpoint, parts);
 
     if (plan.action === 'unrecoverable' || !lease || !envelope) {
