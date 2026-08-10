@@ -30,12 +30,16 @@ COPY --from=builder /app/package.json ./
 # Set working directory to backend
 WORKDIR /app/apps/backend
 
+# Fail closed: an unset NODE_ENV is treated as production by the app, but make
+# the intent explicit so CORS/logging never depend on a forgotten variable.
+ENV NODE_ENV=production
+
 # Expose port
 EXPOSE 3001
 
 # Health check - uses liveness probe for quick checks
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD bun -e "fetch('http://localhost:3001/api/health/live').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
+    CMD bun -e "fetch('http://localhost:3001/health/live').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
 # Run the server
 CMD ["bun", "run", "src/index.ts"]

@@ -28,8 +28,12 @@ services:
     ports:
       - "3001:3001"
     environment:
+      - NODE_ENV=${NODE_ENV:-production}
       - PORT=3001
       - BASE_URL=${BASE_URL:-http://localhost:3001}
+      # CORS is fail-closed in production; the frontend origin must be allowed
+      # explicitly (the compose frontend is published on :3000).
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - S3_BUCKET=${S3_BUCKET}
       - S3_ENDPOINT=${S3_ENDPOINT}
@@ -40,7 +44,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "bun", "-e", "fetch('http://localhost:3001/api/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3001/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3
