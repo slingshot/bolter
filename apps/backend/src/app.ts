@@ -10,6 +10,51 @@ import { providerRoutes } from './routes/providers';
 import { uploadRoutes } from './routes/upload';
 import { storage } from './storage';
 
+/**
+ * Health probes are unauthenticated and every `storage.ping()` fans a
+ * HeadBucket out to every registered provider. Cache the result for a short
+ * window (and de-duplicate concurrent probes) so a probe loop cannot amplify
+ * into an S3 API flood or stall behind a dead provider on every request.
+ */
+export const HEALTH_CACHE_TTL_MS = 5_000;
+
+type HealthResult = Awaited<ReturnType<typeof storage.ping>>;
+
+let cachedHealth: { value: HealthResult; at: number } | null = null;
+let inflightHealth: Promise<HealthResult> | null = null;
+
+/** Test seam — drops the memoised health result. */
+export function resetHealthCache(): void {
+    cachedHealth = null;
+    inflightHealth = null;
+}
+
+function getHealth(): Promise<HealthResult> {
+    if (cachedHealth && Date.now() - cachedHealth.at < HEALTH_CACHE_TTL_MS) {
+        return Promise.resolve(cachedHealth.value);
+    }
+    if (inflightHealth) {
+        return inflightHealth;
+    }
+
+    inflightHealth = storage
+        .ping()
+        .then((value) => {
+            cachedHealth = { value, at: Date.now() };
+            return value;
+        })
+        .finally(() => {
+            inflightHealth = null;
+        });
+
+    return inflightHealth;
+}
+
+// CORS must fail closed: reflecting the request Origin with credentials is only
+// ever acceptable for an explicit `NODE_ENV=development` build. An unset or
+// unrecognised NODE_ENV resolves to production (see `config.isDevelopment`).
+const allowedOrigins = [config.baseUrl, ...config.corsOrigins];
+
 export const app = new Elysia()
     // Request logging
     .onRequest(({ request }) => {
@@ -39,8 +84,8 @@ export const app = new Elysia()
     // Enable CORS for frontend
     .use(
         cors({
-            origin: config.env === 'development' ? true : config.baseUrl,
-            credentials: true,
+            origin: config.isDevelopment ? true : allowedOrigins,
+            credentials: config.isDevelopment,
             methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
             allowedHeaders: ['Content-Type', 'Authorization', 'baggage', 'sentry-trace'],
             exposeHeaders: ['WWW-Authenticate'],
@@ -97,7 +142,7 @@ export const app = new Elysia()
     .get(
         '/__heartbeat__',
         async () => {
-            const health = await storage.ping();
+            const health = await getHealth();
             logger.debug({ health }, 'Health check');
             return {
                 status: health.redis && health.s3 ? 'ok' : 'error',
@@ -143,7 +188,7 @@ export const app = new Elysia()
     .get(
         '/health',
         async ({ set }) => {
-            const health = await storage.ping();
+            const health = await getHealth();
             const isHealthy = health.redis && health.s3;
             if (!isHealthy) {
                 set.status = 503;
@@ -208,7 +253,7 @@ export const app = new Elysia()
     .get(
         '/health/ready',
         async ({ set }) => {
-            const health = await storage.ping();
+            const health = await getHealth();
             const isReady = health.redis && health.s3;
             if (!isReady) {
                 set.status = 503;

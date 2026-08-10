@@ -73,11 +73,12 @@ mock.module('../lib/sentry', () => ({
 }));
 
 // Import app AFTER all mocks are in place
-import { app } from '../app';
+import { app, resetHealthCache } from '../app';
 
 describe('GET /health', () => {
     beforeEach(() => {
         mockStorage.ping.mockReset();
+        resetHealthCache();
     });
 
     it('should return 200 with healthy status when both services are up', async () => {
@@ -152,6 +153,7 @@ describe('GET /health/live', () => {
 describe('GET /health/ready', () => {
     beforeEach(() => {
         mockStorage.ping.mockReset();
+        resetHealthCache();
     });
 
     it('should return 200 with ready status when both services are up', async () => {
@@ -203,6 +205,7 @@ describe('GET /__version__', () => {
 describe('GET /__heartbeat__', () => {
     beforeEach(() => {
         mockStorage.ping.mockReset();
+        resetHealthCache();
     });
 
     it('should return ok status when healthy', async () => {
@@ -285,5 +288,116 @@ describe('GET /robots.txt', () => {
         const text = await res.text();
         expect(text).toContain('User-agent: *');
         expect(text).toContain('Disallow: /');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Finding #29 — unauthenticated health probes must not fan a HeadBucket out to
+// every registered provider on every single request.
+// ---------------------------------------------------------------------------
+
+describe('health probe amplification (finding #29)', () => {
+    beforeEach(() => {
+        mockStorage.ping.mockReset();
+        resetHealthCache();
+    });
+
+    it('reuses a cached ping across repeated /health probes', async () => {
+        mockStorage.ping.mockResolvedValue({ redis: true, s3: true });
+
+        await app.handle(new Request('http://localhost/health'));
+        await app.handle(new Request('http://localhost/health'));
+        await app.handle(new Request('http://localhost/health'));
+
+        expect(mockStorage.ping).toHaveBeenCalledTimes(1);
+    });
+
+    it('shares one cached ping across the different probe endpoints', async () => {
+        mockStorage.ping.mockResolvedValue({ redis: true, s3: true });
+
+        await app.handle(new Request('http://localhost/health'));
+        await app.handle(new Request('http://localhost/health/ready'));
+        await app.handle(new Request('http://localhost/__heartbeat__'));
+
+        expect(mockStorage.ping).toHaveBeenCalledTimes(1);
+    });
+
+    it('de-duplicates concurrent probes into a single upstream ping', async () => {
+        let release: (value: { redis: boolean; s3: boolean }) => void = () => {
+            /* noop */
+        };
+        mockStorage.ping.mockImplementation(
+            () =>
+                new Promise<{ redis: boolean; s3: boolean }>((resolve) => {
+                    release = resolve;
+                }),
+        );
+
+        const inflight = Promise.all([
+            app.handle(new Request('http://localhost/health')),
+            app.handle(new Request('http://localhost/health/ready')),
+            app.handle(new Request('http://localhost/__heartbeat__')),
+        ]);
+
+        // Let the handlers reach the awaited ping before resolving it.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        release({ redis: true, s3: true });
+
+        const responses = await inflight;
+
+        expect(mockStorage.ping).toHaveBeenCalledTimes(1);
+        for (const res of responses) {
+            expect(res.status).toBe(200);
+        }
+    });
+
+    it('does not ping storage at all for the liveness probe', async () => {
+        mockStorage.ping.mockResolvedValue({ redis: true, s3: true });
+
+        await app.handle(new Request('http://localhost/health/live'));
+
+        expect(mockStorage.ping).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Finding #6 — CORS must not reflect an arbitrary origin, and must never send
+// `access-control-allow-credentials` outside an explicit development build.
+// ---------------------------------------------------------------------------
+
+describe('CORS fail-closed (finding #6)', () => {
+    const evilOrigin = 'https://evil.example';
+
+    it('does not reflect an arbitrary origin back to the caller', async () => {
+        const res = await app.handle(
+            new Request('http://localhost/config', { headers: { origin: evilOrigin } }),
+        );
+
+        expect(res.headers.get('access-control-allow-origin')).not.toBe(evilOrigin);
+    });
+
+    it('does not advertise credentialed cross-origin access', async () => {
+        // Pre-fix `credentials: true` was unconditional, so every response
+        // carried access-control-allow-credentials: true.
+        const res = await app.handle(
+            new Request('http://localhost/config', { headers: { origin: evilOrigin } }),
+        );
+
+        expect(res.headers.get('access-control-allow-credentials')).toBeNull();
+    });
+
+    it('does not reflect an arbitrary origin on a preflight request', async () => {
+        const res = await app.handle(
+            new Request('http://localhost/config', {
+                method: 'OPTIONS',
+                headers: {
+                    origin: evilOrigin,
+                    'access-control-request-method': 'GET',
+                },
+            }),
+        );
+
+        expect(res.headers.get('access-control-allow-origin')).not.toBe(evilOrigin);
+        expect(res.headers.get('access-control-allow-credentials')).toBeNull();
     });
 });
