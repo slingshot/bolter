@@ -33,7 +33,7 @@ import {
     runEngineInWorker,
 } from './upload-engine/client';
 import type { EngineJob, EngineSource } from './upload-engine/protocol';
-import type { CompletionEnvelope } from './upload-engine/state';
+import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
 import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
 import {
     computeContentFingerprint,
@@ -54,6 +54,10 @@ import {
 } from './zip';
 
 export { FileReadError } from './errors';
+// Re-exported for the persisted-handle one-click resume flow [R13]: callers
+// verify a handle-reacquired file with the same sampled fingerprint the
+// legacy resume uses (`verifyHandleFile` in upload-engine/resume.ts).
+export { computeContentFingerprint } from './upload-state';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -583,6 +587,13 @@ export interface UploadOptions {
     onZipProgress?: (percent: number) => void;
     onSpeedTest?: (phase: 'started' | 'done', speedMbps?: number) => void;
     onError?: (error: UploadError) => void;
+    /**
+     * Positional (parallel to `files`): File System Access handles for entries
+     * that have one (Chromium top-level drag-drop / `showOpenFilePicker`).
+     * A single-file engine upload persists its handle with the lease so an
+     * interrupted upload can offer one-click resume after reload [R13].
+     */
+    handles?: ReadonlyArray<FileSystemFileHandle | undefined>;
 }
 
 export interface UploadError {
@@ -1560,6 +1571,7 @@ async function uploadFilesViaEngine(
         onProgress,
         onZipProgress,
         onSpeedTest,
+        handles,
     } = options;
     const startTime = Date.now();
     const isMultiFile = files.length > 1;
@@ -1702,6 +1714,38 @@ async function uploadFilesViaEngine(
         declaredTotalSize: totalSize,
         source,
     };
+
+    // Persisted-handle one-click resume [R13]: stash the single file's handle
+    // plus verification facts in the engine lease *before* the worker writes
+    // its own lease (the engine's lease write preserves these fields). Best
+    // effort — a Chromium-only progressive enhancement must never fail the
+    // upload. Multi-file resumes are start-fresh only, so only single-file
+    // uploads persist a handle.
+    const sourceHandle = isMultiFile ? undefined : handles?.[0];
+    if (sourceHandle) {
+        try {
+            const engineState = await openEngineState();
+            await engineState.putLease({
+                fileId: uploadInfo.id,
+                uploadId: uploadInfo.uploadId,
+                uploadToken: uploadInfo.uploadToken,
+                ownerToken: uploadInfo.owner,
+                createdAt: Date.now(),
+                engineVersion: 1,
+                handles: [sourceHandle],
+                handleFacts: [
+                    {
+                        name: files[0].name,
+                        size: files[0].size,
+                        lastModified: files[0].lastModified,
+                        fingerprint: await computeContentFingerprint(files[0]),
+                    },
+                ],
+            });
+        } catch (error) {
+            console.warn('[Upload] Could not persist file handle for one-click resume:', error);
+        }
+    }
 
     const progress = createEngineProgressReporter(totalSize, onProgress);
     try {
@@ -2138,6 +2182,105 @@ export async function resumeEngineUpload(
     try {
         await resumeEngineUploadInWorker(
             fileId,
+            { onProgress: progress.onProgress, onRetry: progress.onRetry },
+            cancel,
+        );
+    } finally {
+        progress.stop();
+    }
+    return {
+        id: fileId,
+        url: `${window.location.origin}/download/${fileId}`,
+        ownerToken: lease.ownerToken,
+        duration: Date.now() - startTime,
+    };
+}
+
+/**
+ * One-click engine resume from a persisted File System Access handle [R13]:
+ * the caller has already re-acquired and *verified* the source file
+ * (`verifyHandleFile` against the lease's `handleFacts`), so this rebuilds
+ * the engine job around it — fresh part URLs from
+ * `/upload/multipart/:id/resume` (the originals died with the crashed run and
+ * are likely expired), the persisted producer checkpoint decides where
+ * production restarts — and re-enters the worker engine.
+ */
+export async function resumeEngineUploadWithFile(
+    fileId: string,
+    file: File,
+    onProgress?: (progress: UploadProgress) => void,
+    canceller?: Canceller,
+): Promise<UploadResult> {
+    const startTime = Date.now();
+    const state = await openEngineState();
+    const [lease, envelope, parts] = await Promise.all([
+        state.getLease(fileId),
+        state.getEnvelope(fileId),
+        state.getParts(fileId),
+    ]);
+    if (!lease || !envelope) {
+        throw new Error('This upload is no longer resumable. Please start a new upload.');
+    }
+
+    const completedPartNumbers = parts.filter((p) => p.uploaded).map((p) => p.partNumber);
+    const resumeResponse = await fetch(`${API_BASE_URL}/upload/multipart/${fileId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            uploadId: lease.uploadId,
+            completedPartNumbers,
+            ...(lease.uploadToken !== undefined && { uploadToken: lease.uploadToken }),
+        }),
+    });
+    if (!resumeResponse.ok) {
+        const status = resumeResponse.status;
+        // Engine state is deliberately left intact on the dead-session
+        // statuses too — the resume card's "Start fresh" owns the discard.
+        if (status === 400 || status === 404 || status === 410) {
+            throw new Error('Upload session expired. Please start a new upload.');
+        }
+        throw new Error(
+            `Resume temporarily unavailable (HTTP ${status}) — your progress is saved, please try again.`,
+        );
+    }
+    const resumeInfo: {
+        parts: Array<{ partNumber: number; url: string }>;
+        partSize: number;
+        numParts: number;
+    } = await resumeResponse.json();
+
+    // Full index-0-=-part-1 array; already-uploaded parts keep an empty slot
+    // the uploader never reads (same shape the worker's URL refresh builds).
+    const maxPart = Math.max(
+        resumeInfo.numParts ?? 0,
+        ...resumeInfo.parts.map((p) => p.partNumber),
+        0,
+    );
+    const partUrls = new Array<string>(maxPart).fill('');
+    for (const part of resumeInfo.parts) {
+        partUrls[part.partNumber - 1] = part.url;
+    }
+
+    const job: EngineJob = {
+        fileId,
+        uploadId: lease.uploadId,
+        uploadToken: lease.uploadToken,
+        ownerToken: lease.ownerToken,
+        partUrls,
+        partSize: getEffectivePartSize(resumeInfo.partSize || 0, envelope.encrypted),
+        encrypted: envelope.encrypted,
+        secretKeyB64: envelope.secretKeyB64,
+        maxConcurrent: getConcurrentUploads(envelope.expectedSize),
+        declaredTotalSize: envelope.expectedSize,
+        source: { kind: 'file', file },
+    };
+
+    const cancel = canceller ?? new Canceller();
+    const progress = createEngineProgressReporter(envelope.expectedSize, onProgress);
+    try {
+        await runEngineInWorker(
+            job,
+            envelope,
             { onProgress: progress.onProgress, onRetry: progress.onRetry },
             cancel,
         );

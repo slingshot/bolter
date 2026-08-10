@@ -12,6 +12,20 @@
  * never goes stale across `deleteDatabase` calls or version changes.
  */
 
+/**
+ * Identity facts for a persisted handle's file, captured at upload time [R13].
+ * A one-click resume re-reads the file from its handle and must prove it is
+ * still the file whose prefix was staged/uploaded — (name, size, mtime) plus
+ * the sampled content fingerprint the legacy resume flow uses
+ * (`computeContentFingerprint`). Checked by `verifyHandleFile` (resume.ts).
+ */
+export interface HandleSourceFacts {
+    name: string;
+    size: number;
+    lastModified: number;
+    fingerprint: string;
+}
+
 export interface EngineLease {
     fileId: string;
     uploadId: string;
@@ -19,6 +33,16 @@ export interface EngineLease {
     ownerToken: string;
     createdAt: number;
     engineVersion: 1;
+    /**
+     * Persisted File System Access handles for the upload's source files
+     * (Chromium progressive enhancement [R13]; structured-clonable, so
+     * IndexedDB stores them). Only top-level dropped files and
+     * `showOpenFilePicker` picks carry one. Written by the main thread at
+     * delegation time; the engine's own lease writes preserve the field.
+     */
+    handles?: FileSystemFileHandle[];
+    /** Parallel to `handles` — verification facts for one-click resume. */
+    handleFacts?: HandleSourceFacts[];
 }
 
 export interface CompletionEnvelope {

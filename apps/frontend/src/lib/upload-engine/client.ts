@@ -28,6 +28,7 @@ import {
     type CompletionEnvelope,
     type EngineLease,
     type EngineStateStore,
+    type HandleSourceFacts,
     openEngineState,
 } from './state';
 
@@ -333,6 +334,14 @@ export interface EngineResumeCandidate {
     downloadLimit: number;
     createdAt: number;
     action: 'finish' | 'need-source-single' | 'need-source-multi';
+    /**
+     * Persisted File System Access handle for a `need-source-single` resume
+     * (Chromium [R13]) — present only when its verification facts survived
+     * too, i.e. only when one-click resume is actually possible.
+     */
+    handle?: FileSystemFileHandle;
+    /** Verification facts for `handle`'s file (see `verifyHandleFile`). */
+    handleFacts?: HandleSourceFacts;
 }
 
 /**
@@ -370,6 +379,17 @@ export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[
             if (plan.action === 'unrecoverable') {
                 continue;
             }
+            const action =
+                plan.action === 'need-source'
+                    ? plan.kind === 'multi'
+                        ? 'need-source-multi'
+                        : 'need-source-single'
+                    : 'finish';
+            // A handle is only useful (and only offered) when production needs
+            // its single source back AND the facts to verify it survived [R13].
+            const handle = action === 'need-source-single' ? lease.handles?.[0] : undefined;
+            const handleFacts =
+                action === 'need-source-single' ? lease.handleFacts?.[0] : undefined;
             candidates.push({
                 fileId: lease.fileId,
                 fileName:
@@ -382,12 +402,8 @@ export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[
                 timeLimit: envelope.timeLimit,
                 downloadLimit: envelope.downloadLimit,
                 createdAt: lease.createdAt,
-                action:
-                    plan.action === 'need-source'
-                        ? plan.kind === 'multi'
-                            ? 'need-source-multi'
-                            : 'need-source-single'
-                        : 'finish',
+                action,
+                ...(handle && handleFacts && { handle, handleFacts }),
             });
         } catch {
             // Unreadable records: keep the staged bytes, offer nothing.

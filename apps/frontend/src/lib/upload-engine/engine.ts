@@ -117,7 +117,11 @@ async function runPipeline(
 
     // Durable ordering: lease before any part-store write [R12], envelope as
     // soon as its inputs exist [R3] — a source-free resume has no File to
-    // rebuild completion metadata from.
+    // rebuild completion metadata from. The main thread may have written a
+    // lease carrying persisted source handles before starting this job [R13]
+    // (the job itself cannot carry them across the worker boundary contract),
+    // so an existing lease's handle fields are preserved, never clobbered.
+    const existingLease = await deps.state.getLease(job.fileId);
     await deps.state.putLease({
         fileId: job.fileId,
         uploadId: job.uploadId,
@@ -125,6 +129,10 @@ async function runPipeline(
         ownerToken: job.ownerToken,
         createdAt: deps.now(),
         engineVersion: 1,
+        ...(existingLease?.handles !== undefined && { handles: existingLease.handles }),
+        ...(existingLease?.handleFacts !== undefined && {
+            handleFacts: existingLease.handleFacts,
+        }),
     });
     await deps.state.putEnvelope(envelope);
 

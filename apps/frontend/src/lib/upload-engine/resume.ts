@@ -30,6 +30,7 @@ import type {
     CompletionEnvelope,
     EngineLease,
     EnginePartRecord,
+    HandleSourceFacts,
     ProducerCheckpoint,
 } from './state';
 
@@ -53,6 +54,39 @@ export class ResumeNeedsSourceError extends Error {
         );
         this.name = 'ResumeNeedsSourceError';
         this.kind = kind;
+    }
+}
+
+/**
+ * Verify that a file re-acquired from a persisted handle really is the file
+ * whose prefix the interrupted upload staged/uploaded [R13]. Cheap identity
+ * fields are checked first; the sampled content fingerprint runs last because
+ * it reads several MiB. The fingerprint function is injected so production
+ * callers share the legacy `computeContentFingerprint` (a (name, size, mtime)
+ * tuple is not an identity — a different file with the same tuple would be
+ * spliced tail-onto-prefix) and tests can fake it.
+ */
+export async function verifyHandleFile(
+    file: File,
+    expected: HandleSourceFacts,
+    computeFingerprint: (blob: Blob) => Promise<string>,
+): Promise<void> {
+    if (file.name !== expected.name) {
+        throw new Error(
+            `handle file mismatch: name changed ("${file.name}" is not "${expected.name}")`,
+        );
+    }
+    if (file.size !== expected.size) {
+        throw new Error(
+            `handle file mismatch: size changed (${file.size} is not ${expected.size})`,
+        );
+    }
+    if (file.lastModified !== expected.lastModified) {
+        throw new Error('handle file mismatch: the file was modified since the upload started');
+    }
+    const fingerprint = await computeFingerprint(file);
+    if (fingerprint !== expected.fingerprint) {
+        throw new Error('handle file mismatch: content fingerprint changed');
     }
 }
 

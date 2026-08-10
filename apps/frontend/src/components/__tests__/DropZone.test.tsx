@@ -421,6 +421,40 @@ describe('DropZone', () => {
             expect(useAppStore.getState().files).toHaveLength(0);
         });
 
+        it('captures file-system handles for top-level dropped files only', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            const handle = { kind: 'file', name: 'top.txt' };
+            const items = [
+                {
+                    kind: 'file' as const,
+                    webkitGetAsEntry: () => fileEntry('top.txt'),
+                    getAsFileSystemHandle: () => Promise.resolve(handle),
+                },
+                {
+                    kind: 'file' as const,
+                    webkitGetAsEntry: () => dirEntry('folder', [fileEntry('inner.txt')]),
+                    getAsFileSystemHandle: () =>
+                        Promise.resolve({ kind: 'directory', name: 'folder' }),
+                },
+            ];
+            const list = Object.assign(items, {
+                length: items.length,
+            }) as unknown as DataTransferItemList;
+
+            fireEvent.drop(dropArea, { dataTransfer: { items: list, files: [] } });
+
+            await waitFor(() => {
+                expect(useAppStore.getState().files).toHaveLength(2);
+            });
+            const files = useAppStore.getState().files;
+            const top = files.find((f) => f.file.name === 'top.txt');
+            const inner = files.find((f) => f.file.name === 'inner.txt');
+            expect(top?.handle).toBe(handle);
+            expect(inner?.handle).toBeUndefined();
+        });
+
         it('does not toast on a clean folder drop', async () => {
             const { container } = render(<DropZone />);
             const dropArea = container.firstChild as HTMLElement;
