@@ -79,8 +79,12 @@ export function HomePage() {
     // staging directories (dirs whose upload lock is held by another tab are
     // skipped).
     useEffect(() => {
+        let cancelled = false;
         engineStartupMaintenance()
             .then((candidates) => {
+                if (cancelled) {
+                    return;
+                }
                 setEngineResumable(
                     candidates.find((c) => c.action === 'finish') ??
                         candidates.find(
@@ -89,7 +93,14 @@ export function HomePage() {
                         null,
                 );
             })
-            .catch(() => setEngineResumable(null));
+            .catch(() => {
+                if (!cancelled) {
+                    setEngineResumable(null);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     const handleResumeFileSelected = useCallback(
