@@ -15,6 +15,31 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { s3Logger as logger } from '../logger';
 
+/**
+ * Per-file expiry as an S3 object tag, so an operator can drive deletion with a
+ * tag-keyed lifecycle rule instead of a coarse age/prefix rule that cannot honor
+ * variable per-file TTLs.
+ *
+ * Opt-in (`S3_OBJECT_EXPIRY_TAGGING=true`): object tagging is not supported by
+ * every S3-compatible backend, and an unsupported `x-amz-tagging` would fail
+ * every upload. The in-process reaper (`src/reaper.ts`) is the default,
+ * backend-independent mechanism; this is complementary, not a replacement.
+ *
+ * On a pre-signed PUT the SDK hoists `x-amz-tagging` into the query string
+ * (SignedHeaders stays `host`), so the client needs no extra header.
+ */
+export function objectExpiryTagging(objectExpires?: Date): string | undefined {
+    if (process.env.S3_OBJECT_EXPIRY_TAGGING !== 'true') {
+        return undefined;
+    }
+    if (!objectExpires || Number.isNaN(objectExpires.getTime())) {
+        return undefined;
+    }
+    const tagKey = process.env.S3_OBJECT_EXPIRY_TAG_KEY || 'bolter-expires';
+    const tagValue = objectExpires.toISOString().slice(0, 10);
+    return `${encodeURIComponent(tagKey)}=${encodeURIComponent(tagValue)}`;
+}
+
 export interface S3StorageOptions {
     providerId: string;
     bucket: string;
@@ -143,16 +168,18 @@ export class S3Storage {
         return url;
     }
 
-    async getSignedUploadUrl(id: string, expiresIn = 3600, _objectExpires?: Date): Promise<string> {
+    async getSignedUploadUrl(id: string, expiresIn = 3600, objectExpires?: Date): Promise<string> {
         logger.debug({ id, expiresIn }, 'Generating signed upload URL');
         const startTime = Date.now();
 
-        // Note: We don't include Expires header here because:
+        // Note: We don't include an Expires header here because:
         // 1. It gets included in SignedHeaders, requiring the client to send it
-        // 2. R2 uses bucket lifecycle rules for object expiration, not the Expires header
+        // 2. Object expiry is enforced by the in-process reaper, optionally
+        //    assisted by a tag-keyed lifecycle rule (see objectExpiryTagging)
         const command = new PutObjectCommand({
             Bucket: this.bucket,
             Key: id,
+            Tagging: objectExpiryTagging(objectExpires),
         });
 
         logger.debug(
@@ -168,13 +195,13 @@ export class S3Storage {
             const url = await getSignedUrl(this.s3, command, { expiresIn });
             const duration = Date.now() - startTime;
 
+            // Never log the URL itself (nor a prefix of it) — the query string
+            // carries a valid AWS signature granting PUT access to this object
             logger.info(
                 {
                     id,
                     duration,
                     urlLength: url.length,
-                    urlPreview: `${url.substring(0, 150)}...`,
-                    fullUrl: url,
                 },
                 'Signed upload URL generated',
             );
@@ -186,16 +213,18 @@ export class S3Storage {
         }
     }
 
-    async createMultipartUpload(id: string, _objectExpires?: Date): Promise<string> {
+    async createMultipartUpload(id: string, objectExpires?: Date): Promise<string> {
         logger.info({ id, bucket: this.bucket }, 'Creating multipart upload');
         const startTime = Date.now();
 
         try {
-            // Note: R2 uses bucket lifecycle rules for object expiration, not the Expires header
+            // Expiry is enforced by the in-process reaper; the tag is an
+            // optional assist for a tag-keyed bucket lifecycle rule
             const result = await this.s3.send(
                 new CreateMultipartUploadCommand({
                     Bucket: this.bucket,
                     Key: id,
+                    Tagging: objectExpiryTagging(objectExpires),
                 }),
             );
             const duration = Date.now() - startTime;
@@ -248,7 +277,8 @@ export class S3Storage {
             const url = await getSignedUrl(this.s3, command, { expiresIn });
             const duration = Date.now() - startTime;
 
-            // Log first and every 100th part, plus sampling
+            // Log first and every 100th part, plus sampling. The URL itself is
+            // a signed PUT credential — log only its length.
             if (partNumber === 1 || partNumber % 100 === 0) {
                 logger.info(
                     {
@@ -256,7 +286,7 @@ export class S3Storage {
                         uploadId,
                         partNumber,
                         duration,
-                        urlPreview: `${url.substring(0, 150)}...`,
+                        urlLength: url.length,
                     },
                     'Signed multipart upload URL generated',
                 );
