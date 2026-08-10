@@ -308,6 +308,9 @@ const urlsFor = (n: number) => Array.from({ length: n }, (_, i) => `https://s3/p
 
 const FAST = { maxAttemptsPerPart: 2, retryDelayMs: () => 0 };
 
+/** The stager's `windowSize` for a 3-uploader job: `maxConcurrent + WINDOW_SLACK`. */
+const WINDOW_AT_3 = 3 + 2;
+
 describe('runEngine', () => {
     it('runs a single-file job end-to-end: stage, upload, complete, clear', async () => {
         const total = 2 * MIN + 12;
@@ -396,6 +399,69 @@ describe('runEngine', () => {
         expect(h.log.indexOf('event:cancelled')).toBeLessThan(h.log.indexOf('destroy'));
         expect(await h.state.getLease(job.fileId)).toBeUndefined();
         expect(h.completions).toEqual([]);
+    });
+
+    it('keeps a full window staged and ready, so a completion convoy starves no uploader', async () => {
+        // Window slots are freed at pickup, not at delete: with maxConcurrent
+        // 3 and WINDOW_SLACK 2, three parts go in flight and five more sit
+        // staged behind them. Counting in-flight parts against the window (the
+        // old accounting) would have stopped staging at five parts total —
+        // only two ready — and left the third uploader of every convoy waiting
+        // on the stager.
+        const partSize = 4;
+        const totalParts = 12;
+        const data = makeData(partSize * totalParts);
+        const urls = urlsFor(totalParts);
+        const started: number[] = [];
+        const gates: (() => void)[] = [];
+        const h = makeHarness(urls, {
+            uploadPart: () => (url, _body, hooks) => {
+                const partNumber = urls.indexOf(url) + 1;
+                started.push(partNumber);
+                return new Promise((resolve, reject) => {
+                    gates.push(() => resolve({ etag: `etag-${partNumber}` }));
+                    hooks.signal.addEventListener('abort', () => reject(new Error('aborted')), {
+                        once: true,
+                    });
+                });
+            },
+        });
+        const job = makeJob({
+            source: { kind: 'blob', blob: new Blob([data]) },
+            partUrls: urls,
+            partSize,
+            declaredTotalSize: data.byteLength,
+            maxConcurrent: 3,
+        });
+        const canceller = new AbortController();
+        const staged = () => h.log.filter((e) => e.startsWith('stagePart:')).length;
+
+        const run = runEngine(
+            job,
+            makeEnvelope(job.fileId, data.byteLength),
+            h.deps,
+            canceller.signal,
+        );
+        run.catch(() => undefined);
+
+        await waitFor(() => staged() === 3 + WINDOW_AT_3);
+        expect(started).toEqual([1, 2, 3]);
+        // …and the window holds there: part 9 waits for a pickup, not a delete.
+        await waitFor(() => gates.length === 3);
+        expect(staged()).toBe(3 + WINDOW_AT_3);
+
+        // The convoy: all three parts land at once. Every uploader finds the
+        // next part already staged.
+        for (const release of gates.splice(0)) {
+            release();
+        }
+        await waitFor(() => started.length === 6);
+        expect(started.slice(3)).toEqual([4, 5, 6]);
+        // Three pickups freed three slots, so the stager ran three parts further.
+        await waitFor(() => staged() === 6 + WINDOW_AT_3);
+
+        canceller.abort();
+        await expect(run).rejects.toThrow(/cancel/i);
     });
 
     it('a retryable terminal failure emits error{retryable:true} and preserves state', async () => {

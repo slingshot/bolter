@@ -65,7 +65,7 @@ export interface EngineTuning {
     producerChunkBytes?: number;
 }
 
-/** Staged-but-unuploaded parts the stager may run ahead of the uploaders. */
+/** Staged-and-ready parts the stager may run ahead of the uploaders. */
 const WINDOW_SLACK = 2;
 
 // ---------------------------------------------------------------------------
@@ -198,8 +198,14 @@ async function runPipeline(
         queue.push(item);
     }
 
-    // Rolling-window slot accounting: the uploader frees a slot when it
-    // deletes an uploaded part's staged bytes.
+    // Rolling-window slot accounting: a part holds a window slot from the
+    // moment the stager commits it until an uploader *picks it up*, not until
+    // its bytes are deleted. Slots held for a whole transfer left only
+    // WINDOW_SLACK parts staged-and-ready in front of `maxConcurrent`
+    // uploaders, so every convoy of simultaneous part completions idled an
+    // uploader for a full staging latency. Residency stays bounded — the
+    // window, plus the parts in flight, plus whatever is awaiting its detached
+    // delete.
     let releaseCredits = 0;
     const releaseWaiters: { resolve: () => void; reject: (err: Error) => void }[] = [];
     const releaseSlot = () => {
@@ -245,6 +251,22 @@ async function runPipeline(
     };
 
     const base = production.basePartNumber;
+
+    /**
+     * Hand the next staged part to an uploader, freeing its window slot as it
+     * goes. Parts staged by an *earlier* run (`partNumber <= base`) never
+     * occupied a slot in this stager's window, so picking one up must not
+     * credit one either — that would let the window run wider than its size on
+     * every resume.
+     */
+    const takeNextPart = async (): Promise<{ partNumber: number; size: number } | null> => {
+        const next = await queue.next();
+        if (next && next.partNumber > base) {
+            releaseSlot();
+        }
+        return next;
+    };
+
     const stagerRun = (
         production.produce
             ? runStager(
@@ -310,10 +332,10 @@ async function runPipeline(
         },
     );
 
-    const uploaderRun = runUploaders(() => queue.next(), {
+    const uploaderRun = runUploaders(takeNextPart, {
         urls: job.partUrls,
         maxConcurrent: job.maxConcurrent,
-        store: releasingPartStore(deps.store, releaseSlot),
+        store: deps.store,
         state: deps.state,
         fileId: job.fileId,
         uploadPart: (url, body, hooks) => deps.uploadPart(url, body, hooks),
@@ -503,20 +525,6 @@ function offsetPartState(inner: EngineStateStore, base: number): EngineStateStor
         getParts: (fileId) => inner.getParts(fileId),
         listLeases: () => inner.listLeases(),
         clearUpload: (fileId) => inner.clearUpload(fileId),
-    };
-}
-
-/** Frees a stager window slot whenever the uploader deletes uploaded bytes. */
-function releasingPartStore(inner: PartStore, onDeleted: () => void): PartStore {
-    return {
-        stagePart: (partNumber, chunks) => inner.stagePart(partNumber, chunks),
-        readPart: (partNumber) => inner.readPart(partNumber),
-        deletePart: async (partNumber) => {
-            await inner.deletePart(partNumber);
-            onDeleted();
-        },
-        listParts: () => inner.listParts(),
-        destroy: () => inner.destroy(),
     };
 }
 

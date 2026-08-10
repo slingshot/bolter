@@ -11,8 +11,11 @@
  * (shrink). After every committed stage the part record is persisted and
  * *then* the producer checkpoint — the checkpoint always describes the next
  * part to produce, so a crash between stages resumes from an exact boundary
- * [R4][R5]. When `windowSize` staged-but-unuploaded parts accumulate, staging
- * pauses until `partReleased()` reports a freed slot (backpressure).
+ * [R4][R5]. When `windowSize` unreleased parts accumulate, staging pauses
+ * until `partReleased()` reports a freed slot (backpressure). What frees a
+ * slot is the consumer's business — the engine frees one when an uploader
+ * picks a part up, so the window measures parts staged and *waiting*, not
+ * bytes resident on disk.
  *
  * Worker-safe: no DOM globals. For encrypted uploads only ciphertext reaches
  * the part store — the encryption transform runs before any staging write.
@@ -31,7 +34,7 @@ export interface StagerOpts {
     fileId: string;
     partSize: number; // payload bytes per part (already effective/record-aligned when encrypted)
     totalParts: number; // allocated part count — hard cap; final part absorbs overflow [R1]
-    windowSize: number; // max staged-not-yet-uploaded parts
+    windowSize: number; // max staged parts outstanding before `partReleased()` gates staging
     /** Test seam for the growth-absorption cap; defaults to the S3/R2 5 GiB
      * per-part limit. */
     maxPartBytes?: number;
