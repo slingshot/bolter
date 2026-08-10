@@ -36,6 +36,16 @@ export const ECE_ENCRYPTED_RECORD_SIZE = ECE_RECORD_SIZE + TAG_LENGTH + 1;
 export const ECE_VERSION = 1;
 
 /**
+ * First ECE version whose writer is guaranteed to emit a final-flagged record.
+ *
+ * Deliberately a fixed floor rather than `ECE_VERSION`: every version from 1
+ * onwards always terminates the stream with a final record, so bumping
+ * `ECE_VERSION` for an unrelated format change must not silently downgrade the
+ * millions of already-stored v1 files back to the fail-open legacy path.
+ */
+const ECE_MIN_VERSION_WITH_FINAL_RECORD = 1;
+
+/**
  * Read the ECE format version from a file's decrypted metadata.
  *
  * Returns 0 when the marker is absent or not a positive number, i.e. metadata
@@ -351,13 +361,18 @@ async function encryptRecord(
 export interface DecryptionStreamOptions {
     /**
      * ECE format version taken from the file's authenticated metadata via
-     * `readEceVersion(metadata)`. `>= ECE_VERSION` means the ciphertext was
-     * written by a client that always emits a final-flagged record, so a
-     * missing final record is truncation or tampering and fails closed.
-     * 0 (the default) means pre-versioning data, which may legitimately lack
-     * one and is decrypted with warning telemetry only.
+     * `readEceVersion(metadata)`. `>= ECE_MIN_VERSION_WITH_FINAL_RECORD` means
+     * the ciphertext was written by a client that always emits a final-flagged
+     * record, so a missing final record is truncation or tampering and fails
+     * closed. 0 means pre-versioning data, which may legitimately lack one and
+     * is decrypted with warning telemetry only.
+     *
+     * Required, with no default: omitting it would silently select the
+     * fail-open legacy path, which is precisely the vulnerability the marker
+     * exists to close. Callers that genuinely have no marker must say so by
+     * passing 0.
      */
-    eceVersion?: number;
+    eceVersion: number;
 }
 
 /**
@@ -365,10 +380,10 @@ export interface DecryptionStreamOptions {
  */
 export function createDecryptionStream(
     keychain: Keychain,
-    options: DecryptionStreamOptions = {},
+    options: DecryptionStreamOptions,
 ): TransformStream<Uint8Array, Uint8Array> {
-    const eceVersion = options.eceVersion ?? 0;
-    const requireFinalRecord = eceVersion >= ECE_VERSION;
+    const eceVersion = options.eceVersion;
+    const requireFinalRecord = eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
     let recordCount = 0;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
