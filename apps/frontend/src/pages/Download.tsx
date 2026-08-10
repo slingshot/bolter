@@ -8,7 +8,7 @@ import {
     Lock,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { DownloadFileTree } from '@/components/DownloadFileTree';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
@@ -17,6 +17,7 @@ import {
     API_BASE_URL,
     checkLegacyFile,
     type DownloadPhase,
+    type DownloadStatusResult,
     downloadFile,
     fileExists,
     getDownloadStatus,
@@ -25,9 +26,71 @@ import {
 import { Keychain } from '@/lib/crypto';
 import { trackDownload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
+import { captureUrlFragmentSecret } from '@/lib/url-secret';
 import { formatBytes, formatTimeLimit, triggerDownload } from '@/lib/utils';
 
 type DownloadState = 'loading' | 'ready' | 'downloading' | 'complete' | 'error' | 'not-found';
+
+/**
+ * The key never survives a reload: it is stripped from the address bar on load
+ * and held in memory only (persisting it would put the file key on disk). Say
+ * so, instead of leaving the user with a generic "missing key" message.
+ */
+const MISSING_KEY_MESSAGE =
+    'This page is missing its decryption key. The key is the part of the link after "#", and it is removed from the address bar as soon as the page loads — so reloading or bookmarking this page loses it. Open the original share link again.';
+
+const DIRECT_DOWNLOAD_SETTLE_MS = 3000;
+const DIRECT_DOWNLOAD_RECHECK_MS = 2000;
+const DIRECT_DOWNLOAD_STATUS_ATTEMPTS = 3;
+
+export type DirectDownloadOutcome = 'delivered' | 'not-delivered' | 'unknown';
+
+/**
+ * Decide whether a hidden-iframe direct download actually delivered anything.
+ *
+ * The iframe cannot surface HTTP status, so the only observable signal is the
+ * server-side download counter moving. `gone` means the file disappeared
+ * during the attempt: that is only consistent with success when this very
+ * download would have exhausted the limit (the server schedules deletion once
+ * `dl >= dlimit`); otherwise it was deleted or expired out from under us and
+ * nothing was delivered. A transient status error tells us nothing, so it
+ * stays `unknown` and is treated as before (the page deliberately never turns
+ * a transient status failure into a hard error).
+ */
+export function evaluateDirectDownloadOutcome(
+    before: { dl: number; dlimit: number },
+    after: DownloadStatusResult,
+): DirectDownloadOutcome {
+    if (after.status === 'ok') {
+        return after.dl > before.dl ? 'delivered' : 'not-delivered';
+    }
+    if (after.status === 'gone') {
+        return before.dl + 1 >= before.dlimit ? 'delivered' : 'not-delivered';
+    }
+    return 'unknown';
+}
+
+/**
+ * Classify a download failure so expected conditions get the right screen.
+ *
+ * `limit` covers both the typed error a future `fetchDownloadUrlInfo` throws
+ * at the download limit and the raw `HTTP 404`/`HTTP 410` the download routes
+ * return once the file is exhausted or deleted — neither is a bug worth an
+ * error report, and neither is fixed by a "Try again" button.
+ */
+export function classifyDownloadError(err: unknown): 'key' | 'limit' | 'other' {
+    const name = err instanceof Error ? err.name : '';
+    if (name === 'MissingKeyError' || name === 'InvalidKeyError') {
+        return 'key';
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    if (name === 'LimitReachedError' || /HTTP (404|410)/.test(message)) {
+        return 'limit';
+    }
+    return 'other';
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface FileMetadata {
     name: string;
@@ -42,8 +105,15 @@ interface FileMetadata {
 
 export function DownloadPage() {
     const { id } = useParams<{ id: string }>();
-    const location = useLocation();
     const navigate = useNavigate();
+
+    // The AES key rides in the URL fragment. Read it out of memory (main.tsx
+    // captured and stripped it before any telemetry SDK could read
+    // location.href) and, for an in-app navigation that carried one, capture
+    // and strip it here — during render, ahead of every effect, breadcrumb and
+    // network call. The call is idempotent, so StrictMode double-renders and
+    // ordinary re-renders are safe.
+    const secretKey = captureUrlFragmentSecret();
 
     const [state, setState] = useState<DownloadState>('loading');
     const [metadata, setMetadata] = useState<FileMetadata | null>(null);
@@ -57,6 +127,7 @@ export function DownloadPage() {
     const loadedKeyRef = useRef<string | null>(null);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
     const directPendingRef = useRef(false);
+    const directRunRef = useRef(0);
 
     // Compute document meta based on state and metadata
     const documentMeta = useMemo(() => {
@@ -107,7 +178,7 @@ export function DownloadPage() {
             return;
         }
         const fileId = id;
-        const requestKey = fileId + location.hash;
+        const requestKey = `${fileId}#${secretKey}`;
 
         // Prevent duplicate requests from StrictMode double-render
         if (loadedKeyRef.current === requestKey) {
@@ -130,8 +201,6 @@ export function DownloadPage() {
         // A newer navigation replaces loadedKeyRef, so a slow response for an
         // older key must not commit state (StrictMode re-runs keep the same key)
         const isStale = () => loadedKeyRef.current !== requestKey;
-
-        const secretKey = location.hash.slice(1); // Remove the # prefix
 
         async function loadMetadata() {
             try {
@@ -194,7 +263,7 @@ export function DownloadPage() {
                     e instanceof Error &&
                     (e.name === 'MissingKeyError' || e.name === 'InvalidKeyError')
                 ) {
-                    setError(e.message);
+                    setError(e.name === 'MissingKeyError' ? MISSING_KEY_MESSAGE : e.message);
                     setIsKeyError(true);
                     setState('error');
                 } else if (message.includes('404') || message.includes('401')) {
@@ -216,7 +285,7 @@ export function DownloadPage() {
         }
 
         loadMetadata();
-    }, [id, location.hash]);
+    }, [id, secretKey]);
 
     const handleDownload = async () => {
         if (!id) {
@@ -227,6 +296,7 @@ export function DownloadPage() {
         // so a finished download for file A never writes state onto file B
         const requestKey = loadedKeyRef.current;
         const isStale = () => loadedKeyRef.current !== requestKey;
+        const fromCompleteScreen = state === 'complete';
 
         // Direct download for unencrypted files (uses native browser download)
         // Works for: single files, or multi-file zips (zipped at upload time)
@@ -242,7 +312,8 @@ export function DownloadPage() {
                 return;
             }
             directPendingRef.current = true;
-            const fromCompleteScreen = state === 'complete';
+            // A later click supersedes any still-running delivery check
+            const run = ++directRunRef.current;
 
             // Validate before navigating the iframe — the iframe itself cannot
             // surface server errors, so a failed pre-check must not burn a click
@@ -286,28 +357,73 @@ export function DownloadPage() {
                 document.body.appendChild(iframe);
                 iframeRef.current = iframe;
             }
+            // Snapshot the counter so the post-navigation check can tell a real
+            // delivery from an iframe request the server refused
+            const before = { dl: status.dl, dlimit: status.dlimit };
+
             iframe.src = `${API_BASE_URL}/download/direct/${id}`;
 
             // Refresh download counts once the server has likely burned the credit
             setTimeout(async () => {
                 directPendingRef.current = false;
                 trackDownload({ fileId: id });
-                if (isStale()) {
+                if (isStale() || directRunRef.current !== run) {
                     return;
                 }
-                const after = await getDownloadStatus(id, keychain);
-                if (isStale()) {
+
+                // The iframe cannot report HTTP failures (410 at the limit, a
+                // 5xx from URL signing), so confirm delivery by watching the
+                // server-side counter instead of assuming success. Re-check a
+                // couple of times before giving up — a slow request may not
+                // have reached the server yet.
+                let after = await getDownloadStatus(id, keychain);
+                for (
+                    let attempt = 1;
+                    attempt < DIRECT_DOWNLOAD_STATUS_ATTEMPTS &&
+                    evaluateDirectDownloadOutcome(before, after) === 'not-delivered';
+                    attempt++
+                ) {
+                    await delay(DIRECT_DOWNLOAD_RECHECK_MS);
+                    if (isStale() || directRunRef.current !== run) {
+                        return;
+                    }
+                    after = await getDownloadStatus(id, keychain);
+                }
+                if (isStale() || directRunRef.current !== run) {
                     return;
                 }
+
                 if (after.status === 'ok') {
                     setDownloadsLeft(after.dlimit - after.dl);
                     setCanDownloadAgain(after.dl < after.dlimit);
                 } else if (after.status === 'gone') {
                     setCanDownloadAgain(false);
                 }
-                // 'error' is transient — leave canDownloadAgain untouched
+
+                if (evaluateDirectDownloadOutcome(before, after) === 'not-delivered') {
+                    captureError(new Error('Direct download delivered nothing'), {
+                        operation: 'download.direct',
+                        level: 'warning',
+                        extra: {
+                            fileId: id,
+                            dlBefore: before.dl,
+                            dlimit: before.dlimit,
+                            afterStatus: after.status,
+                        },
+                    });
+                    setIsKeyError(false);
+                    setError(
+                        'The download did not start. The file may have just reached its download limit, or the server rejected the request.',
+                    );
+                    setState('error');
+                    return;
+                }
+
+                // 'unknown' (transient status error) is reported as before —
+                // the page deliberately never turns a transient status failure
+                // into a hard error
                 setState('complete');
-            }, 3000);
+            }, DIRECT_DOWNLOAD_SETTLE_MS);
             return;
         }
 
@@ -360,14 +476,28 @@ export function DownloadPage() {
         } catch (e: unknown) {
             const message = e instanceof Error ? e.message : String(e);
             console.error('Download failed:', e);
-            if (
-                e instanceof Error &&
-                (e.name === 'MissingKeyError' || e.name === 'InvalidKeyError')
-            ) {
+            const kind = classifyDownloadError(e);
+            if (kind === 'key') {
                 if (!isStale()) {
-                    setError(e.message);
+                    setError(
+                        e instanceof Error && e.name === 'MissingKeyError'
+                            ? MISSING_KEY_MESSAGE
+                            : message,
+                    );
                     setIsKeyError(true);
                     setState('error');
+                }
+                return;
+            }
+            if (kind === 'limit') {
+                // Expected: the file hit its download limit or was deleted
+                // while this page was open. Show the limit / not-found screen
+                // instead of a generic failure with a dead "Try again", and
+                // don't report an expected condition as an error.
+                if (!isStale()) {
+                    setDownloadsLeft(0);
+                    setCanDownloadAgain(false);
+                    setState(fromCompleteScreen ? 'complete' : 'not-found');
                 }
                 return;
             }
