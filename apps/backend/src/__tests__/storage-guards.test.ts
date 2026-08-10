@@ -25,9 +25,21 @@ mock.module('redis', () => ({
     createClient: () => fakeClient,
 }));
 
-import { RedisStorage } from '../storage/redis';
-// eslint-disable-next-line import/order -- import after the redis mock
-import { objectExpiryTagging } from '../storage/s3';
+// These two modules are globally replaced by `mock.module` in sibling test
+// files (storage.test.ts, health.test.ts, reaper.test.ts, routes/*.test.ts all
+// stub `RedisStorage` as an empty `class {}`). Bun's module mocks are
+// process-global and are never reset between files, so a plain static import
+// here yields the real class or a method-less stub purely depending on which
+// file bun loads first — i.e. on readdir order, which differs between macOS
+// (green) and Linux CI (red). Appending a query string makes the specifier
+// distinct from the one the mocks are registered against, so these always
+// resolve to the real implementation regardless of order.
+// The `as string` keeps the specifier non-literal so tsc doesn't try to resolve
+// the query form; the cast restores full typing.
+const REAL_REDIS_MODULE = '../storage/redis.ts?unmocked' as string;
+const REAL_S3_MODULE = '../storage/s3.ts?unmocked' as string;
+const { RedisStorage } = (await import(REAL_REDIS_MODULE)) as typeof import('../storage/redis');
+const { objectExpiryTagging } = (await import(REAL_S3_MODULE)) as typeof import('../storage/s3');
 
 // ---------------------------------------------------------------------------
 // #7 — finalization writes must not resurrect a deleted/expired key
