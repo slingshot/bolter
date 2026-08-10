@@ -103,6 +103,28 @@ function looksLikeConnectionFailure(error: Error): boolean {
 }
 
 /**
+ * Drop an uploaded part's staged bytes, detached from the upload.
+ *
+ * Only ever called once the uploaded+ETag record has committed [R11], after
+ * which the bytes are dead weight: awaiting the delete (several OPFS round
+ * trips) would put storage latency straight into this worker's turnaround for
+ * nothing. Every failure is swallowed — synchronous throws included, so this
+ * can never be mistaken for an upload failure and re-send a committed part.
+ * A lost delete costs space, never progress: completion and cancel destroy the
+ * whole directory, startup GC reaps orphans, and resume reconciliation reads
+ * an uploaded+ETag record as intact whether or not its file survived.
+ */
+function releaseStagedBytes(store: PartStore, partNumber: number): void {
+    const swallow = (err: unknown) =>
+        console.debug(`[Engine] could not release staged part ${partNumber}:`, err);
+    try {
+        store.deletePart(partNumber).catch(swallow);
+    } catch (err) {
+        swallow(err);
+    }
+}
+
+/**
  * Upload every part the queue yields; resolves to `partNumber → ETag` once the
  * queue returns null and all in-flight parts have finished. Pull-based: the
  * stager feeds the queue as parts commit. Any worker's terminal failure (or
@@ -285,18 +307,7 @@ export async function runUploaders(
                     etag,
                 });
                 etags.set(partNumber, etag);
-                // With that record durable the staged bytes are dead weight,
-                // so releasing them is detached: awaiting an OPFS delete (a
-                // handful of round trips) before pulling the next part put
-                // storage latency directly into this worker's turnaround. A
-                // lost delete costs space, never progress — completion and
-                // cancel both `destroy()` the whole directory, startup GC
-                // reaps orphaned ones, and reconciliation reads an
-                // uploaded+ETag record as intact whether or not its file
-                // survived.
-                opts.store.deletePart(partNumber).catch((err: unknown) => {
-                    console.debug(`[Engine] could not release staged part ${partNumber}:`, err);
-                });
+                releaseStagedBytes(opts.store, partNumber);
                 return;
             } catch (err) {
                 inFlight.delete(partNumber);

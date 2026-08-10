@@ -370,13 +370,22 @@ describe('runUploaders', () => {
         finishFirstDelete?.();
     });
 
-    it('survives a failed staged-part deletion', async () => {
+    it.each([
+        ['rejects', () => Promise.reject(new Error('OPFS removeEntry failed'))],
+        [
+            'throws synchronously',
+            () => {
+                throw new Error('OPFS handle is closed');
+            },
+        ],
+    ])('survives a staged-part deletion that %s', async (_label, deletePart) => {
         const inner = new MemoryPartStore();
         await stage(inner, 1, makeData(4));
+        let uploads = 0;
         const store: PartStore = {
             stagePart: (partNumber, chunks) => inner.stagePart(partNumber, chunks),
             readPart: (partNumber) => inner.readPart(partNumber),
-            deletePart: () => Promise.reject(new Error('OPFS removeEntry failed')),
+            deletePart: deletePart as PartStore['deletePart'],
             listParts: () => inner.listParts(),
             destroy: () => inner.destroy(),
         };
@@ -387,15 +396,20 @@ describe('runUploaders', () => {
             baseOpts({
                 store,
                 state,
-                uploadPart: () => Promise.resolve({ etag: 'etag-1' }),
+                uploadPart: () => {
+                    uploads += 1;
+                    return Promise.resolve({ etag: 'etag-1' });
+                },
                 maxConcurrent: 1,
             }),
         );
         await flush();
 
-        // The ETag is what completion needs; the orphaned bytes are reaped by
-        // the completion/cancel `destroy()` and by startup GC.
+        // The ETag is what completion needs, and the part is not re-sent: the
+        // orphaned bytes are reaped by the completion/cancel `destroy()` and
+        // by startup GC.
         expect(etags).toEqual(new Map([[1, 'etag-1']]));
+        expect(uploads).toBe(1);
         expect(partPuts).toEqual([
             {
                 fileId: 'up_test',
