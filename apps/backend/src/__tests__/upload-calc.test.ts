@@ -1,4 +1,5 @@
-import { describe, expect, it, mock } from 'bun:test';
+import { afterEach, describe, expect, it, mock } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 
 // --- Mock storage and its transitive dependencies before importing upload.ts ---
@@ -46,7 +47,16 @@ mock.module('../lib/sentry', () => ({
 }));
 
 // Import after mocking
-import { calculateOptimalPartSize } from '../routes/upload';
+import { DOWNLOAD_LIMITS, TIME_LIMITS } from '@bolter/shared';
+import {
+    calculateOptimalPartSize,
+    clampDownloadLimit,
+    clampExpireSeconds,
+    clientIp,
+    FixedWindowRateLimiter,
+    uploadTokenEnforced,
+    verifyUploadToken,
+} from '../routes/upload';
 
 const { MIN_PART_SIZE, MAX_PART_SIZE, DEFAULT_PART_SIZE, MAX_PARTS } = UPLOAD_LIMITS;
 const MB = 1024 * 1024; // binary MB for alignment checks
@@ -199,5 +209,184 @@ describe('calculateOptimalPartSize', () => {
 
         expect(result1.partSize).toBe(result2.partSize);
         expect(result1.numParts).toBe(result2.numParts);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #5 — dlimit must be a positive integer clamped to config.maxDownloads
+// ---------------------------------------------------------------------------
+
+describe('clampDownloadLimit', () => {
+    const MAX = DOWNLOAD_LIMITS.MAX_DOWNLOADS;
+    const DEFAULT = DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS;
+
+    it('should fall back to the configured default when omitted', () => {
+        expect(clampDownloadLimit(undefined)).toBe(DEFAULT);
+    });
+
+    it('should pass an in-range value through unchanged', () => {
+        expect(clampDownloadLimit(20)).toBe(20);
+    });
+
+    it('should clamp an absurd limit down to the maximum', () => {
+        // Unclamped, dl >= dlimit is unreachable: unlimited downloads
+        expect(clampDownloadLimit(1_000_000_000)).toBe(MAX);
+    });
+
+    it('should raise a non-positive limit to 1 instead of bricking the file', () => {
+        // A negative dlimit survived `||` and made dl >= dlimit true immediately
+        expect(clampDownloadLimit(-1)).toBe(1);
+        expect(clampDownloadLimit(0)).toBe(DEFAULT);
+    });
+
+    it('should truncate fractions so the stored value round-trips through parseInt', () => {
+        expect(clampDownloadLimit(3.9)).toBe(3);
+    });
+
+    it('should never return a value that stringifies in exponential notation', () => {
+        expect(clampDownloadLimit(1e21).toString()).not.toContain('e');
+    });
+
+    it('should fall back on non-finite input rather than storing NaN/Infinity', () => {
+        expect(clampDownloadLimit(Number.NaN)).toBe(DEFAULT);
+        expect(clampDownloadLimit(Number.POSITIVE_INFINITY)).toBe(DEFAULT);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #7 — timeLimit must never reach EXPIRE as a non-positive value
+// ---------------------------------------------------------------------------
+
+describe('clampExpireSeconds', () => {
+    const MAX = TIME_LIMITS.MAX_EXPIRE_SECONDS;
+    const DEFAULT = TIME_LIMITS.DEFAULT_EXPIRE_SECONDS;
+
+    it('should fall back to the configured default when omitted', () => {
+        expect(clampExpireSeconds(undefined)).toBe(DEFAULT);
+    });
+
+    it('should cap at the configured maximum', () => {
+        expect(clampExpireSeconds(86400 * 365)).toBe(MAX);
+    });
+
+    it('should never return a non-positive TTL', () => {
+        // EXPIRE(key, -1) DELETES the key; later HSETs then resurrect it
+        // TTL-less, ownerless and providerId-less
+        for (const bad of [-1, 0, -86400, Number.NaN, Number.NEGATIVE_INFINITY]) {
+            expect(clampExpireSeconds(bad)).toBeGreaterThan(0);
+        }
+    });
+
+    it('should truncate a fractional TTL', () => {
+        expect(clampExpireSeconds(3600.7)).toBe(3600);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #52 — upload-owner token comparison
+// ---------------------------------------------------------------------------
+
+describe('verifyUploadToken', () => {
+    const token = 'f'.repeat(32);
+    const hash = createHash('sha256').update(token).digest('hex');
+
+    it('should accept the matching token', () => {
+        expect(verifyUploadToken(token, hash)).toBe(true);
+    });
+
+    it('should reject a different token', () => {
+        expect(verifyUploadToken('e'.repeat(32), hash)).toBe(false);
+    });
+
+    it('should reject a missing or non-string token', () => {
+        expect(verifyUploadToken(undefined, hash)).toBe(false);
+        expect(verifyUploadToken('', hash)).toBe(false);
+        expect(verifyUploadToken(123, hash)).toBe(false);
+    });
+
+    it('should reject rather than throw on a malformed stored hash', () => {
+        expect(verifyUploadToken(token, 'not-a-hash')).toBe(false);
+        expect(verifyUploadToken(token, '')).toBe(false);
+    });
+});
+
+describe('uploadTokenEnforced', () => {
+    const previous = process.env.UPLOAD_TOKEN_ENFORCED;
+
+    afterEach(() => {
+        if (previous === undefined) {
+            delete process.env.UPLOAD_TOKEN_ENFORCED;
+        } else {
+            process.env.UPLOAD_TOKEN_ENFORCED = previous;
+        }
+    });
+
+    it('should default to off so the shipped client keeps aborting and resuming', () => {
+        delete process.env.UPLOAD_TOKEN_ENFORCED;
+        expect(uploadTokenEnforced()).toBe(false);
+    });
+
+    it('should only enforce on an exact "true"', () => {
+        for (const value of ['false', '1', 'yes', 'TRUE', '']) {
+            process.env.UPLOAD_TOKEN_ENFORCED = value;
+            expect(uploadTokenEnforced()).toBe(false);
+        }
+        process.env.UPLOAD_TOKEN_ENFORCED = 'true';
+        expect(uploadTokenEnforced()).toBe(true);
+    });
+
+    it('should be read per call so the flag can be flipped at runtime', () => {
+        process.env.UPLOAD_TOKEN_ENFORCED = 'true';
+        expect(uploadTokenEnforced()).toBe(true);
+        process.env.UPLOAD_TOKEN_ENFORCED = 'false';
+        expect(uploadTokenEnforced()).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #11 — speed-test rate limiting
+// ---------------------------------------------------------------------------
+
+describe('FixedWindowRateLimiter', () => {
+    it('should allow up to the limit then refuse', () => {
+        const limiter = new FixedWindowRateLimiter(3, 1000);
+        expect(limiter.take('ip', 0)).toBe(true);
+        expect(limiter.take('ip', 1)).toBe(true);
+        expect(limiter.take('ip', 2)).toBe(true);
+        expect(limiter.take('ip', 3)).toBe(false);
+    });
+
+    it('should let the window slide', () => {
+        const limiter = new FixedWindowRateLimiter(1, 1000);
+        expect(limiter.take('ip', 0)).toBe(true);
+        expect(limiter.take('ip', 500)).toBe(false);
+        expect(limiter.take('ip', 1500)).toBe(true);
+    });
+
+    it('should track keys independently', () => {
+        const limiter = new FixedWindowRateLimiter(1, 1000);
+        expect(limiter.take('a', 0)).toBe(true);
+        expect(limiter.take('b', 0)).toBe(true);
+        expect(limiter.take('a', 0)).toBe(false);
+    });
+});
+
+describe('clientIp', () => {
+    function req(headers: Record<string, string>) {
+        return new Request('http://localhost/upload/speedtest', { method: 'POST', headers });
+    }
+
+    it('should prefer cf-connecting-ip', () => {
+        expect(
+            clientIp(req({ 'cf-connecting-ip': '203.0.113.9', 'x-forwarded-for': '10.0.0.1' })),
+        ).toBe('203.0.113.9');
+    });
+
+    it('should fall back to the leftmost x-forwarded-for entry', () => {
+        expect(clientIp(req({ 'x-forwarded-for': '203.0.113.9, 10.0.0.1' }))).toBe('203.0.113.9');
+    });
+
+    it('should return a stable bucket when no client IP is known', () => {
+        expect(clientIp(req({}))).toBe('unknown');
     });
 });

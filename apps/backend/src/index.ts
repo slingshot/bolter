@@ -10,6 +10,7 @@ import { app } from './app';
 import { config } from './config';
 import { captureError } from './lib/sentry';
 import { logger } from './logger';
+import { startReaper } from './reaper';
 import { storage } from './storage';
 import { providerRegistry } from './storage/provider-registry';
 
@@ -36,6 +37,12 @@ try {
     console.error('Failed to initialize provider registry:', err);
     process.exit(1);
 }
+
+// Sweep objects whose metadata TTL has passed. Without this, Redis expiry
+// removes the metadata but the S3/R2 object (and any abandoned multipart parts)
+// live on forever unless an out-of-band lifecycle rule happens to exist — and no
+// age/prefix rule can honor Bolter's variable per-file TTLs.
+startReaper();
 
 // Start server
 app.listen(config.port);

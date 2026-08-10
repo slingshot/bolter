@@ -54,6 +54,36 @@ export class RedisStorage {
         await client.hSet(key, field, value);
     }
 
+    /**
+     * EXISTS-guarded multi-field write, mirroring the guard on `rotateNonce`.
+     *
+     * A plain HSET recreates a key that expired (or was deleted) between the
+     * caller's read and its write — and the recreated hash has NO TTL, so it
+     * lives forever without the `owner`/`providerId` fields that make it
+     * deletable and routable. Finalization writes must therefore be conditional
+     * on the key still existing. Returns false when the key is gone, so callers
+     * can report 404 instead of silently resurrecting metadata.
+     */
+    async hSetIfExists(key: string, data: Record<string, string>): Promise<boolean> {
+        const entries = Object.entries(data);
+        if (entries.length === 0) {
+            return true;
+        }
+        const client = await this.getClient();
+        const args: string[] = [];
+        for (const [field, value] of entries) {
+            args.push(field, value);
+        }
+        const result = await client.eval(
+            "if redis.call('EXISTS', KEYS[1]) == 1 then redis.call('HSET', KEYS[1], unpack(ARGV)) return 1 else return 0 end",
+            {
+                keys: [key],
+                arguments: args,
+            },
+        );
+        return result === 1;
+    }
+
     async hGet(key: string, field: string): Promise<string | null> {
         const client = await this.getClient();
         const result = await client.hGet(key, field);
