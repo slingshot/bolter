@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'bun:test';
 import pino from 'pino';
-import { logger, redactPaths } from '../logger';
+
+// `../logger` is globally replaced by `mock.module` in sibling test files (several
+// stub it with no-op log methods). Bun's module mocks are process-global and are
+// never reset between files, so a plain static import here resolves to the real
+// module or a no-op stub purely depending on which file bun loads first — i.e. on
+// readdir order, which differs between macOS (green) and Linux CI (red). Appending
+// a query string makes the specifier distinct from the one the mocks are registered
+// against, so this always resolves to the real implementation.
+// The `as string` keeps the specifier non-literal so tsc doesn't try to resolve the
+// query form; the cast restores full typing.
+const REAL_LOGGER_MODULE = '../logger.ts?unmocked' as string;
+const { logger, redactPaths } = (await import(REAL_LOGGER_MODULE)) as typeof import('../logger');
 
 // ---------------------------------------------------------------------------
 // #35 — pino runs at `info` in production, so anything handed to a log object
