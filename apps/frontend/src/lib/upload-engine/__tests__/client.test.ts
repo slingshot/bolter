@@ -8,9 +8,14 @@ vi.mock('@/lib/plausible', () => ({
     trackUploadAttempt: vi.fn(),
 }));
 
-import { probeEligibility, runEngineInWorker, setWorkerFactory } from '../client';
+import {
+    engineStartupMaintenance,
+    probeEligibility,
+    runEngineInWorker,
+    setWorkerFactory,
+} from '../client';
 import type { ClientToWorker, EngineJob, WorkerToClient } from '../protocol';
-import { type CompletionEnvelope, openEngineState } from '../state';
+import { type CompletionEnvelope, type EngineLease, openEngineState } from '../state';
 
 /**
  * Fake Worker installed via `setWorkerFactory` — implements the surface the
@@ -276,5 +281,105 @@ describe('upload-engine client facade', () => {
         expect(await state.getParts('f1')).toEqual([]);
         expect(fetchSpy).toHaveBeenCalledTimes(1);
         expect(String(fetchSpy.mock.calls[0][0])).toContain('/upload/abort/f1');
+    });
+});
+
+function deleteDatabase(name: string): Promise<void> {
+    return new Promise((resolve) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = () => resolve();
+        req.onerror = () => resolve();
+        req.onblocked = () => resolve();
+    });
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function makeLease(fileId: string, createdAt: number): EngineLease {
+    return {
+        fileId,
+        uploadId: `mp-${fileId}`,
+        uploadToken: `tok-${fileId}`,
+        ownerToken: `own-${fileId}`,
+        createdAt,
+        engineVersion: 1,
+    };
+}
+
+function makeStoredEnvelope(fileId: string, timeLimit: number): CompletionEnvelope {
+    return {
+        fileId,
+        metadata: 'meta-b64',
+        authKeyB64: 'auth-b64',
+        manifest: [{ name: 'a.bin', size: 4, type: 'application/octet-stream' }],
+        expectedSize: 4,
+        encrypted: true,
+        secretKeyB64: 'secret-b64',
+        timeLimit,
+        downloadLimit: 1,
+    };
+}
+
+describe('engineStartupMaintenance lease expiry', () => {
+    beforeEach(async () => {
+        await deleteDatabase('bolter-upload-engine');
+        localStorage.removeItem('bolter:upload-engine');
+        setWorkerFactory(() => new FakeWorker() as unknown as Worker);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('discards a lease older than its server metadata TTL', async () => {
+        // The multipart died server-side at the TTL; without expiry the lease
+        // retained secretKeyB64 + staged ciphertext in origin storage forever.
+        const fetchSpy = vi.fn().mockResolvedValue(new Response('{"success":true}'));
+        vi.stubGlobal('fetch', fetchSpy);
+        const state = await openEngineState();
+        await state.putLease(makeLease('exp1', Date.now() - 2 * DAY_MS));
+        await state.putEnvelope(makeStoredEnvelope('exp1', 86_400)); // 1-day TTL
+        await state.putPart({
+            fileId: 'exp1',
+            partNumber: 1,
+            size: 4,
+            staged: true,
+            uploaded: false,
+        });
+
+        const candidates = await engineStartupMaintenance();
+
+        expect(candidates.find((c) => c.fileId === 'exp1')).toBeUndefined();
+        expect(await state.getLease('exp1')).toBeUndefined();
+        expect(await state.getEnvelope('exp1')).toBeUndefined();
+        expect(await state.getParts('exp1')).toEqual([]);
+        // The discard attempted the authenticated server-side abort too.
+        expect(
+            fetchSpy.mock.calls.some(([url]) => String(url).includes('/upload/abort/exp1')),
+        ).toBe(true);
+    });
+
+    it('discards an envelope-less lease after the 7-day cap', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"success":true}')));
+        const state = await openEngineState();
+        await state.putLease(makeLease('exp2', Date.now() - 8 * DAY_MS));
+
+        await engineStartupMaintenance();
+
+        expect(await state.getLease('exp2')).toBeUndefined();
+    });
+
+    it('keeps fresh leases and still offers their resume', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"success":true}')));
+        const state = await openEngineState();
+        await state.putLease(makeLease('fresh1', Date.now() - 60_000));
+        await state.putEnvelope(makeStoredEnvelope('fresh1', 86_400));
+
+        const candidates = await engineStartupMaintenance();
+
+        expect(await state.getLease('fresh1')).toBeDefined();
+        expect(candidates.find((c) => c.fileId === 'fresh1')).toMatchObject({
+            action: 'need-source-single',
+        });
     });
 });

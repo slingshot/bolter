@@ -44,6 +44,14 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 const CANCEL_ACK_TIMEOUT_MS = 10_000;
 const PROBE_TIMEOUT_MS = 5_000;
 
+/**
+ * Absolute cap on engine lease retention, mirroring the legacy store's 7-day
+ * `cleanupExpiredUploads` cutoff. A lease also expires with the server
+ * metadata TTL (`envelope.timeLimit`) — past it the multipart is dead
+ * server-side and nothing local is worth keeping.
+ */
+const ENGINE_LEASE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 // Worker creation is injectable for tests, but the `new Worker(new URL(...))`
 // literal must stay in this module for Vite's static analysis [R17].
 let workerFactory: () => Worker = () =>
@@ -487,9 +495,13 @@ export interface EngineResumeCandidate {
 }
 
 /**
- * Startup maintenance: plan a resume offer for each engine lease, then
- * garbage-collect OPFS staging directories with no lease — skipping any
- * directory whose `upload:<fileId>` Web Lock is held by a live holder [R12].
+ * Startup maintenance: expire dead leases, plan a resume offer for each
+ * surviving engine lease, then garbage-collect OPFS staging directories with
+ * no lease — skipping any directory whose `upload:<fileId>` Web Lock is held
+ * by a live holder [R12]. Expiry is the engine's equivalent of the legacy
+ * `cleanupExpiredUploads`: past `min(envelope.timeLimit, 7 days)` the
+ * multipart is gone server-side, so retaining the lease would only preserve
+ * `secretKeyB64` and staged ciphertext in origin storage indefinitely.
  * Never throws; an environment without OPFS/IndexedDB simply yields no
  * candidates.
  */
@@ -503,17 +515,34 @@ export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[
     const leases = await state.listLeases().catch(() => [] as EngineLease[]);
     const live = new Set<string>();
     const candidates: EngineResumeCandidate[] = [];
+    const now = Date.now();
     for (const lease of leases) {
-        // Every leased directory stays live — including the lease-only crash
-        // window before the envelope lands, which may be another tab's
-        // just-started upload.
-        live.add(lease.fileId);
         try {
             const [envelope, checkpoint, parts] = await Promise.all([
                 state.getEnvelope(lease.fileId),
                 state.getCheckpoint(lease.fileId),
                 state.getParts(lease.fileId),
             ]);
+            // Lease expiry GC: server-side the upload died at the metadata
+            // TTL; 7 days bounds even envelope-less crash leftovers. The
+            // discard runs under the upload's Web Lock — a busy lock means a
+            // live (long-running) holder, which is kept.
+            const expiryMs = Math.min(
+                envelope ? envelope.timeLimit * 1000 : Number.POSITIVE_INFINITY,
+                ENGINE_LEASE_MAX_AGE_MS,
+            );
+            if (now - lease.createdAt > expiryMs) {
+                try {
+                    await acquireUploadLock(lease.fileId, () => discardEngineUpload(lease.fileId));
+                } catch {
+                    live.add(lease.fileId); // live holder — not ours to reap
+                }
+                continue;
+            }
+            // Every surviving leased directory stays live — including the
+            // lease-only crash window before the envelope lands, which may be
+            // another tab's just-started upload.
+            live.add(lease.fileId);
             if (!envelope) {
                 continue;
             }
@@ -569,6 +598,7 @@ export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[
             });
         } catch {
             // Unreadable records: keep the staged bytes, offer nothing.
+            live.add(lease.fileId);
         }
     }
     await collectOrphanedStaging(live).catch(() => undefined);
