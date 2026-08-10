@@ -395,7 +395,7 @@ describe('createServiceWorkerWriter', () => {
      * acknowledges the handshake, grants one credit per chunk and acknowledges
      * the close.
      */
-    function fakeWorker() {
+    function fakeWorker({ ackClose = true }: { ackClose?: boolean } = {}) {
         const received: Uint8Array[] = [];
         let ended = false;
         let aborted = false;
@@ -412,7 +412,9 @@ describe('createServiceWorkerWriter', () => {
                     }
                     if (msg.type === 'end') {
                         ended = true;
-                        port.postMessage({ type: 'closed' });
+                        if (ackClose) {
+                            port.postMessage({ type: 'closed' });
+                        }
                         return;
                     }
                     if (msg.type === 'abort') {
@@ -470,6 +472,28 @@ describe('createServiceWorkerWriter', () => {
         expect(delivered).toEqual([9, 8, 7]);
         expect(sw.ended).toBe(true);
         expect(frameClosed).toBe(true);
+    });
+
+    it('fails closed when the worker never confirms the commit', async () => {
+        // `close()` promises the save has landed — resolving on the timeout
+        // would let downloadFile POST /download/complete and burn a credit for
+        // a file the worker never acknowledged writing.
+        const sw = fakeWorker({ ackClose: false });
+        const writer = await createServiceWorkerWriter(
+            { filename: 'movie.mkv' },
+            { worker: sw.worker, openFrame: () => () => undefined },
+        );
+
+        vi.useFakeTimers();
+        try {
+            const closed = writer.close();
+            const assertion = expect(closed).rejects.toThrow(/never confirmed/);
+            await vi.advanceTimersByTimeAsync(30_000);
+            await assertion;
+        } finally {
+            vi.useRealTimers();
+        }
+        expect(sw.ended).toBe(true);
     });
 
     it('signals the worker to discard the stream on abort', async () => {

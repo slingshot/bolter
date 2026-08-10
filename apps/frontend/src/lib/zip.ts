@@ -2,7 +2,7 @@
  * Zip utilities for handling file uploads and downloads
  */
 
-import { downloadZip, predictLength } from 'client-zip';
+import { downloadZip, makeZip, predictLength } from 'client-zip';
 import JSZip from 'jszip';
 import { FileReadError } from './errors';
 
@@ -301,13 +301,13 @@ export function sliceConcatenatedBlob(
 }
 
 /**
- * Handle duplicate filenames by appending (1), (2), etc.
+ * Handle duplicate names by appending (1), (2), etc.
  */
-function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
+function deduplicateNames(names: string[]): string[] {
     const nameCount: Record<string, number> = {};
 
-    return slices.map((slice) => {
-        let name = slice.name;
+    return names.map((original) => {
+        let name = original;
 
         if (nameCount[name] !== undefined) {
             // Split name and extension
@@ -321,8 +321,16 @@ function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
             nameCount[name] = 0;
         }
 
-        return { ...slice, name };
+        return name;
     });
+}
+
+/**
+ * Handle duplicate filenames by appending (1), (2), etc.
+ */
+function deduplicateFilenames(slices: FileSlice[]): FileSlice[] {
+    const names = deduplicateNames(slices.map((slice) => slice.name));
+    return slices.map((slice, i) => ({ ...slice, name: names[i] }));
 }
 
 /**
@@ -353,6 +361,157 @@ export async function createZipFromFiles(fileSlices: FileSlice[]): Promise<Blob>
         }
         throw error;
     }
+}
+
+/**
+ * Split a stream into consecutive fixed-length sub-streams.
+ *
+ * The sub-streams MUST be consumed strictly in order — they all pull from one
+ * underlying reader — which is exactly how `client-zip` consumes its entries.
+ */
+function createSequentialSplitter(source: ReadableStream<Uint8Array>) {
+    // Acquired lazily so the caller can still cancel `source` outright if it
+    // decides not to consume the zip at all (e.g. no save target could be
+    // opened) — `getReader()` locks the stream against that.
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const getReader = () => {
+        if (!reader) {
+            reader = source.getReader();
+        }
+        return reader;
+    };
+    let leftover: Uint8Array | null = null;
+    let exhausted = false;
+
+    /** Up to `limit` bytes, or null once the source is drained. */
+    const readUpTo = async (limit: number): Promise<Uint8Array | null> => {
+        if (leftover) {
+            const take = Math.min(limit, leftover.length);
+            const out = leftover.subarray(0, take);
+            leftover = take < leftover.length ? leftover.subarray(take) : null;
+            return out;
+        }
+        while (!exhausted) {
+            const { done, value } = await getReader().read();
+            if (done) {
+                exhausted = true;
+                break;
+            }
+            // WebKit can emit empty chunks mid-stream; they are not EOF.
+            if (!value || value.length === 0) {
+                continue;
+            }
+            if (value.length <= limit) {
+                return value;
+            }
+            leftover = value.subarray(limit);
+            return value.subarray(0, limit);
+        }
+        return null;
+    };
+
+    return {
+        /**
+         * A stream of the next `size` bytes. Closes early if the source runs
+         * out first, so a payload shorter than its metadata truncates the
+         * trailing entries instead of hanging.
+         */
+        take(size: number): ReadableStream<Uint8Array> {
+            let remaining = size;
+            return new ReadableStream<Uint8Array>({
+                async pull(controller) {
+                    if (remaining <= 0) {
+                        controller.close();
+                        return;
+                    }
+                    const chunk = await readUpTo(remaining);
+                    if (!chunk) {
+                        controller.close();
+                        return;
+                    }
+                    remaining -= chunk.length;
+                    controller.enqueue(chunk);
+                    if (remaining <= 0) {
+                        controller.close();
+                    }
+                },
+            });
+        },
+        /**
+         * Read and discard anything past the last entry.
+         *
+         * Metadata can under-count the payload as easily as over-count it, and
+         * the caller checks the received byte count against `Content-Length`.
+         * Cancelling here instead would make that check see a short read and
+         * fail a download that is merely carrying a few drifted bytes.
+         */
+        async drain(): Promise<void> {
+            leftover = null;
+            while (!exhausted) {
+                const { done } = await getReader().read();
+                if (done) {
+                    exhausted = true;
+                }
+            }
+        },
+        /** Abandon the source outright; for when the consumer has gone away. */
+        async release(): Promise<void> {
+            leftover = null;
+            try {
+                await (reader ? reader.cancel() : source.cancel());
+            } catch {
+                // Already closed or errored — nothing to release.
+            }
+        },
+    };
+}
+
+/**
+ * Build a zip from a concatenated payload stream without ever materializing it.
+ *
+ * A legacy (not-zipped-at-upload) multi-file payload is `file[0] || file[1] ||
+ * …` in metadata order, so it can be split sequentially by size — no random
+ * access, and therefore no need to hold the payload in a Blob first. Entries go
+ * straight into client-zip (STORE, ZIP64-correct) so the archive is produced
+ * incrementally and can be piped to a `DownloadWriter`.
+ *
+ * Legacy metadata sizes can drift from the real payload (iOS lazily transcodes
+ * HEIC/HEVC after `File.size` is read), so this is deliberately non-strict:
+ * entries are truncated to whatever the payload actually holds. `size` is not
+ * declared to client-zip, which writes the true byte count and CRC of each
+ * entry into its data descriptor, so a drifted payload still yields a valid zip.
+ */
+export function createZipStreamFromConcatenated(
+    payload: ReadableStream<Uint8Array>,
+    files: FileInfo[],
+): { stream: ReadableStream<Uint8Array>; estimatedSize: number } {
+    const splitter = createSequentialSplitter(payload);
+    // client-zip rejects empty names outright; legacy metadata is uploader-controlled.
+    const names = deduplicateNames(files.map((f, i) => f.name || `file-${i + 1}`));
+
+    async function* entries() {
+        let abandoned = false;
+        try {
+            for (let i = 0; i < files.length; i++) {
+                yield { name: names[i], input: splitter.take(files[i].size) };
+            }
+        } catch {
+            // client-zip cancels by throwing into this generator when the zip
+            // stream's consumer goes away. Swallow it — an unhandled rejection
+            // is the only thing propagating it would achieve.
+            abandoned = true;
+        } finally {
+            await (abandoned ? splitter.release() : splitter.drain());
+        }
+    }
+
+    // Best-effort hint for the save-target size gate; exact when metadata sizes
+    // match the payload, which is the normal case.
+    const estimatedSize = Number(
+        predictLength(files.map((f, i) => ({ name: names[i], size: f.size }))),
+    );
+
+    return { stream: makeZip(entries()), estimatedSize };
 }
 
 /**

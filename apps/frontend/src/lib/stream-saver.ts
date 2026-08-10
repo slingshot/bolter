@@ -84,6 +84,7 @@ export const STREAM_SW_FILENAME = 'download-stream-sw.js';
 
 const SW_ACTIVATION_TIMEOUT = 15_000;
 const SW_HANDSHAKE_TIMEOUT = 15_000;
+/** How long to wait for the worker to confirm the commit before failing closed. */
 const SW_CLOSE_TIMEOUT = 30_000;
 /** Waiting forever on a credit would deadlock a download; degrade instead. */
 const SW_CREDIT_TIMEOUT = 30_000;
@@ -556,8 +557,19 @@ export async function createServiceWorkerWriter(
                 if (failure) {
                     throw failure;
                 }
-                await new Promise<void>((resolve) => {
-                    const timer = setTimeout(resolve, SW_CLOSE_TIMEOUT);
+                // Fail closed: resolving on the timeout would report the save as
+                // landed and let the caller burn a download credit for a file
+                // the worker never confirmed it committed.
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(() => {
+                        closedResolve = null;
+                        reject(
+                            new Error(
+                                'The browser never confirmed the download finished saving. ' +
+                                    'Please try again.',
+                            ),
+                        );
+                    }, SW_CLOSE_TIMEOUT);
                     closedResolve = () => {
                         clearTimeout(timer);
                         closedResolve = null;

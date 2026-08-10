@@ -16,7 +16,12 @@ import {
 } from './crypto';
 import { FileReadError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
-import { createDownloadWriter, savedToDiskPlaceholder } from './stream-saver';
+import {
+    createDownloadWriter,
+    type DownloadWriter,
+    type DownloadWriterOptions,
+    savedToDiskPlaceholder,
+} from './stream-saver';
 import {
     deleteUploadState,
     type PersistedUpload,
@@ -25,11 +30,10 @@ import {
 } from './upload-state';
 import {
     createStreamingZip,
-    createZipFromFiles,
     createZipFromUploadFiles,
+    createZipStreamFromConcatenated,
     type FileInfo,
     generateZipFilename,
-    sliceConcatenatedBlob,
 } from './zip';
 
 export { FileReadError } from './errors';
@@ -2789,6 +2793,58 @@ export function createResilientDownloadStream(
  */
 export type DownloadPhase = 'downloading' | 'decrypting' | 'finalizing';
 
+/**
+ * Open the save target, dropping the in-flight transfer if none can be opened.
+ *
+ * The writer is opened before any bytes are consumed so an oversized or
+ * declined save is refused up front rather than after gigabytes have been
+ * pulled down. When it does refuse, the response stream is already attached, so
+ * cancel it instead of leaking the connection.
+ */
+async function openSaveTarget(
+    options: DownloadWriterOptions,
+    upstream: ReadableStream<Uint8Array>,
+): Promise<DownloadWriter> {
+    try {
+        return await createDownloadWriter(options);
+    } catch (e) {
+        void upstream.cancel().catch(() => {
+            // Already cancelled or errored — the transfer is gone either way.
+        });
+        throw e;
+    }
+}
+
+/**
+ * Drain a stream into a save target, discarding the partial file on failure so
+ * a truncated download is never left behind.
+ */
+async function pumpToWriter(
+    stream: ReadableStream<Uint8Array>,
+    writer: DownloadWriter,
+    onError: (e: unknown, written: number) => never,
+): Promise<number> {
+    const reader = stream.getReader();
+    let written = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (value.length === 0) {
+                continue;
+            }
+            written += value.length;
+            await writer.write(value);
+        }
+    } catch (e) {
+        await writer.abort(e);
+        onError(e, written);
+    }
+    return written;
+}
+
 export async function downloadFile(
     id: string,
     keychain: Keychain | null,
@@ -2995,34 +3051,17 @@ export async function downloadFile(
         ? metadata.zipFilename || generateZipFilename(files || [])
         : metadata.name || 'download';
     const outputMimeType = metadata.zipped ? 'application/zip' : undefined;
-    const writer = await createDownloadWriter({
-        filename: outputFilename,
-        mimeType: outputMimeType,
-        expectedSize: metadata.size > 0 ? metadata.size : total,
-    });
+    const writer = await openSaveTarget(
+        {
+            filename: outputFilename,
+            mimeType: outputMimeType,
+            expectedSize: metadata.size > 0 ? metadata.size : total,
+        },
+        outputStream,
+    );
     dlLog('Save target ready', { strategy: writer.strategy, filename: outputFilename });
 
-    let decryptedSize = 0;
-    const reader = outputStream.getReader();
-
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-                break;
-            }
-
-            if (value.length === 0) {
-                continue;
-            }
-
-            decryptedSize += value.length;
-            await writer.write(value);
-        }
-    } catch (e) {
-        // Discard the partially written file so a failed transfer never leaves
-        // a truncated download behind.
-        await writer.abort(e);
+    const decryptedSize = await pumpToWriter(outputStream, writer, (e, written) => {
         const message = e instanceof Error ? e.message : String(e);
         captureError(e, {
             operation: 'download.stream',
@@ -3030,13 +3069,13 @@ export async function downloadFile(
                 fileId: id,
                 encrypted: metadata.encrypted,
                 bytesDownloaded: loaded,
-                bytesDecrypted: decryptedSize,
+                bytesDecrypted: written,
                 saveStrategy: writer.strategy,
                 errorMessage: message,
             },
         });
         throw new Error(`Download stream failed: ${message}`);
-    }
+    });
 
     const streamElapsed = Math.max(Date.now() - streamStart, 1);
     dlLog('Streaming download complete', {
@@ -3047,48 +3086,45 @@ export async function downloadFile(
         speed: `${(loaded / (1024 * 1024) / (streamElapsed / 1000)).toFixed(1)} MB/s`,
     });
 
-    // The integrity guards below throw before the file is committed. Nothing
-    // else would then tear the writer down, so a short watchdog discards the
-    // partially written file; it is cleared the moment we reach the commit.
-    const commitWatchdog = setTimeout(() => {
-        void writer.abort(new Error('Download failed integrity validation'));
-    }, 5_000);
-
     // Integrity checks: fail loudly on truncation instead of returning a
-    // partial file and burning a download credit.
-    if (contentLength > 0 && loaded !== contentLength) {
-        throw new Error(
-            `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
-        );
-    }
-    // Plaintext size can legitimately differ from metadata (iOS lazily
-    // transcodes HEIC/HEVC after File.size is read), so a mismatch here is
-    // telemetry, not failure — real truncation is caught by the
-    // Content-Length check above and by ECE record authentication.
-    const isSinglePayload = !metadata.zipped && (!files || files.length <= 1);
-    if (isSinglePayload && metadata.size > 0) {
-        const expectedPlaintext = metadata.size;
-        const actualPlaintext = metadata.encrypted ? decryptedSize : loaded;
-        if (actualPlaintext !== expectedPlaintext) {
-            captureError(
-                new Error(
-                    `Download size mismatch: metadata says ${expectedPlaintext} bytes, received ${actualPlaintext}`,
-                ),
-                {
-                    operation: 'download.size-mismatch',
-                    extra: {
-                        fileId: id,
-                        expectedPlaintext,
-                        actualPlaintext,
-                        encrypted: metadata.encrypted,
-                    },
-                    level: 'warning',
-                },
+    // partial file and burning a download credit. They run before the commit,
+    // so a failure has to tear the writer down itself — nothing else would.
+    try {
+        if (contentLength > 0 && loaded !== contentLength) {
+            throw new Error(
+                `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
             );
         }
+        // Plaintext size can legitimately differ from metadata (iOS lazily
+        // transcodes HEIC/HEVC after File.size is read), so a mismatch here is
+        // telemetry, not failure — real truncation is caught by the
+        // Content-Length check above and by ECE record authentication.
+        const isSinglePayload = !metadata.zipped && (!files || files.length <= 1);
+        if (isSinglePayload && metadata.size > 0) {
+            const expectedPlaintext = metadata.size;
+            const actualPlaintext = metadata.encrypted ? decryptedSize : loaded;
+            if (actualPlaintext !== expectedPlaintext) {
+                captureError(
+                    new Error(
+                        `Download size mismatch: metadata says ${expectedPlaintext} bytes, received ${actualPlaintext}`,
+                    ),
+                    {
+                        operation: 'download.size-mismatch',
+                        extra: {
+                            fileId: id,
+                            expectedPlaintext,
+                            actualPlaintext,
+                            encrypted: metadata.encrypted,
+                        },
+                        level: 'warning',
+                    },
+                );
+            }
+        }
+    } catch (e) {
+        await writer.abort(e);
+        throw e;
     }
-
-    clearTimeout(commitWatchdog);
 
     // Commit the save BEFORE burning a download credit. Reporting completion
     // first meant an OOM or a failed save consumed one of the file's limited
@@ -3118,45 +3154,15 @@ export async function downloadFile(
 }
 
 /**
- * Consolidate a stream into one Blob via intermediate 64MB Blobs so only a
- * bounded window of Uint8Array chunks is live in JS heap at a time (browsers
- * back large Blobs with disk).
- */
-async function collectStreamToBlob(
-    stream: ReadableStream<Uint8Array>,
-    onChunk?: (bytes: number) => void,
-): Promise<Blob> {
-    const CONSOLIDATION_SIZE = 64 * 1024 * 1024;
-    const blobs: Blob[] = [];
-    let pending: Uint8Array[] = [];
-    let pendingSize = 0;
-
-    const reader = stream.getReader();
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-            break;
-        }
-        pending.push(value);
-        pendingSize += value.length;
-        onChunk?.(value.length);
-
-        if (pendingSize >= CONSOLIDATION_SIZE) {
-            blobs.push(new Blob(pending as BlobPart[]));
-            pending = [];
-            pendingSize = 0;
-        }
-    }
-    if (pending.length > 0) {
-        blobs.push(new Blob(pending as BlobPart[]));
-    }
-    return new Blob(blobs);
-}
-
-/**
  * Legacy fallback for multi-file downloads that weren't zipped at upload time.
- * The concatenated payload is consolidated into disk-backed Blobs and sliced
- * per-file with zero-copy Blob.slice to avoid multi-x heap peaks.
+ *
+ * The payload is `file[0] || file[1] || …` in metadata order, so it is split
+ * sequentially and zipped as it arrives rather than being materialized. The
+ * previous implementation held three full copies at once — the ciphertext Blob,
+ * the decrypted Blob and the finished zip Blob — which made this the worst of
+ * the three download paths for retained bytes, and it POSTed
+ * `/download/complete` before the caller had saved anything, so a browser that
+ * fell over on the zip Blob burned a download credit and delivered nothing.
  */
 async function downloadFileLegacyMultiFile(
     id: string,
@@ -3179,7 +3185,7 @@ async function downloadFileLegacyMultiFile(
         console.log(`[Download] ${msg}`, data ? data : '');
 
     onPhase?.('downloading');
-    dlLog('Legacy multi-file download (buffered)', { fileCount: files.length });
+    dlLog('Legacy multi-file download (streaming)', { fileCount: files.length });
 
     const expectedPlaintext = files.reduce((sum, f) => sum + f.size, 0);
     const total =
@@ -3190,46 +3196,83 @@ async function downloadFileLegacyMultiFile(
               : expectedPlaintext;
 
     let loaded = 0;
-    const wireBlob = await collectStreamToBlob(bodyStream, (bytes) => {
-        loaded += bytes;
-        if (total > 0) {
-            onProgress?.(Math.min(loaded, total), total);
-        }
+    const progressStream = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            loaded += chunk.length;
+            if (total > 0) {
+                onProgress?.(Math.min(loaded, total), total);
+            }
+            controller.enqueue(chunk);
+        },
     });
 
+    // Decryption and zipping both run concurrently with the transfer, so there
+    // is no separate 'decrypting' phase on this path either.
+    const payloadStream =
+        metadata.encrypted && keychain
+            ? bodyStream.pipeThrough(progressStream).pipeThrough(createDecryptionStream(keychain))
+            : bodyStream.pipeThrough(progressStream);
+
+    const zipFilename = generateZipFilename(files);
+    const { stream: zipStream, estimatedSize } = createZipStreamFromConcatenated(
+        payloadStream,
+        files,
+    );
+
+    // Open the save target before a single byte is pulled: a browser that can
+    // only buffer refuses an oversized archive up front instead of OOMing after
+    // the whole payload has been transferred.
+    const writer = await openSaveTarget(
+        {
+            filename: zipFilename,
+            mimeType: 'application/zip',
+            expectedSize: estimatedSize,
+        },
+        payloadStream,
+    );
+    dlLog('Save target ready', { strategy: writer.strategy, filename: zipFilename });
+
+    const zipStart = Date.now();
+    const zippedSize = await pumpToWriter(zipStream, writer, (e, written) => {
+        const message = e instanceof Error ? e.message : String(e);
+        captureError(e, {
+            operation: 'download.legacy-multifile',
+            extra: {
+                fileId: id,
+                encrypted: metadata.encrypted,
+                fileCount: files.length,
+                bytesDownloaded: loaded,
+                bytesZipped: written,
+                saveStrategy: writer.strategy,
+                errorMessage: message,
+            },
+        });
+        throw new Error(`Download stream failed: ${message}`);
+    });
+    dlLog('Legacy zip streamed', { elapsed: Date.now() - zipStart, zipSize: zippedSize });
+
+    // Truncation has to fail before the commit, and nothing else would tear the
+    // writer down at this point.
     if (contentLength > 0 && loaded !== contentLength) {
-        throw new Error(
+        const err = new Error(
             `Download incomplete: received ${loaded} of ${contentLength} bytes. Please try again.`,
         );
+        await writer.abort(err);
+        throw err;
     }
 
-    // Decrypt if needed
-    let payloadBlob: Blob;
-    if (metadata.encrypted && keychain) {
-        onPhase?.('decrypting');
-        dlLog('Decrypting legacy multi-file data...', { size: wireBlob.size });
-        const decryptStream = createDecryptionStream(keychain);
-        payloadBlob = await collectStreamToBlob(wireBlob.stream().pipeThrough(decryptStream));
-    } else {
-        payloadBlob = wireBlob;
-    }
-
-    dlLog('Creating zip from legacy multi-file download', { fileCount: files.length });
-    const zipStart = Date.now();
-    // Legacy uploads can carry drifted metadata sizes (iOS lazy transcoding);
-    // deliver best-effort instead of failing the whole download.
-    const fileSlices = sliceConcatenatedBlob(payloadBlob, files, { strict: false });
-    const zipBlob = await createZipFromFiles(fileSlices);
-    dlLog('Legacy zip created', { elapsed: Date.now() - zipStart, zipSize: zipBlob.size });
-
-    // Report completion only after the failure-prone zip step succeeds so a
-    // zip failure doesn't burn a download credit.
+    // Commit the archive before burning a download credit.
     onPhase?.('finalizing');
+    dlLog('Committing save', { strategy: writer.strategy, filename: zipFilename });
+    await writer.close();
+
     dlLog('Reporting download complete to server...');
     await reportDownloadComplete(id, keychain);
 
+    // Already delivered by the writer — the placeholder stops triggerDownload
+    // from saving an empty second copy over it.
     return {
-        blob: zipBlob,
-        filename: generateZipFilename(files),
+        blob: savedToDiskPlaceholder(),
+        filename: zipFilename,
     };
 }

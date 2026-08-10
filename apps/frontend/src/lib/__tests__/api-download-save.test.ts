@@ -1,3 +1,4 @@
+import JSZip from 'jszip';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DownloadWriter, DownloadWriterOptions } from '@/lib/stream-saver';
 import { isSavedToDisk } from '@/lib/utils';
@@ -19,10 +20,15 @@ const events: string[] = [];
 const writtenChunks: Uint8Array[] = [];
 let writeShouldFail = false;
 let closeShouldFail = false;
+let openShouldFail: Error | null = null;
 let lastWriterOptions: DownloadWriterOptions | null = null;
 
 const createDownloadWriter = vi.fn((options: DownloadWriterOptions): Promise<DownloadWriter> => {
     lastWriterOptions = options;
+    if (openShouldFail) {
+        events.push('writer:open-refused');
+        return Promise.reject(openShouldFail);
+    }
     events.push('writer:open');
     return Promise.resolve({
         strategy: 'file-system-access',
@@ -82,13 +88,19 @@ function fakeResponse(init: FakeResponseInit): Response {
     } as unknown as Response;
 }
 
-function payloadStream(): ReadableStream<Uint8Array> {
+function payloadStream(chunks: Uint8Array[] = PAYLOAD): ReadableStream<Uint8Array> {
+    let i = 0;
     return new ReadableStream<Uint8Array>({
-        start(controller) {
-            for (const chunk of PAYLOAD) {
-                controller.enqueue(chunk);
+        pull(controller) {
+            if (i >= chunks.length) {
+                controller.close();
+                return;
             }
-            controller.close();
+            controller.enqueue(chunks[i++]);
+        },
+        cancel() {
+            // Proves a refused save target does not leave the transfer running.
+            events.push('body:cancel');
         },
     });
 }
@@ -97,9 +109,20 @@ function encodeMetadata(meta: Record<string, unknown>): string {
     return btoa(JSON.stringify(meta));
 }
 
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let offset = 0;
+    for (const c of chunks) {
+        out.set(c, offset);
+        offset += c.length;
+    }
+    return out;
+}
+
 interface RouteOptions {
     metadata?: Record<string, unknown>;
     contentLength?: number;
+    payload?: Uint8Array[];
 }
 
 function installFetch(options: RouteOptions = {}) {
@@ -108,7 +131,9 @@ function installFetch(options: RouteOptions = {}) {
         size: PAYLOAD_SIZE,
         type: 'video/x-matroska',
     };
-    const contentLength = options.contentLength ?? PAYLOAD_SIZE;
+    const payload = options.payload ?? PAYLOAD;
+    const contentLength =
+        options.contentLength ?? payload.reduce((n: number, c: Uint8Array) => n + c.length, 0);
 
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
         const url = String(input);
@@ -128,7 +153,7 @@ function installFetch(options: RouteOptions = {}) {
             return Promise.resolve(
                 fakeResponse({
                     headers: { 'Content-Length': String(contentLength) },
-                    body: payloadStream(),
+                    body: payloadStream(payload),
                 }),
             );
         }
@@ -149,6 +174,7 @@ describe('downloadFile save pipeline', () => {
         writtenChunks.length = 0;
         writeShouldFail = false;
         closeShouldFail = false;
+        openShouldFail = null;
         lastWriterOptions = null;
         createDownloadWriter.mockClear();
     });
@@ -234,6 +260,152 @@ describe('downloadFile save pipeline', () => {
 
         await expect(downloadFile('abc123', null)).rejects.toThrow(/Download incomplete/);
         expect(events).not.toContain('writer:close');
+        expect(events).not.toContain('report:complete');
+        // The integrity guards run after the pump, so they have to tear the
+        // writer down themselves or a truncated file is left on disk.
+        expect(events).toContain('writer:abort');
+    });
+
+    it('drops the in-flight transfer when no save target can be opened', async () => {
+        installFetch();
+        openShouldFail = new Error('too large to buffer');
+
+        await expect(downloadFile('abc123', null)).rejects.toThrow('too large to buffer');
+        expect(events).toContain('body:cancel');
+        expect(events).not.toContain('report:complete');
+    });
+});
+
+/**
+ * The legacy (not-zipped-at-upload) multi-file path is the one the audit finding
+ * names first and the worst offender: it buffered the whole ciphertext, the
+ * whole plaintext AND the whole zip, then POSTed `/download/complete` before
+ * handing the archive back to the caller to save.
+ */
+describe('downloadFile legacy multi-file save pipeline', () => {
+    const LEGACY_FILES = [
+        { name: 'alpha.txt', size: 5, type: 'text/plain' },
+        { name: 'beta.txt', size: 4, type: 'text/plain' },
+    ];
+    const LEGACY_PAYLOAD = [
+        new TextEncoder().encode('AAA'),
+        new TextEncoder().encode('AABB'),
+        new TextEncoder().encode('BB'),
+    ];
+    const LEGACY_METADATA = {
+        name: 'alpha.txt',
+        size: 9,
+        // No `zipped` flag + more than one file is exactly the legacy branch.
+        files: LEGACY_FILES,
+    };
+
+    function installLegacyFetch(overrides: RouteOptions = {}) {
+        return installFetch({
+            metadata: LEGACY_METADATA,
+            payload: LEGACY_PAYLOAD,
+            ...overrides,
+        });
+    }
+
+    beforeEach(() => {
+        events.length = 0;
+        writtenChunks.length = 0;
+        writeShouldFail = false;
+        closeShouldFail = false;
+        openShouldFail = null;
+        lastWriterOptions = null;
+        createDownloadWriter.mockClear();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('streams the archive to a save target instead of returning a Blob', async () => {
+        installLegacyFetch();
+        const result = await downloadFile('abc123', null);
+
+        expect(createDownloadWriter).toHaveBeenCalledTimes(1);
+        expect(lastWriterOptions).toMatchObject({
+            filename: 'files-2.zip',
+            mimeType: 'application/zip',
+        });
+
+        // A real zip landed in the writer, not in the returned Blob.
+        const zip = await JSZip.loadAsync(concatChunks(writtenChunks));
+        expect(Object.keys(zip.files).sort()).toEqual(['alpha.txt', 'beta.txt']);
+        expect(await zip.file('alpha.txt')?.async('string')).toBe('AAAAA');
+        expect(await zip.file('beta.txt')?.async('string')).toBe('BBBB');
+
+        expect(result.filename).toBe('files-2.zip');
+        expect(result.blob.size).toBe(0);
+        expect(isSavedToDisk(result.blob)).toBe(true);
+    });
+
+    it('opens the save target before pulling a single payload byte', async () => {
+        // Pre-fix nothing gated this path at all — a 20GB legacy link was
+        // transferred in full and only then blew up building the Blob.
+        installLegacyFetch();
+        openShouldFail = new Error('cannot buffer 20 GB');
+
+        await expect(downloadFile('abc123', null)).rejects.toThrow('cannot buffer 20 GB');
+        expect(writtenChunks).toHaveLength(0);
+        expect(events).toContain('body:cancel');
+        expect(events).not.toContain('report:complete');
+    });
+
+    it('reports the download complete only AFTER the archive has been saved', async () => {
+        installLegacyFetch();
+        await downloadFile('abc123', null);
+
+        const closeIndex = events.indexOf('writer:close');
+        const reportIndex = events.indexOf('report:complete');
+        expect(closeIndex).toBeGreaterThanOrEqual(0);
+        expect(reportIndex).toBeGreaterThanOrEqual(0);
+        // Pre-fix the POST fired inside downloadFileLegacyMultiFile, before the
+        // caller had even been handed the zip Blob to save.
+        expect(closeIndex).toBeLessThan(reportIndex);
+    });
+
+    it('does not burn a download credit when committing the archive fails', async () => {
+        installLegacyFetch();
+        closeShouldFail = true;
+
+        await expect(downloadFile('abc123', null)).rejects.toThrow('save failed');
+        expect(events).not.toContain('report:complete');
+    });
+
+    it('aborts the archive and reports nothing when the transfer is truncated', async () => {
+        installLegacyFetch({ contentLength: 99 });
+
+        await expect(downloadFile('abc123', null)).rejects.toThrow(/Download incomplete/);
+        expect(events).toContain('writer:abort');
+        expect(events).not.toContain('writer:close');
+        expect(events).not.toContain('report:complete');
+    });
+
+    it('still completes when the payload runs longer than its metadata', async () => {
+        // Legacy uploads can carry drifted sizes in either direction. The
+        // buffered implementation read the whole body and dropped the tail;
+        // stopping at the last entry instead would leave bytes unread and make
+        // the Content-Length reconciliation call an intact download truncated.
+        installLegacyFetch({
+            payload: [...LEGACY_PAYLOAD, new TextEncoder().encode('EXTRA')],
+        });
+
+        const result = await downloadFile('abc123', null);
+        const zip = await JSZip.loadAsync(concatChunks(writtenChunks));
+        expect(await zip.file('beta.txt')?.async('string')).toBe('BBBB');
+        expect(events).toContain('report:complete');
+        expect(isSavedToDisk(result.blob)).toBe(true);
+    });
+
+    it('aborts the archive when the save target fails mid-stream', async () => {
+        installLegacyFetch();
+        writeShouldFail = true;
+
+        await expect(downloadFile('abc123', null)).rejects.toThrow(/Download stream failed/);
+        expect(events).toContain('writer:abort');
         expect(events).not.toContain('report:complete');
     });
 });
