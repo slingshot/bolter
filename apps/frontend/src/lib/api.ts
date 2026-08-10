@@ -24,6 +24,7 @@ import {
     type DownloadWriterOptions,
     savedToDiskPlaceholder,
 } from './stream-saver';
+import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
 import {
     computeContentFingerprint,
     deleteUploadState,
@@ -49,10 +50,8 @@ const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
 // API base URL - defaults to localhost for development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
-// Retry configuration
+// Retry configuration (backoff base/cap live in upload-shared.ts → retryDelayMs)
 const MAX_RETRIES = 10;
-const RETRY_DELAY_BASE = 2000; // 2 seconds
-const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Download retry configuration
@@ -544,18 +543,6 @@ function getPreferredPartSize(speed: number): number | undefined {
         }
     }
     return PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize;
-}
-
-// Adaptive concurrency based on file size
-// R2 limits concurrent part uploads to ~2-3 per upload ID, so we cap at 3.
-// With backpressure, memory is bounded to ~(concurrency + 1) * partSize
-// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
-function getConcurrentUploads(fileSize: number): number {
-    const GB = 1024 * 1024 * 1024;
-    if (fileSize > 50 * GB) {
-        return 2; // > 50GB: conservative for R2
-    }
-    return 3; // default: 3 concurrent uploads (R2 limit)
 }
 
 export interface UploadProgress {
@@ -2068,10 +2055,7 @@ async function uploadSinglePartWithRetry(
                 throw new Error('Upload cancelled');
             }
 
-            const delay = Math.min(
-                RETRY_DELAY_BASE * 2 ** attempt + Math.random() * 1000,
-                MAX_RETRY_DELAY,
-            );
+            const delay = retryDelayMs(attempt);
             console.log(`[Upload] Retrying single-part upload in ${(delay / 1000).toFixed(1)}s...`);
             onRetry?.();
             await cancellableDelay(delay, canceller);
@@ -2715,10 +2699,7 @@ async function uploadPartWithRetry(
                 throw new Error('Upload cancelled');
             }
 
-            const delay = Math.min(
-                RETRY_DELAY_BASE * 2 ** retryCount + Math.random() * 1000,
-                MAX_RETRY_DELAY,
-            );
+            const delay = retryDelayMs(retryCount);
 
             console.log(`[Upload] Retrying part ${partNumber} in ${(delay / 1000).toFixed(1)}s...`);
 
@@ -2880,27 +2861,6 @@ function uploadPart(
         xhr.open('PUT', url);
         xhr.send(blob);
     });
-}
-
-/**
- * Check if an error is retryable
- * Includes browser abort errors (NS_BINDING_ABORTED in Firefox) which often happen
- * due to memory pressure or connection limits
- */
-function isRetryableError(error: Error): boolean {
-    const msg = (error.message || '').toLowerCase();
-    return (
-        msg.includes('network error') ||
-        msg.includes('network') ||
-        msg.includes('timeout') ||
-        msg.includes('abort') ||
-        msg.includes('stalled') ||
-        msg.includes('failed to fetch') ||
-        /http 5\d\d/.test(msg) ||
-        msg.includes('http 429') ||
-        msg.includes('http 408') ||
-        msg.includes('http 0') // Often indicates network failure
-    );
 }
 
 /**
