@@ -48,6 +48,13 @@ Bolter offers **optional end-to-end encryption** that users can enable per uploa
 - **No forward secrecy** — if a key is compromised, all files encrypted with that key are compromised.
 - **Metadata visibility** — the server knows file sizes, upload times, and access patterns even though it can't read contents.
 
+### Deployment Hardening
+
+- **CORS fails closed.** The API reflects the request `Origin` and allows credentials only for an explicit `NODE_ENV=development` build. `NODE_ENV` is validated against `development | production | test`; anything else — including leaving it unset — is treated as production, where the allow-list is `BASE_URL` plus `CORS_ORIGINS` and `Access-Control-Allow-Credentials` is never sent. The shipped `Dockerfile` and `docker-compose.yml` set `NODE_ENV` explicitly.
+- **Configuration fails fast.** Malformed numeric environment variables used to become `NaN` and silently disable the limit they were meant to enforce (`size > NaN` is always false). The backend now validates every numeric variable at startup and exits rather than running with limits removed.
+- **The analytics proxy is not an open relay.** `/pl/api/event` only forwards events whose domain belongs to this deployment (`PLAUSIBLE_DOMAINS`), caps the request body, and time-bounds the upstream call. `cf-connecting-ip` is honoured for visitor attribution but must be a valid IP, and can be restricted to peers inside `TRUSTED_EDGE_CIDRS`.
+- **Bucket CORS is a runtime dependency.** The browser reads `ETag` and `Content-Range` from bucket responses; the required policy is documented under [Operational requirements](README.md#operational-requirements). Scope `AllowedOrigins` to your frontend origin rather than `*`.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in Bolter, please report it responsibly:

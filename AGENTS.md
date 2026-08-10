@@ -88,7 +88,7 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 - `apps/backend/src/routes/upload.ts` - Pre-signed URL generation, multipart orchestration, resume endpoint, speed test endpoints
 - `apps/backend/src/routes/download.ts` - URL signing, download count enforcement
 - `apps/backend/src/routes/providers.ts` - Provider CRUD API (admin-only, protected by `ADMIN_API_KEY`)
-- `apps/backend/src/routes/plausible.ts` - Analytics proxy (`/pl/api/event` → plausible.io). Visitor IP comes from `cf-connecting-ip` first — Cloudflare sets it to the real visitor and it survives Railway's edge/CDN rewrites of `x-forwarded-for`. Plausible silently bot-filters events whose leftmost forwarded IP is a datacenter IP (202 + `x-plausible-dropped: 1` response header), so the proxy logs dropped events and propagates the header to the browser
+- `apps/backend/src/routes/plausible.ts` - Analytics proxy (`/pl/api/event` → plausible.io). Visitor IP comes from `cf-connecting-ip` first — Cloudflare sets it to the real visitor and it survives Railway's edge/CDN rewrites of `x-forwarded-for`. Plausible silently bot-filters events whose leftmost forwarded IP is a datacenter IP (202 + `x-plausible-dropped: 1` response header), so the proxy logs dropped events and propagates the header to the browser. The proxy is not an open relay: the event's `d` (domain) must be in `PLAUSIBLE_DOMAINS` (403 otherwise), the body is capped at `MAX_EVENT_BODY_BYTES` (8 KiB → 413), the upstream fetch carries `AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)` and failures return 502 instead of an unhandled 500, and `cf-connecting-ip` must parse as a real IP — plus, when `TRUSTED_EDGE_CIDRS` is set, the request peer must be inside one of those ranges or the proxy falls back to `x-forwarded-for`
 - `apps/backend/src/storage/s3.ts` - S3 client with explicit config (supports multiple instances per provider)
 - `apps/backend/src/storage/provider-registry.ts` - Provider registry with Redis persistence and in-memory caching
 - `apps/backend/src/storage/index.ts` - Storage facade routing operations to the correct provider
@@ -118,7 +118,26 @@ Optional for provider management:
 - `PROVIDER_CACHE_TTL_SECONDS` - In-memory provider cache refresh interval (default: `60`)
 - `ADMIN_API_KEY` - Bearer token for provider CRUD API (`/providers/*`)
 
+Deployment / security:
+- `NODE_ENV` - Validated against `development | production | test`. Anything else, **including unset**, resolves to `production` (`config.isDevelopment` is true only for the exact string `development`). Both `apps/backend/Dockerfile` and `docker-compose.yml` set it explicitly.
+- `CORS_ORIGINS` - Comma-separated extra browser origins allowed by CORS; `BASE_URL` is always allowed. Required in production whenever the frontend origin differs from the API origin.
+- `PLAUSIBLE_DOMAINS` - Comma-separated site domains the analytics proxy will forward events for (default: `send.fm`)
+- `TRUSTED_EDGE_CIDRS` - Comma-separated CIDRs of the edge tier allowed to set `cf-connecting-ip`. Unset keeps the legacy always-prefer-`cf-connecting-ip` behaviour.
+
+**Startup validation is fail-fast** (`apps/backend/src/config.ts`). `buildConfig(env)` is a pure, unit-tested function: every numeric var is parsed with `Number()` and rejected if non-finite, fractional, negative or out of range (`parseInt` used to turn `MAX_FILE_SIZE='10GB'` into 10 bytes and `'abc'` into `NaN`, which removes the cap because `size > NaN` is always false); `S3_BUCKET`/`S3_ENDPOINT` must be non-empty outside `NODE_ENV=test`; defaults may not exceed their `MAX_*`. All problems are collected and printed, then `process.exit(1)`.
+
+**CORS fails closed** (`apps/backend/src/app.ts`). `origin: true` + `credentials: true` are enabled only for `config.isDevelopment`; otherwise the allow-list is `[baseUrl, ...corsOrigins]` and `Access-Control-Allow-Credentials` is never sent.
+
+**Health probes are cached** (`apps/backend/src/app.ts`). `/health`, `/health/ready` and `/__heartbeat__` share a `HEALTH_CACHE_TTL_MS` (5s) memoised `storage.ping()` with concurrent-probe de-duplication, so unauthenticated probe loops cannot amplify one request into a HeadBucket against every registered provider. `resetHealthCache()` is the test seam. `/health/live` never touches storage.
+
 See `.env.example` for full list of configurable limits and UI options.
+
+## Operational requirements (bucket-side)
+
+Neither of these is an environment variable and neither is detectable by `/health` (which only does a server-side `HeadBucket`), so a misconfigured bucket reports healthy and fails at runtime.
+
+- **Bucket CORS policy.** The browser talks to the bucket directly and reads response headers that only appear when `ExposeHeaders` lists them: `ETag` (read after each multipart part, `api.ts` part completion) and `Content-Range` (read on download range-resume). Required policy: `AllowedMethods` `PUT`/`GET`/`HEAD`, `AllowedOrigins` set to the frontend origin(s), `AllowedHeaders` `*`, `ExposeHeaders` including `ETag` and `Content-Range`. Without it, multipart uploads fail *after* transferring every byte and range-resume fails with "Range resume mismatch". Full policy in `README.md` → Deployment → Operational requirements.
+- **`AbortIncompleteMultipartUpload` lifecycle rule.** Interrupted multipart uploads leave LIST-invisible, billable parts that no code path aborts. A lifecycle rule (e.g. `DaysAfterInitiation: 7`) is a hard operational requirement.
 
 ## API Endpoints
 

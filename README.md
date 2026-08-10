@@ -85,7 +85,8 @@ bun install
 
 # Copy and configure environment variables
 cp .env.example .env.local
-# Edit .env.local with your S3/R2 credentials and Redis URL
+# Edit .env.local with your S3/R2 credentials and Redis URL.
+# Set NODE_ENV=development so the API accepts the Vite dev server origin.
 
 # Start development (frontend + backend concurrently)
 bun run dev
@@ -177,12 +178,20 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `PORT` | `3001` | Backend server port |
 | `BASE_URL` | `http://localhost:3001` | Public-facing base URL |
 | `DETECT_BASE_URL` | `false` | Auto-detect base URL from request headers |
+| `NODE_ENV` | `production` | One of `development`, `production`, `test`. Anything else — including unset — is treated as `production` |
+| `CORS_ORIGINS` | _(none)_ | Extra browser origins allowed by CORS, comma separated (`BASE_URL` is always allowed) |
 | `MAX_FILE_SIZE` | `1000000000000` (1 TB) | Maximum upload size in bytes |
 | `MAX_FILES_PER_ARCHIVE` | `64` | Max files per upload |
 | `MAX_EXPIRE_SECONDS` | `15552000` (6 months) | Maximum link expiration time |
 | `DEFAULT_EXPIRE_SECONDS` | `86400` (1 day) | Default expiration |
 | `MAX_DOWNLOADS` | `100` | Maximum download limit |
 | `DEFAULT_DOWNLOADS` | `1` | Default download limit |
+| `PLAUSIBLE_DOMAINS` | `send.fm` | Site domains the analytics proxy will forward events for, comma separated |
+| `TRUSTED_EDGE_CIDRS` | _(none)_ | CIDR ranges allowed to set `cf-connecting-ip`; when set, the header is only trusted from those peers |
+
+> **Startup validation.** Every numeric variable above is parsed strictly at boot. Non-numeric (`abc`), unit-suffixed (`10GB`, `6months`), fractional, negative or out-of-range values abort startup with an explicit message instead of silently becoming `NaN` (which disables the limit) or a truncated integer. `S3_BUCKET` and `S3_ENDPOINT` must also be non-empty.
+
+> **CORS fails closed.** `origin: true` with credentials is only enabled for an explicit `NODE_ENV=development` build. In every other case — including an unset or misspelled `NODE_ENV` — the API allows only `BASE_URL` plus `CORS_ORIGINS`, and never sends `Access-Control-Allow-Credentials`. For local development set `NODE_ENV=development` in your `.env.local`, or add `http://localhost:3000` to `CORS_ORIGINS`.
 
 ### Storage Provider Management
 
@@ -374,6 +383,57 @@ cd apps/backend && bun run start
 - **Object storage**: Any S3-compatible service (Cloudflare R2, AWS S3, MinIO, etc.)
 - **Redis**: For metadata storage with TTL-based expiration (v7+ recommended)
 - **Reverse proxy**: Recommended for production (Nginx, Caddy, etc.) to terminate TLS and serve the frontend
+
+### Operational requirements
+
+These are configured on the **bucket**, not through environment variables. The backend's `/health` endpoint performs a server-side `HeadBucket` and cannot detect either of them, so a misconfigured bucket reports healthy and then fails at runtime.
+
+#### 1. Bucket CORS policy (required)
+
+The browser uploads and downloads directly against the bucket and reads response headers that S3/R2 only expose when the CORS policy says so:
+
+- **`ETag`** is read after every multipart part completes. If it is not exposed, every upload large enough to go multipart fails — *after* all bytes have transferred — with a "bucket CORS misconfiguration" error.
+- **`Content-Range`** is read when a mid-stream download failure is resumed with a `Range` request. If it is not exposed, resumable downloads fail with "Range resume mismatch".
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://send.fm", "http://localhost:3000"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag", "Content-Range", "Content-Length", "Accept-Ranges"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+`AllowedOrigins` must list every origin the frontend is served from — the same set you put in `CORS_ORIGINS`.
+
+Apply it with the AWS CLI (works against R2 too):
+
+```bash
+aws s3api put-bucket-cors --bucket "$S3_BUCKET" --endpoint-url "$S3_ENDPOINT" \
+  --cors-configuration file://bucket-cors.json
+```
+
+#### 2. `AbortIncompleteMultipartUpload` lifecycle rule (required)
+
+Interrupted multipart uploads leave parts in the bucket that are invisible to `LIST` and billed indefinitely, and nothing in the application aborts them on the user's behalf. Configure a lifecycle rule:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-multipart",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+```
+
+Per-file object expiry is enforced through the Redis metadata TTL; a coarse object-expiration lifecycle rule is recommended as a backstop so objects whose metadata has expired do not linger in the bucket.
 
 ## Security
 
