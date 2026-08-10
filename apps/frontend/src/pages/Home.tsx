@@ -77,7 +77,10 @@ export function HomePage() {
     // ("Finish upload — no file selection needed"), one-click resumes backed
     // by a persisted file handle [R13], and garbage-collect orphaned OPFS
     // staging directories (dirs whose upload lock is held by another tab are
-    // skipped).
+    // skipped). Candidates that cannot resume (multi-file mid-production,
+    // single-file without a persisted handle) still surface with "Start
+    // fresh" — without the discard they would leak their lease, staged
+    // ciphertext, and server-side multipart forever.
     useEffect(() => {
         let cancelled = false;
         engineStartupMaintenance()
@@ -90,6 +93,7 @@ export function HomePage() {
                         candidates.find(
                             (c) => c.action === 'need-source-single' && c.handle !== undefined,
                         ) ??
+                        candidates[0] ??
                         null,
                 );
             })
@@ -546,6 +550,19 @@ export function HomePage() {
     const maxSize = config?.maxFileSize || UPLOAD_LIMITS.MAX_FILE_SIZE;
     const canUpload = files.length > 0 && totalSize <= maxSize && !isUploading;
 
+    // How the engine resume card behaves: 'finish' needs no source,
+    // 'one-click' re-acquires a persisted handle [R13], and 'discard-only'
+    // covers uploads that cannot resume (multi-file mid-production,
+    // single-file without a handle) — those must still offer "Start fresh" so
+    // their staged data and server-side multipart can be discarded.
+    const engineResumeMode = engineResumable
+        ? engineResumable.action === 'finish'
+            ? 'finish'
+            : engineResumable.action === 'need-source-single' && engineResumable.handle
+              ? 'one-click'
+              : 'discard-only'
+        : null;
+
     return (
         <div className="pt-24 pb-16 px-6">
             <div className="max-w-main-card mx-auto flex flex-col gap-section">
@@ -611,26 +628,33 @@ export function HomePage() {
                                 <Upload className="h-8 w-8 text-content-secondary" />
                                 <div>
                                     <p className="text-paragraph-sm font-medium text-content-primary mb-1">
-                                        {engineResumable.action === 'finish'
+                                        {engineResumeMode === 'finish'
                                             ? 'Finish upload — no file selection needed'
-                                            : 'Resume upload — no file selection needed'}
+                                            : engineResumeMode === 'one-click'
+                                              ? 'Resume upload — no file selection needed'
+                                              : 'Interrupted upload cannot be resumed'}
                                     </p>
                                     <p className="text-paragraph-xs text-content-secondary">
                                         <span className="font-medium">
                                             {engineResumable.fileName}
                                         </span>{' '}
                                         ({formatBytes(engineResumable.size)}) &mdash;{' '}
-                                        {engineResumable.action === 'finish'
+                                        {engineResumeMode === 'finish'
                                             ? 'every remaining byte is already saved, so this upload can finish right away.'
-                                            : 'a reference to the file was saved, so this upload can resume with one click.'}
+                                            : engineResumeMode === 'one-click'
+                                              ? 'a reference to the file was saved, so this upload can resume with one click.'
+                                              : engineResumable.action === 'need-source-multi'
+                                                ? 'multi-file uploads cannot continue after an interruption this early — start fresh to upload the files again and free the saved data.'
+                                                : 'this upload cannot continue automatically — start fresh to upload the file again and free the saved data.'}
                                     </p>
                                 </div>
                                 <div className="flex gap-3 w-full">
-                                    {engineResumable.action === 'finish' ? (
+                                    {engineResumeMode === 'finish' && (
                                         <Button className="flex-1" onClick={handleEngineFinish}>
                                             Finish upload
                                         </Button>
-                                    ) : (
+                                    )}
+                                    {engineResumeMode === 'one-click' && (
                                         <Button
                                             className="flex-1"
                                             onClick={handleEngineHandleResume}
@@ -638,9 +662,15 @@ export function HomePage() {
                                             Resume upload
                                         </Button>
                                     )}
-                                    <Button variant="ghost" onClick={handleEngineStartFresh}>
-                                        Start fresh
-                                    </Button>
+                                    {engineResumeMode === 'discard-only' ? (
+                                        <Button className="flex-1" onClick={handleEngineStartFresh}>
+                                            Start fresh
+                                        </Button>
+                                    ) : (
+                                        <Button variant="ghost" onClick={handleEngineStartFresh}>
+                                            Start fresh
+                                        </Button>
+                                    )}
                                 </div>
                             </div>
                         )}
