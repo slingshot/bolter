@@ -22,7 +22,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **Files up to 1 TB** — multipart uploads with adaptive part sizing and resumability
 - **Self-destructing links** — configurable expiration (5 min to 6 months) and download limits
 - **No accounts required** — generate a link, share it, done
-- **Resilient uploads** — stall detection, offline awareness, progress-based retries, IndexedDB-backed resume on page reload, and Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility
+- **Resilient uploads** — multipart uploads run in a dedicated Web Worker with an OPFS staged-part store: byte-identical retries, wall-clock stall detection that survives background-tab throttling, crash/reload resume (including finishing an interrupted upload with no file re-selection, and replaying a completion whose response was lost), and one-click resume from persisted file handles on Chromium. Environments without worker/OPFS support fall back automatically to the main-thread pipeline (stall detection, offline awareness, progress-based retries, IndexedDB-backed resume, Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility); setting `localStorage['bolter:upload-engine'] = 'off'` forces the fallback
 - **Resilient downloads** — mid-stream failures resume via HTTP Range requests with stall detection and signed-URL refresh; every download is verified for completeness (and decryption integrity when encrypted) before it is reported successful
 - **Streaming saves** — encrypted, zipped and legacy multi-file downloads write straight to disk (File System Access API, with a service-worker stream for Safari/Firefox) instead of being buffered in memory, and a download only counts against the share's limit once the save has actually landed
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
@@ -123,6 +123,7 @@ bolter/
 │   │   ├── src/
 │   │   │   ├── components/   # Radix UI-based components
 │   │   │   ├── lib/          # Crypto, API client, upload state
+│   │   │   │   └── upload-engine/  # Worker+OPFS multipart upload engine
 │   │   │   ├── pages/        # Home (upload) + Download pages
 │   │   │   └── stores/       # Zustand state management
 │   │   └── Dockerfile        # Multi-stage: Bun build → Nginx
@@ -155,7 +156,8 @@ bolter/
 | **Web Crypto API** | Standards-based, hardware-accelerated encryption available in all modern browsers |
 | **HKDF key derivation** | Derives separate keys for content and metadata from a single secret |
 | **64KB record encryption** | Streaming-friendly — encrypt/decrypt without loading the entire file into memory |
-| **IndexedDB resume state** | Multipart upload state survives page reloads; users can resume interrupted uploads |
+| **Worker+OPFS upload engine** | Multipart uploads produce, stage, and upload parts inside a dedicated Web Worker with an OPFS staged-part store — byte-identical retries, background-tab-safe wall-clock stall detection, staged ciphertext only for encrypted uploads, and crash-window resume without re-picking files. Ineligible environments (and the `localStorage['bolter:upload-engine'] = 'off'` kill switch) fall back to the retained main-thread pipeline |
+| **IndexedDB resume state** | Multipart upload state survives page reloads; users can resume interrupted uploads (engine state lives in its own `bolter-upload-engine` database, separate from the legacy store) |
 | **Streaming download sink** | Browser-processed downloads write through a `DownloadWriter` (File System Access → service worker → capped in-memory buffer) so a large file is never fully retained; the in-memory last resort is capped at 2 GiB and warns first |
 | **Save before credit** | `/download/complete` is posted only after the save commits, so a failed or refused save can never consume one of a share's limited downloads |
 | **Safari/WebKit compat** | Handles empty stream chunks from iOS HEIC/HEVC transcoding; pre-resolves transcoded file sizes for accurate part allocation |
