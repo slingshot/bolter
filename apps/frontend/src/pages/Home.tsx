@@ -103,10 +103,15 @@ export function HomePage() {
                     ownerToken: result.ownerToken,
                     name: file.name,
                     size: file.size,
-                    // The server TTL started back at /upload/url — which for a
-                    // resume can be days ago — so trust the authoritative expiry
-                    // from /upload/complete over a local now+timeLimit estimate.
-                    expiresAt: resolveExpiresAt(result, resumableUpload.timeLimit),
+                    // The server TTL started at /upload/url, which for a resume
+                    // can be days ago — `createdAt` is stamped right after that
+                    // call, so anchor the expiry there instead of restarting the
+                    // clock at completion.
+                    expiresAt: resolveExpiresAt(
+                        result,
+                        resumableUpload.timeLimit,
+                        resumableUpload.createdAt,
+                    ),
                     downloadLimit: resumableUpload.downloadLimit,
                     downloadCount: 0,
                     encrypted: resumableUpload.encrypted,
@@ -173,6 +178,11 @@ export function HomePage() {
 
         const keychain = new Keychain();
         const canceller = new Canceller();
+        // The server starts the metadata TTL when /upload/url mints the id, a
+        // moment or two after this. Anchoring the displayed expiry here rather
+        // than at completion keeps a multi-hour upload from advertising hours
+        // the server will not honor.
+        const startedAt = Date.now();
 
         setUploading(true);
         setUploadError(null);
@@ -221,9 +231,8 @@ export function HomePage() {
                 ownerToken: result.ownerToken,
                 name: files.length === 1 ? files[0].file.name : `${files.length} files`,
                 size: files.reduce((sum, f) => sum + f.file.size, 0),
-                // The server started the TTL at /upload/url, not now — prefer the
-                // authoritative expiry it returns from /upload/complete.
-                expiresAt: resolveExpiresAt(result, timeLimit),
+                // The server started the TTL at /upload/url, not now.
+                expiresAt: resolveExpiresAt(result, timeLimit, startedAt),
                 downloadLimit,
                 downloadCount: 0,
                 encrypted,

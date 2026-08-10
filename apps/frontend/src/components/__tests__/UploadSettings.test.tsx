@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/lib/api', () => ({
     deleteFile: vi.fn().mockResolvedValue(undefined),
+    getDownloadStatus: vi.fn().mockResolvedValue({ status: 'error' }),
     API_BASE_URL: 'http://localhost:3001',
 }));
 vi.mock('@/lib/sentry', () => ({

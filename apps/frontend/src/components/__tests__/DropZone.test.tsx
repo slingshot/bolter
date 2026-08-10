@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/lib/api', () => ({
     deleteFile: vi.fn().mockResolvedValue(undefined),
+    getDownloadStatus: vi.fn().mockResolvedValue({ status: 'error' }),
     API_BASE_URL: 'http://localhost:3001',
 }));
 vi.mock('@/lib/sentry', () => ({
@@ -400,6 +401,24 @@ describe('DropZone', () => {
             });
             expect(useAppStore.getState().files[0].file.name).toBe('plain.txt');
             expect(useAppStore.getState().toasts).toHaveLength(0);
+        });
+
+        it('stays silent when the drop carries no file items at all', async () => {
+            const { container } = render(<DropZone />);
+            const dropArea = container.firstChild as HTMLElement;
+
+            // Dragging a link or a text selection produces `string` items and no
+            // files — a no-op, not a failed drop.
+            const stringItems = Object.assign(
+                [{ kind: 'string' as const, type: 'text/uri-list' }],
+                { length: 1 },
+            ) as unknown as DataTransferItemList;
+
+            fireEvent.drop(dropArea, { dataTransfer: { items: stringItems, files: [] } });
+
+            await Promise.resolve();
+            expect(useAppStore.getState().toasts).toHaveLength(0);
+            expect(useAppStore.getState().files).toHaveLength(0);
         });
 
         it('does not toast on a clean folder drop', async () => {

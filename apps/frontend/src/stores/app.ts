@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { type Canceller, deleteFile, type UploadProgress } from '@/lib/api';
+import { type Canceller, deleteFile, getDownloadStatus, type UploadProgress } from '@/lib/api';
 import type { Keychain } from '@/lib/crypto';
 import { captureError } from '@/lib/sentry';
 import type { PersistedUpload } from '@/lib/upload-state';
@@ -49,15 +49,27 @@ export function buildShareUrl(file: Pick<UploadedFile, 'url' | 'secretKey' | 'en
 /**
  * Resolve the expiry to display/persist for a completed upload.
  *
- * The server starts the metadata TTL at `/upload/url`, not at `/upload/complete`
- * — for a resumed upload those can be days apart. `/upload/complete` therefore
- * returns the authoritative `expiresAt` (epoch ms) and `ttl` (seconds remaining);
- * prefer them, and only fall back to the local `now + timeLimit` estimate when a
- * server that predates the field is answering.
+ * The server starts the metadata TTL when `/upload/url` mints the file id and
+ * never refreshes it at `/upload/complete`. Computing the expiry as
+ * `Date.now() + timeLimit` at completion therefore overstates it by however long
+ * the upload took — days, for an upload that was interrupted and resumed later.
+ *
+ * `startedAt` is the epoch ms at which the server's clock started: the moment
+ * the upload was requested (fresh upload) or the persisted `createdAt` of the
+ * resume record (which is stamped immediately after `/upload/url` answers).
+ * Anchoring to it makes the displayed expiry match Redis, and errs early rather
+ * than late — the UI never claims a file is live after the server dropped it.
+ *
+ * `completion` is the parsed `/upload/complete` body. The server does not send
+ * an authoritative expiry today (and `api.ts` currently discards the body), so
+ * the `expiresAt` / `ttl` branches below are dormant; they exist so the moment
+ * either side starts supplying the field it takes precedence over the estimate,
+ * with no change needed here.
  */
 export function resolveExpiresAt(
     completion: unknown,
     timeLimitSeconds: number,
+    startedAt: number,
     now: number = Date.now(),
 ): Date {
     const source = (completion ?? {}) as { expiresAt?: unknown; ttl?: unknown };
@@ -67,12 +79,15 @@ export function resolveExpiresAt(
         return new Date(expiresAt);
     }
 
+    // `ttl` is "seconds remaining as of this response", so it is relative to now
+    // — not to the upload start.
     const { ttl } = source;
     if (typeof ttl === 'number' && Number.isFinite(ttl) && ttl >= 0) {
         return new Date(now + ttl * 1000);
     }
 
-    return new Date(now + timeLimitSeconds * 1000);
+    const anchor = Number.isFinite(startedAt) && startedAt > 0 ? startedAt : now;
+    return new Date(anchor + timeLimitSeconds * 1000);
 }
 
 export interface AppState {
@@ -214,7 +229,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     addUploadedFile: (file) => {
         set((state) => {
             const newFiles = [file, ...state.uploadedFiles];
-            saveUploadedFiles(newFiles);
+            persistUploadedFiles(newFiles);
             return { uploadedFiles: newFiles };
         });
     },
@@ -226,25 +241,31 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
         const file = get().uploadedFiles[index];
 
-        // Optimistically hide the entry so the UI stays responsive…
-        set((state) => {
-            const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
-            saveUploadedFiles(newFiles);
-            return { uploadedFiles: newFiles };
-        });
+        // Optimistically hide the entry so the UI stays responsive — IN MEMORY
+        // ONLY. The ownerToken is the sole credential that can delete this
+        // object, so localStorage must keep it until the server confirms: if the
+        // tab is closed, reloaded or crashes while the request is in flight (or
+        // the request simply never answers), the token has to survive.
+        markDeletePending(id, file, index);
+        set((state) => ({ uploadedFiles: state.uploadedFiles.filter((f) => f.id !== id) }));
 
-        // …but the ownerToken is the ONLY credential that can delete this
-        // object, so it may not be discarded until the server confirms.
         const deleted = await confirmServerDelete(file);
+        clearDeletePending(id);
+
         if (deleted) {
+            // Confirmed gone — only now is it safe to drop the token durably.
+            set((state) => {
+                const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
+                persistUploadedFiles(newFiles);
+                return { uploadedFiles: newFiles };
+            });
             return;
         }
 
-        set((state) => {
-            const newFiles = insertUploadedFileAt(state.uploadedFiles, file, index);
-            saveUploadedFiles(newFiles);
-            return { uploadedFiles: newFiles };
-        });
+        // Restore in memory; localStorage was never pruned, so nothing to undo.
+        set((state) => ({
+            uploadedFiles: insertUploadedFileAt(state.uploadedFiles, file, index),
+        }));
         get().addToast({
             title: 'Delete failed',
             description: `"${file.name}" is still available on the server. Try removing it again.`,
@@ -254,7 +275,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     forgetUploadedFile: (id) => {
         set((state) => {
             const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
-            saveUploadedFiles(newFiles);
+            persistUploadedFiles(newFiles);
             return { uploadedFiles: newFiles };
         });
     },
@@ -263,43 +284,58 @@ export const useAppStore = create<AppState>((set, get) => ({
             const newFiles = state.uploadedFiles.map((f) =>
                 f.id === id ? { ...f, ...updates } : f,
             );
-            saveUploadedFiles(newFiles);
+            persistUploadedFiles(newFiles);
             return { uploadedFiles: newFiles };
         });
     },
     clearUploadedFiles: async () => {
         const files = get().uploadedFiles;
         if (files.length === 0) {
-            localStorage.removeItem('uploadedFiles');
             set({ uploadedFiles: [] });
+            persistUploadedFiles([]);
             return;
         }
 
-        // Optimistically clear, then restore whatever the server refused to
-        // delete — dropping those ownerTokens would strand the objects live.
-        localStorage.removeItem('uploadedFiles');
+        // Same contract as removeUploadedFile, applied to the whole list: hide
+        // everything immediately, but leave localStorage alone until each delete
+        // is confirmed. A crash mid-clear must not discard every ownerToken at
+        // once while the objects stay live.
+        files.forEach((file, index) => {
+            markDeletePending(file.id, file, index);
+        });
         set({ uploadedFiles: [] });
 
         const outcomes = await Promise.all(
-            files.map(async (file, index) => ({
-                file,
-                index,
-                deleted: await confirmServerDelete(file),
-            })),
+            files.map(async (file) => ({ file, deleted: await confirmServerDelete(file) })),
         );
-        const failed = outcomes.filter((o) => !o.deleted);
+
+        const failed: UploadedFile[] = [];
+        for (const { file, deleted } of outcomes) {
+            if (deleted) {
+                clearDeletePending(file.id);
+            } else {
+                failed.push(file);
+            }
+        }
+
         if (failed.length === 0) {
+            persistUploadedFiles(get().uploadedFiles);
             return;
         }
 
         set((state) => {
             let newFiles = state.uploadedFiles;
-            for (const { file, index } of failed) {
+            for (const file of failed) {
+                const index = pendingDeletes.get(file.id)?.index ?? newFiles.length;
                 newFiles = insertUploadedFileAt(newFiles, file, index);
             }
-            saveUploadedFiles(newFiles);
             return { uploadedFiles: newFiles };
         });
+        for (const file of failed) {
+            clearDeletePending(file.id);
+        }
+        persistUploadedFiles(get().uploadedFiles);
+
         get().addToast({
             title: 'Some files could not be deleted',
             description: `${failed.length} file${failed.length === 1 ? '' : 's'} are still available on the server. Try again.`,
@@ -348,17 +384,53 @@ export const useAppStore = create<AppState>((set, get) => ({
 // Helper functions
 
 /**
+ * History entries whose server delete is in flight.
+ *
+ * The optimistic removal is in-memory only, so every writer that persists the
+ * history has to merge these back in — otherwise a concurrent `addUploadedFile`
+ * or `updateUploadedFile` would durably prune an entry whose delete has not been
+ * confirmed, losing the only credential that can remove the object.
+ */
+const pendingDeletes = new Map<string, { file: UploadedFile; index: number }>();
+
+function markDeletePending(id: string, file: UploadedFile, index: number) {
+    pendingDeletes.set(id, { file, index });
+}
+
+function clearDeletePending(id: string) {
+    pendingDeletes.delete(id);
+}
+
+/** Persist the history, keeping entries whose delete is not yet confirmed. */
+function persistUploadedFiles(files: UploadedFile[]) {
+    let merged = files;
+    for (const { file, index } of pendingDeletes.values()) {
+        merged = insertUploadedFileAt(merged, file, index);
+    }
+    saveUploadedFiles(merged);
+}
+
+/**
  * Ask the server to delete a file and report whether it is confirmed gone.
  *
- * `deleteFile` currently resolves `response.ok` and only rejects on a raw
- * network error, so a 401/410/500 is indistinguishable from any other non-ok
- * status here. Anything not confirmed is treated as "still live" — the entry and
- * its ownerToken are kept so the user can retry. See the PR's cross-PR contract
- * note for the richer `deleteFile` result shape this would prefer.
+ * `deleteFile` resolves `response.ok` and only rejects on a raw network error,
+ * so every non-ok status collapses to `false` — including the very common
+ * "already gone" case (the server reaps a file once its download limit is hit,
+ * and `/delete` then answers 401 because the owner token it compares against was
+ * deleted with the metadata). Treating that as a failed delete would leave a row
+ * the user can never remove.
+ *
+ * So on a non-confirmation, ask an endpoint that reports absence *distinctly*:
+ * `getDownloadStatus` returns `gone` only for a 404/410 and `error` for a 5xx,
+ * a 401 on a live encrypted file, or a network failure — `/download/url/:id`
+ * checks metadata before auth, so a deleted encrypted file still answers 404.
+ * A backend outage can therefore never be mistaken for a successful delete.
  */
 async function confirmServerDelete(file: UploadedFile): Promise<boolean> {
     try {
-        return await deleteFile(file.id, file.ownerToken);
+        if (await deleteFile(file.id, file.ownerToken)) {
+            return true;
+        }
     } catch (err) {
         console.warn('Failed to delete file from server:', err);
         captureError(err, {
@@ -366,6 +438,12 @@ async function confirmServerDelete(file: UploadedFile): Promise<boolean> {
             extra: { fileId: file.id },
             level: 'warning',
         });
+    }
+
+    try {
+        const status = await getDownloadStatus(file.id);
+        return status.status === 'gone';
+    } catch {
         return false;
     }
 }

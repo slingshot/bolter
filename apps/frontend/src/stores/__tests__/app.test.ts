@@ -3,16 +3,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Mock dependencies before importing the store
 vi.mock('@/lib/api', () => ({
     deleteFile: vi.fn().mockResolvedValue(true),
+    getDownloadStatus: vi.fn().mockResolvedValue({ status: 'error' }),
 }));
 vi.mock('@/lib/sentry', () => ({
     captureError: vi.fn(),
     addBreadcrumb: vi.fn(),
 }));
 
-import { deleteFile } from '@/lib/api';
+import { deleteFile, getDownloadStatus } from '@/lib/api';
 import { buildShareUrl, resolveExpiresAt, type UploadedFile, useAppStore } from '@/stores/app';
 
 const deleteFileMock = vi.mocked(deleteFile);
+const getDownloadStatusMock = vi.mocked(getDownloadStatus);
+
+/** A deferred promise, so a test can inspect state while a delete is in flight. */
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+        resolve = r;
+    });
+    return { promise, resolve };
+}
 
 function makeUploadedFile(overrides: Partial<UploadedFile> = {}): UploadedFile {
     return {
@@ -53,6 +64,9 @@ describe('useAppStore', () => {
         localStorage.clear();
         vi.clearAllMocks();
         deleteFileMock.mockResolvedValue(true);
+        // Default: the "is it actually gone?" probe reports a transient failure,
+        // so a non-ok delete stays conservatively unconfirmed.
+        getDownloadStatusMock.mockResolvedValue({ status: 'error' });
     });
 
     afterEach(() => {
@@ -303,6 +317,86 @@ describe('useAppStore', () => {
             expect(useAppStore.getState().uploadedFiles.map((f) => f.id)).toEqual(['a', 'b', 'c']);
         });
 
+        // Regression: finding #37 — pruning localStorage optimistically means a
+        // tab close / reload / crash (or a request that simply never answers)
+        // during the in-flight delete destroys the ownerToken while the object
+        // stays live and downloadable. The optimistic removal must be
+        // in-memory only.
+        it('keeps the entry and its ownerToken in localStorage while the delete is in flight', async () => {
+            const file = makeUploadedFile({ id: 'inflight', ownerToken: 'tok-inflight' });
+            useAppStore.getState().addUploadedFile(file);
+
+            const gate = deferred<boolean>();
+            deleteFileMock.mockReturnValue(gate.promise);
+
+            const pending = useAppStore.getState().removeUploadedFile('inflight');
+
+            // Hidden in the UI…
+            expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
+            // …but the only credential that can delete the object survives a
+            // reload at exactly this moment.
+            const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string);
+            expect(stored).toHaveLength(1);
+            expect(stored[0].id).toBe('inflight');
+            expect(stored[0].ownerToken).toBe('tok-inflight');
+
+            gate.resolve(true);
+            await pending;
+
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toHaveLength(0);
+        });
+
+        it('does not durably prune a pending entry when another upload is recorded mid-flight', async () => {
+            const file = makeUploadedFile({ id: 'pending', ownerToken: 'tok-pending' });
+            useAppStore.getState().addUploadedFile(file);
+
+            const gate = deferred<boolean>();
+            deleteFileMock.mockReturnValue(gate.promise);
+            const pendingDelete = useAppStore.getState().removeUploadedFile('pending');
+
+            // A concurrent write persists the history — it must not take the
+            // unconfirmed entry down with it.
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'brand-new' }));
+
+            const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string) as Array<{
+                id: string;
+            }>;
+            expect(stored.map((f) => f.id).sort()).toEqual(['brand-new', 'pending']);
+
+            gate.resolve(true);
+            await pendingDelete;
+
+            const after = JSON.parse(localStorage.getItem('uploadedFiles') as string) as Array<{
+                id: string;
+            }>;
+            expect(after.map((f) => f.id)).toEqual(['brand-new']);
+        });
+
+        // `deleteFile` collapses "already gone" (401 after the server reaped the
+        // file at its download limit) into the same `false` as a real failure.
+        it('treats a confirmed-gone file as successfully deleted', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'reaped' }));
+            deleteFileMock.mockResolvedValue(false);
+            getDownloadStatusMock.mockResolvedValue({ status: 'gone' });
+
+            await useAppStore.getState().removeUploadedFile('reaped');
+
+            expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
+            expect(useAppStore.getState().toasts).toHaveLength(0);
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toHaveLength(0);
+        });
+
+        it('does not treat a backend outage as a successful delete', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'outage' }));
+            deleteFileMock.mockResolvedValue(false); // 500
+            getDownloadStatusMock.mockResolvedValue({ status: 'error' }); // 500 too
+
+            await useAppStore.getState().removeUploadedFile('outage');
+
+            expect(useAppStore.getState().uploadedFiles.map((f) => f.id)).toEqual(['outage']);
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toHaveLength(1);
+        });
+
         it('is a no-op for an unknown id', async () => {
             await useAppStore.getState().removeUploadedFile('nope');
             expect(deleteFile).not.toHaveBeenCalled();
@@ -337,7 +431,7 @@ describe('useAppStore', () => {
     });
 
     describe('clearUploadedFiles', () => {
-        it('removes localStorage entry and empties the list', async () => {
+        it('empties the list and the persisted history', async () => {
             const file1 = makeUploadedFile({ id: 'a' });
             const file2 = makeUploadedFile({ id: 'b' });
             useAppStore.getState().addUploadedFile(file1);
@@ -346,7 +440,37 @@ describe('useAppStore', () => {
             await useAppStore.getState().clearUploadedFiles();
 
             expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
-            expect(localStorage.getItem('uploadedFiles')).toBeNull();
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toEqual([]);
+        });
+
+        // Regression: finding #37 — `localStorage.removeItem` before awaiting a
+        // single delete destroyed EVERY ownerToken at once. A crash or reload
+        // mid-clear must leave the whole history recoverable.
+        it('keeps every ownerToken in localStorage while the deletes are in flight', async () => {
+            useAppStore
+                .getState()
+                .addUploadedFile(makeUploadedFile({ id: 'k1', ownerToken: 't1' }));
+            useAppStore
+                .getState()
+                .addUploadedFile(makeUploadedFile({ id: 'k2', ownerToken: 't2' }));
+
+            const gate = deferred<boolean>();
+            deleteFileMock.mockReturnValue(gate.promise);
+
+            const pending = useAppStore.getState().clearUploadedFiles();
+
+            expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
+            const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string) as Array<{
+                id: string;
+                ownerToken: string;
+            }>;
+            expect(stored.map((f) => f.id).sort()).toEqual(['k1', 'k2']);
+            expect(stored.map((f) => f.ownerToken).sort()).toEqual(['t1', 't2']);
+
+            gate.resolve(true);
+            await pending;
+
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toEqual([]);
         });
 
         it('calls deleteFile for each file', async () => {
@@ -420,37 +544,74 @@ describe('useAppStore', () => {
     });
 
     describe('resolveExpiresAt', () => {
-        const NOW = Date.UTC(2026, 7, 9, 12, 0, 0);
+        const STARTED_AT = Date.UTC(2026, 7, 3, 9, 0, 0); // Monday
+        const COMPLETED_AT = Date.UTC(2026, 7, 6, 17, 0, 0); // Thursday
+        const WEEK = 604800;
 
-        // Regression: finding #15 — the server TTL starts at /upload/url, so a
-        // resumed upload completing days later must not restart the clock.
-        it('uses the authoritative expiresAt from the completion response', () => {
-            const serverExpiry = NOW + 3 * 60 * 60 * 1000;
+        // Regression: finding #15 — the server sets the metadata TTL when
+        // /upload/url mints the id and never refreshes it. `/upload/complete`
+        // returns no expiry today (and `api.ts` discards its body), so the
+        // fallback IS the live path: it must anchor on the upload start, not on
+        // the completion time. The audit's scenario is exactly this one — start
+        // Monday, resume and complete Thursday, with a 7-day expiry.
+        it('anchors the fallback to the upload start, not the completion time', () => {
+            const result = resolveExpiresAt({ id: 'f' }, WEEK, STARTED_AT, COMPLETED_AT);
+            expect(result.getTime()).toBe(STARTED_AT + WEEK * 1000);
+            expect(result.getTime()).toBeLessThan(COMPLETED_AT + WEEK * 1000);
+        });
+
+        // The shape `api.ts` actually produces: a 4-field UploadResult with no
+        // expiry fields at all.
+        it('anchors on the upload start for a completion result carrying no server fields', () => {
+            const uploadResult = {
+                id: 'abc',
+                url: 'https://example.com/download/abc',
+                ownerToken: 'tok',
+                duration: 3 * 24 * 60 * 60 * 1000,
+            };
+            const result = resolveExpiresAt(uploadResult, WEEK, STARTED_AT, COMPLETED_AT);
+            expect(result.getTime()).toBe(STARTED_AT + WEEK * 1000);
+        });
+
+        it('falls back to the completion time only when no start is known', () => {
+            expect(resolveExpiresAt({}, 3600, 0, COMPLETED_AT).getTime()).toBe(
+                COMPLETED_AT + 3_600_000,
+            );
+            expect(resolveExpiresAt({}, 3600, Number.NaN, COMPLETED_AT).getTime()).toBe(
+                COMPLETED_AT + 3_600_000,
+            );
+        });
+
+        // Forward-compatible: dormant until `/upload/complete` (and `api.ts`)
+        // start carrying an authoritative expiry.
+        it('prefers an authoritative expiresAt from the completion response', () => {
+            const serverExpiry = COMPLETED_AT + 3 * 60 * 60 * 1000;
             const result = resolveExpiresAt(
                 { id: 'f', expiresAt: serverExpiry, ttl: 10800 },
-                604800,
-                NOW,
+                WEEK,
+                STARTED_AT,
+                COMPLETED_AT,
             );
             expect(result.getTime()).toBe(serverExpiry);
         });
 
-        it('falls back to the server ttl when expiresAt is absent', () => {
-            const result = resolveExpiresAt({ id: 'f', ttl: 60 }, 604800, NOW);
-            expect(result.getTime()).toBe(NOW + 60_000);
-        });
-
-        it('falls back to now + timeLimit when the server sends neither', () => {
-            const result = resolveExpiresAt({ id: 'f' }, 3600, NOW);
-            expect(result.getTime()).toBe(NOW + 3_600_000);
+        it('reads a server ttl as remaining-from-now, not from the upload start', () => {
+            const result = resolveExpiresAt({ id: 'f', ttl: 60 }, WEEK, STARTED_AT, COMPLETED_AT);
+            expect(result.getTime()).toBe(COMPLETED_AT + 60_000);
         });
 
         it('ignores non-numeric or nonsensical server values', () => {
-            expect(resolveExpiresAt({ expiresAt: 'soon' }, 60, NOW).getTime()).toBe(NOW + 60_000);
-            expect(resolveExpiresAt({ expiresAt: 0 }, 60, NOW).getTime()).toBe(NOW + 60_000);
-            expect(resolveExpiresAt({ expiresAt: Number.NaN }, 60, NOW).getTime()).toBe(
-                NOW + 60_000,
+            const expected = STARTED_AT + 60_000;
+            expect(
+                resolveExpiresAt({ expiresAt: 'soon' }, 60, STARTED_AT, COMPLETED_AT).getTime(),
+            ).toBe(expected);
+            expect(resolveExpiresAt({ expiresAt: 0 }, 60, STARTED_AT, COMPLETED_AT).getTime()).toBe(
+                expected,
             );
-            expect(resolveExpiresAt(null, 60, NOW).getTime()).toBe(NOW + 60_000);
+            expect(
+                resolveExpiresAt({ expiresAt: Number.NaN }, 60, STARTED_AT, COMPLETED_AT).getTime(),
+            ).toBe(expected);
+            expect(resolveExpiresAt(null, 60, STARTED_AT, COMPLETED_AT).getTime()).toBe(expected);
         });
     });
 

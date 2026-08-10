@@ -190,9 +190,18 @@ export function DropZone() {
             // the fallback path had nothing left to recover.
             const droppedFiles = Array.from(e.dataTransfer.files ?? []);
             const items = e.dataTransfer.items;
-            const itemCount = items?.length ?? 0;
+            // Count only `kind === 'file'` items, synchronously. Dragging a URL,
+            // a text selection or an image from another page produces `string`
+            // items and no files at all — that is a no-op, not a failed drop,
+            // and must not raise "Nothing was added".
+            let fileItemCount = 0;
+            for (let i = 0; i < (items?.length ?? 0); i++) {
+                if (items[i].kind === 'file') {
+                    fileItemCount++;
+                }
+            }
 
-            if (itemCount === 0 && droppedFiles.length === 0) {
+            if (fileItemCount === 0 && droppedFiles.length === 0) {
                 return;
             }
 
@@ -202,7 +211,7 @@ export function DropZone() {
             let skipped = 0;
 
             try {
-                if (itemCount > 0) {
+                if (fileItemCount > 0) {
                     const traversal = await processDataTransferItems(items);
                     files = traversal.files;
                     skipped = traversal.skipped;
