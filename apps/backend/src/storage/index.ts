@@ -257,8 +257,13 @@ export const storage = {
         return redis.exists(id);
     },
 
-    incrementDownloadCount(id: string): Promise<number> {
-        return redis.hIncrBy(id, 'dl', 1);
+    /**
+     * Increment a file's download counter, but never resurrect a deleted key
+     * (audit #7). Resolves `null` when the file vanished mid-request — callers
+     * must treat that as "gone" rather than as a count of zero.
+     */
+    incrementDownloadCount(id: string): Promise<number | null> {
+        return redis.hIncrByIfExists(id, 'dl', 1);
     },
 
     rotateNonce(id: string, nonce: string): Promise<boolean> {

@@ -9,7 +9,9 @@ import { abortServerMultipart } from './multipart-abort';
 // state with completed parts was cut mid-record and cannot be resumed safely.
 // Version 3: state carries a content fingerprint of the file being uploaded so a
 // resume cannot splice a different file's tail onto the uploaded prefix.
-export const UPLOAD_STATE_VERSION = 3;
+// v4 adds `uploadToken` (audit #52). Purely additive: v3 records still resume,
+// they just cannot present a token — which the backend accepts as pre-token.
+export const UPLOAD_STATE_VERSION = 4;
 
 // The version at which encrypted parts started being cut on ECE record
 // boundaries. Pinned separately from UPLOAD_STATE_VERSION so later schema bumps
@@ -29,6 +31,11 @@ export interface PersistedUpload {
     // would be spliced tail-onto-prefix and, for encrypted uploads, decrypt
     // cleanly into a corrupt hybrid.
     contentFingerprint?: string;
+    // Bearer credential from /upload/url that authorizes aborting or resuming
+    // THIS upload (audit #52). Distinct from ownerToken, which authorizes the
+    // finished file. Optional so records written before v4 still resume — the
+    // backend treats a missing token as pre-token and allows it.
+    uploadToken?: string;
     encrypted: boolean;
     partSize: number; // Encrypted part size used by S3
     plaintextPartSize: number; // Plaintext bytes per part (for resume offset)
@@ -343,28 +350,34 @@ export async function deleteUploadState(fileId: string): Promise<void> {
 export async function discardResumableUpload(state: {
     fileId: string;
     uploadId: string;
+    /** Authorizes the abort (audit #52); absent on records persisted before v4. */
+    uploadToken?: string;
 }): Promise<void> {
-    await abortServerMultipart(state.fileId, state.uploadId);
+    await abortServerMultipart(state.fileId, state.uploadId, state.uploadToken);
     await deleteUploadState(state.fileId);
 }
 
 /** Collect (without deleting) the records older than `cutoff`. */
 async function listUploadsOlderThan(
     cutoff: number,
-): Promise<Array<{ fileId: string; uploadId: string }>> {
+): Promise<Array<{ fileId: string; uploadId: string; uploadToken?: string }>> {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const request = store.openCursor();
-        const stale: Array<{ fileId: string; uploadId: string }> = [];
+        const stale: Array<{ fileId: string; uploadId: string; uploadToken?: string }> = [];
 
         request.onsuccess = () => {
             const cursor = request.result;
             if (cursor) {
                 const state = cursor.value as PersistedUpload;
                 if (state.createdAt < cutoff) {
-                    stale.push({ fileId: state.fileId, uploadId: state.uploadId });
+                    stale.push({
+                        fileId: state.fileId,
+                        uploadId: state.uploadId,
+                        uploadToken: state.uploadToken,
+                    });
                 }
                 cursor.continue();
             }
