@@ -1,3 +1,8 @@
+// MUST stay the first import: it strips the end-to-end encryption key out of
+// location.hash before any telemetry SDK can read location.href. ES modules
+// evaluate in import order, so this runs ahead of Plausible's auto-pageview
+// (which sends `u: location.href`) and ahead of Sentry.init() below.
+import './lib/url-secret';
 import * as Sentry from '@sentry/react';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
@@ -7,10 +12,18 @@ import App from './App';
 import './index.css';
 import { AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { scrubReplayRecordingEvent, scrubSentryBreadcrumb, scrubSentryEvent } from './lib/sentry';
 
 Sentry.init({
     dsn: 'https://04c2025d3ea04059cd3f474b55d0a941@glitch.slingshot.fm/5',
-    integrations: [Sentry.browserTracingIntegration(), Sentry.replayIntegration()],
+    integrations: [
+        Sentry.browserTracingIntegration(),
+        Sentry.replayIntegration({
+            // Replay records navigation/performance entries carrying the full
+            // URL — strip the fragment out of every one of them
+            beforeAddRecordingEvent: (event) => scrubReplayRecordingEvent(event),
+        }),
+    ],
     // Tracing
     tracesSampleRate: 1.0,
     // Set 'tracePropagationTargets' to control for which URLs distributed tracing should be enabled
@@ -18,6 +31,13 @@ Sentry.init({
     // Session Replay
     replaysSessionSampleRate: 0.1,
     replaysOnErrorSampleRate: 1.0,
+    // Defence in depth for the download link's key fragment: strip it from
+    // every URL an event, transaction or breadcrumb can carry, on every route.
+    // The address-bar strip above is the root-cause fix; these hooks catch
+    // anything captured before it ran or reconstructed afterwards.
+    beforeSend: (event) => scrubSentryEvent(event),
+    beforeSendTransaction: (event) => scrubSentryEvent(event),
+    beforeBreadcrumb: (breadcrumb) => scrubSentryBreadcrumb(breadcrumb),
 });
 
 function ErrorFallback() {
