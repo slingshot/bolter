@@ -2,11 +2,15 @@ import { beforeEach, describe, expect, it, mock } from 'bun:test';
 import { createHmac } from 'node:crypto';
 
 // --- Mock storage ---
+const mockCompareAndRotateNonce = mock(() => Promise.resolve(true));
 const mockStorage = {
     getMetadata: mock(() => Promise.resolve(null)),
     setField: mock(() => Promise.resolve()),
-    getField: mock(() => Promise.resolve(null)),
+    getField: mock(() => Promise.resolve(null as string | null)),
     rotateNonce: mock(() => Promise.resolve(true)),
+    redis: {
+        compareAndRotateNonce: mockCompareAndRotateNonce,
+    },
 };
 
 mock.module('../storage', () => ({
@@ -30,8 +34,12 @@ describe('verifyAuth', () => {
     beforeEach(() => {
         mockStorage.getMetadata.mockReset();
         mockStorage.setField.mockReset();
+        mockStorage.getField.mockReset();
+        mockStorage.getField.mockResolvedValue(null);
         mockStorage.rotateNonce.mockReset();
         mockStorage.rotateNonce.mockResolvedValue(true);
+        mockCompareAndRotateNonce.mockReset();
+        mockCompareAndRotateNonce.mockResolvedValue(true);
     });
 
     it('should return valid=false with empty nonce when file not found', async () => {
@@ -139,9 +147,10 @@ describe('verifyAuth', () => {
 
         expect(result.valid).toBe(true);
         expect(result.nonce).toBeTruthy();
-        // The used nonce is consumed — a fresh one is persisted and returned
+        // The used nonce is consumed — a fresh one is persisted and returned,
+        // via a compare-and-swap against the nonce that was just validated
         expect(result.nonce).not.toBe(nonceB64);
-        expect(mockStorage.rotateNonce).toHaveBeenCalledWith('test-id', result.nonce);
+        expect(mockCompareAndRotateNonce).toHaveBeenCalledWith('test-id', nonceB64, result.nonce);
     });
 
     it('should return valid=false when HMAC signature is wrong', async () => {
@@ -262,6 +271,7 @@ describe('verifyAuth', () => {
         expect(result1.nonce).toBe(storedNonce);
         expect(result2.nonce).toBe(storedNonce);
         expect(mockStorage.rotateNonce).not.toHaveBeenCalled();
+        expect(mockCompareAndRotateNonce).not.toHaveBeenCalled();
         expect(mockStorage.setField).not.toHaveBeenCalled();
     });
 
@@ -285,13 +295,18 @@ describe('verifyAuth', () => {
 
         const failed = await verifyAuth('test-id', null);
         expect(failed.valid).toBe(false);
-        expect(mockStorage.rotateNonce).not.toHaveBeenCalled();
+        expect(mockCompareAndRotateNonce).not.toHaveBeenCalled();
 
         const succeeded = await verifyAuth('test-id', `send-v1 ${expectedSig}`);
         expect(succeeded.valid).toBe(true);
         expect(succeeded.nonce).not.toBe(nonceB64);
-        expect(mockStorage.rotateNonce).toHaveBeenCalledTimes(1);
-        expect(mockStorage.rotateNonce).toHaveBeenCalledWith('test-id', succeeded.nonce);
+        expect(mockStorage.rotateNonce).not.toHaveBeenCalled();
+        expect(mockCompareAndRotateNonce).toHaveBeenCalledTimes(1);
+        expect(mockCompareAndRotateNonce).toHaveBeenCalledWith(
+            'test-id',
+            nonceB64,
+            succeeded.nonce,
+        );
     });
 
     it('should generate and persist a nonce for legacy records missing one', async () => {
@@ -330,6 +345,151 @@ describe('verifyAuth', () => {
 
         expect(mockStorage.setField).not.toHaveBeenCalled();
         expect(mockStorage.rotateNonce).not.toHaveBeenCalled();
+    });
+
+    // --- #44: nonce rotation must be an atomic compare-and-swap ---
+
+    it('should rotate the nonce with a CAS against the nonce that was validated', async () => {
+        const authKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+        const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
+        const nonceB64 = nonce.toString('base64');
+        const expectedSig = createHmac('sha256', authKey).update(nonce).digest('base64');
+
+        mockStorage.getMetadata.mockResolvedValue({
+            id: 'test-id',
+            encrypted: true,
+            auth: authKey.toString('base64'),
+            nonce: nonceB64,
+            prefix: '1',
+            owner: 'owner123',
+            dl: 0,
+            dlimit: 1,
+            fileSize: 1000,
+        });
+
+        const result = await verifyAuth('test-id', `send-v1 ${expectedSig}`);
+
+        expect(result.valid).toBe(true);
+        // Pre-fix this was a blind HSET that carried no expectation about the
+        // nonce being replaced, so a concurrent verification of the same nonce
+        // could not be detected.
+        expect(mockCompareAndRotateNonce).toHaveBeenCalledTimes(1);
+        const [key, expected, next] = mockCompareAndRotateNonce.mock.calls[0] as unknown as [
+            string,
+            string,
+            string,
+        ];
+        expect(key).toBe('test-id');
+        expect(expected).toBe(nonceB64);
+        expect(next).toBe(result.nonce);
+        expect(next).not.toBe(nonceB64);
+    });
+
+    it('should NOT accept a request that loses the nonce CAS (nonce consumed twice)', async () => {
+        const authKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+        const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
+        const nonceB64 = nonce.toString('base64');
+        const expectedSig = createHmac('sha256', authKey).update(nonce).digest('base64');
+
+        mockStorage.getMetadata.mockResolvedValue({
+            id: 'test-id',
+            encrypted: true,
+            auth: authKey.toString('base64'),
+            nonce: nonceB64,
+            prefix: '1',
+            owner: 'owner123',
+            dl: 0,
+            dlimit: 1,
+            fileSize: 1000,
+        });
+
+        // A concurrent request already consumed this nonce and rotated it
+        mockCompareAndRotateNonce.mockResolvedValue(false);
+        mockStorage.getField.mockResolvedValue('winner-rotated-nonce');
+
+        const result = await verifyAuth('test-id', `send-v1 ${expectedSig}`);
+
+        // Pre-fix both concurrent holders of the same nonce were accepted,
+        // double-consuming it (and letting a replayed /download/complete
+        // increment the counter twice).
+        expect(result.valid).toBe(false);
+        // ...and the loser is re-challenged with the nonce that actually won
+        expect(result.nonce).toBe('winner-rotated-nonce');
+        expect(mockStorage.getField).toHaveBeenCalledWith('test-id', 'nonce');
+    });
+
+    it('should fall back to the validated nonce when the CAS loser cannot re-read one', async () => {
+        const authKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+        const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
+        const nonceB64 = nonce.toString('base64');
+        const expectedSig = createHmac('sha256', authKey).update(nonce).digest('base64');
+
+        mockStorage.getMetadata.mockResolvedValue({
+            id: 'test-id',
+            encrypted: true,
+            auth: authKey.toString('base64'),
+            nonce: nonceB64,
+            prefix: '1',
+            owner: 'owner123',
+            dl: 0,
+            dlimit: 1,
+            fileSize: 1000,
+        });
+
+        // Key expired between the read and the CAS — nothing to re-challenge with
+        mockCompareAndRotateNonce.mockResolvedValue(false);
+        mockStorage.getField.mockResolvedValue(null);
+
+        const result = await verifyAuth('test-id', `send-v1 ${expectedSig}`);
+
+        expect(result.valid).toBe(false);
+        expect(result.nonce).toBe(nonceB64);
+    });
+
+    it('should let only one of two concurrent verifications of the same nonce succeed', async () => {
+        const authKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+        const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
+        const nonceB64 = nonce.toString('base64');
+        const expectedSig = createHmac('sha256', authKey).update(nonce).digest('base64');
+
+        mockStorage.getMetadata.mockResolvedValue({
+            id: 'test-id',
+            encrypted: true,
+            auth: authKey.toString('base64'),
+            nonce: nonceB64,
+            prefix: '1',
+            owner: 'owner123',
+            dl: 0,
+            dlimit: 1,
+            fileSize: 1000,
+        });
+
+        // Simulate the real Lua CAS: the stored nonce only matches once
+        let stored = nonceB64;
+        mockCompareAndRotateNonce.mockImplementation(
+            (...args: unknown[]) =>
+                new Promise<boolean>((resolve) => {
+                    const [, expected, next] = args as [string, string, string];
+                    if (stored !== expected) {
+                        resolve(false);
+                        return;
+                    }
+                    stored = next;
+                    resolve(true);
+                }),
+        );
+        mockStorage.getField.mockImplementation(() => Promise.resolve(stored));
+
+        const [a, b] = await Promise.all([
+            verifyAuth('test-id', `send-v1 ${expectedSig}`),
+            verifyAuth('test-id', `send-v1 ${expectedSig}`),
+        ]);
+
+        // Exactly one wins; the other is rejected and re-challenged. Pre-fix
+        // both returned valid=true, consuming one nonce twice.
+        expect([a.valid, b.valid].filter(Boolean).length).toBe(1);
+        const loser = a.valid ? b : a;
+        expect(loser.nonce).toBe(stored);
     });
 
     it('should handle exceptions in HMAC computation gracefully', async () => {

@@ -78,9 +78,20 @@ export async function verifyAuth(
         }
 
         // Rotate only after a successful verification — the used nonce is
-        // consumed immediately, preserving replay protection
+        // consumed immediately, preserving replay protection.
+        //
+        // The rotation is a compare-and-swap on the nonce that was validated:
+        // read-validate-then-blind-write is not atomic, so two concurrent
+        // requests signing the same nonce would both be accepted and both
+        // rotate (last writer wins), consuming one nonce twice. Losing the CAS
+        // means another request already consumed this nonce, so this attempt is
+        // rejected and re-challenged with the current nonce instead.
         const newNonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('base64');
-        await storage.rotateNonce(id, newNonce);
+        const rotated = await storage.redis.compareAndRotateNonce(id, storedNonce, newNonce);
+        if (!rotated) {
+            const currentNonce = await storage.getField(id, 'nonce');
+            return { valid: false, nonce: currentNonce || storedNonce };
+        }
         return { valid: true, nonce: newNonce };
     } catch (e) {
         captureError(e, {

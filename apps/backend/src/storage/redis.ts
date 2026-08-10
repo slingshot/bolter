@@ -153,6 +153,30 @@ export class RedisStorage {
         );
         return result === 1;
     }
+
+    // Compare-and-swap rotation: the nonce is replaced only if it still holds
+    // the value that was just validated. Read-validate-then-blind-write is not
+    // atomic, so two concurrent requests carrying valid signatures for the same
+    // nonce would both succeed and both rotate — consuming one nonce twice and
+    // defeating replay protection. Returns false when the nonce already moved
+    // on (or the key expired), so the caller can issue a fresh challenge.
+    // EXISTS-guarded like rotateNonce so a just-expired key is never
+    // resurrected as a TTL-less hash containing only the nonce field.
+    async compareAndRotateNonce(
+        key: string,
+        expectedNonce: string,
+        nextNonce: string,
+    ): Promise<boolean> {
+        const client = await this.getClient();
+        const result = await client.eval(
+            "if redis.call('EXISTS', KEYS[1]) == 1 and redis.call('HGET', KEYS[1], 'nonce') == ARGV[1] then redis.call('HSET', KEYS[1], 'nonce', ARGV[2]) return 1 else return 0 end",
+            {
+                keys: [key],
+                arguments: [expectedNonce, nextNonce],
+            },
+        );
+        return result === 1;
+    }
 }
 
 export const redis = new RedisStorage();
