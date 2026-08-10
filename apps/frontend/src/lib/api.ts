@@ -2522,6 +2522,42 @@ export async function reportDownloadComplete(
 }
 
 /**
+ * Fetch with a stall guard around the connection/response-header phase.
+ *
+ * Browsers impose no default fetch timeout, so a socket that connects but
+ * never returns headers (blackholed proxy, captive portal, dead middlebox)
+ * parks the await forever. The body-side stall detector cannot help — it only
+ * arms once a reader exists. This aborts the request if no response headers
+ * arrive within `timeoutMs`, then clears the timer the moment they do so body
+ * transfer is never capped by it.
+ *
+ * Pass an existing `controller` to keep the caller's ability to abort the
+ * in-flight body later (the resilient stream does exactly this).
+ */
+export async function fetchWithHeaderTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number,
+    controller: AbortController = new AbortController(),
+): Promise<Response> {
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, timeoutMs);
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    } catch (e) {
+        if (timedOut) {
+            throw new Error(`Timed out waiting for response headers after ${timeoutMs}ms`);
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
  * Fetch the download URL info for a file, handling the 401 challenge-response
  * pattern for encrypted files. Throws on non-ok responses.
  */
@@ -2534,7 +2570,11 @@ async function fetchDownloadUrlInfo(
         headers.Authorization = await keychain.authHeader();
     }
 
-    let response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+    let response = await fetchWithHeaderTimeout(
+        `${API_BASE_URL}/download/url/${id}`,
+        { headers },
+        DOWNLOAD_STALL_TIMEOUT,
+    );
 
     // Handle 401 challenge-response: extract nonce and retry
     if (response.status === 401 && keychain) {
@@ -2544,7 +2584,11 @@ async function fetchDownloadUrlInfo(
             if (nonce) {
                 keychain.nonce = nonce;
                 headers.Authorization = await keychain.authHeader();
-                response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
+                response = await fetchWithHeaderTimeout(
+                    `${API_BASE_URL}/download/url/${id}`,
+                    { headers },
+                    DOWNLOAD_STALL_TIMEOUT,
+                );
             }
         }
     }
@@ -2572,11 +2616,75 @@ async function fetchDownloadUrlInfo(
     return response.json();
 }
 
-class PermanentDownloadError extends Error {
+export class PermanentDownloadError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'PermanentDownloadError';
     }
+}
+
+/**
+ * Raised when `controller.enqueue`/`controller.close` throws because the
+ * stream is already closed or errored — i.e. the consumer went away (a
+ * downstream decryption TransformStream errored and cancelled us). Retrying
+ * the network can never fix this, so it is strictly terminal.
+ *
+ * It must be a distinct type: the raw failure is a `TypeError`, which is also
+ * what a genuine `fetch()` network failure throws, and those MUST stay
+ * retryable.
+ */
+export class StreamConsumerGoneError extends Error {
+    constructor(operation: 'enqueue' | 'close', cause: unknown) {
+        super(`Download stream consumer is gone (${operation} failed)`);
+        this.name = 'StreamConsumerGoneError';
+        this.cause = cause;
+    }
+}
+
+/**
+ * Decide whether a failed pull attempt is worth retrying. Pure, so the retry
+ * policy is unit-testable without a network.
+ *
+ * Terminal cases: a 404/410 from the object store, a consumer that has gone
+ * away, and an exhausted retry budget. Everything else (socket resets, stalls,
+ * `fetch` TypeErrors) is retryable.
+ */
+export function shouldRetryDownloadAttempt(
+    error: unknown,
+    state: { failures: number; maxRetries: number },
+): boolean {
+    if (error instanceof PermanentDownloadError || error instanceof StreamConsumerGoneError) {
+        return false;
+    }
+    return state.failures < state.maxRetries;
+}
+
+/**
+ * True when a range-resume attempt is pointless because every byte of the
+ * object has already been received.
+ *
+ * A connection that dies holding EOF/FIN leaves `received === total`; the
+ * retry would ask for `Range: bytes=<total>-`, which is unsatisfiable, and
+ * S3/R2 answer 416 — discarding a byte-complete download. The total is taken
+ * from the first response's Content-Length when known, otherwise from the
+ * `bytes * /N` Content-Range that a 416 carries.
+ */
+export function isRangeResumeUnnecessary(
+    received: number,
+    expectedTotal?: number,
+    unsatisfiableContentRange?: string | null,
+): boolean {
+    if (expectedTotal !== undefined && expectedTotal > 0 && received >= expectedTotal) {
+        return true;
+    }
+    if (unsatisfiableContentRange) {
+        const match = /^bytes\s+\*\/(\d+)$/.exec(unsatisfiableContentRange.trim());
+        if (match) {
+            const total = parseInt(match[1], 10);
+            return Number.isFinite(total) && total > 0 && received >= total;
+        }
+    }
+    return false;
 }
 
 export interface ResilientDownloadRequest {
@@ -2599,6 +2707,12 @@ export interface ResilientDownloadOptions {
     onResponse?: (response: Response) => void;
     /** Already-fetched response to consume for the first attempt */
     firstResponse?: Response;
+    /**
+     * Total wire size of the object, when known (the first response's
+     * Content-Length). Once `received` reaches it the stream closes as
+     * complete instead of issuing an unsatisfiable range-resume request.
+     */
+    expectedTotal?: number;
     maxRetries?: number;
     retryDelays?: number[];
     stallTimeout?: number;
@@ -2610,8 +2724,10 @@ export interface ResilientDownloadOptions {
  * (waiting for connectivity when offline) and resumes from the total bytes
  * already delivered via a Range request. Servers without range support (200
  * response) have the already-received prefix discarded. A stall detector
- * aborts the in-flight fetch if no bytes arrive within stallTimeout.
- * The retry budget resets whenever an attempt delivers new bytes.
+ * aborts the in-flight fetch if no bytes arrive within stallTimeout, and the
+ * connection/response-header phase carries the same guard.
+ * The retry budget resets whenever an attempt successfully delivers new bytes
+ * downstream. Cancellation is terminal: no attempt is opened afterwards.
  */
 export function createResilientDownloadStream(
     options: ResilientDownloadOptions,
@@ -2619,9 +2735,11 @@ export function createResilientDownloadStream(
     const maxRetries = options.maxRetries ?? DOWNLOAD_MAX_RETRIES;
     const retryDelays = options.retryDelays ?? DOWNLOAD_RETRY_DELAYS;
     const stallTimeout = options.stallTimeout ?? DOWNLOAD_STALL_TIMEOUT;
+    const expectedTotal = options.expectedTotal;
 
     let received = 0;
     let failures = 0;
+    let cancelled = false;
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let abortController: AbortController | null = null;
     let discardRemaining = 0;
@@ -2642,7 +2760,8 @@ export function createResilientDownloadStream(
         }
     };
 
-    const openAttempt = async (): Promise<void> => {
+    // 'complete' means every byte already arrived and no attempt is needed.
+    const openAttempt = async (): Promise<'opened' | 'complete'> => {
         discardRemaining = 0;
         abortController = new AbortController();
 
@@ -2653,7 +2772,14 @@ export function createResilientDownloadStream(
                 throw new Error('No response body');
             }
             reader = response.body.getReader();
-            return;
+            return 'opened';
+        }
+
+        // A connection that dropped while holding EOF leaves us byte-complete;
+        // resuming would request an unsatisfiable range and throw away a
+        // finished download.
+        if (isRangeResumeUnnecessary(received, expectedTotal)) {
+            return 'complete';
         }
 
         const doFetch = async (refreshUrl: boolean): Promise<Response> => {
@@ -2662,7 +2788,8 @@ export function createResilientDownloadStream(
             if (received > 0) {
                 headers.Range = `bytes=${received}-`;
             }
-            return fetch(request.url, { headers, signal: abortController?.signal });
+            const controller = abortController ?? new AbortController();
+            return fetchWithHeaderTimeout(request.url, { headers }, stallTimeout, controller);
         };
 
         let response = await doFetch(false);
@@ -2692,6 +2819,17 @@ export function createResilientDownloadStream(
             } else if (response.status === 200) {
                 // Server ignored the Range header — discard the prefix we already have
                 discardRemaining = received;
+            } else if (
+                response.status === 416 &&
+                isRangeResumeUnnecessary(
+                    received,
+                    expectedTotal,
+                    response.headers.get('Content-Range'),
+                )
+            ) {
+                // Unsatisfiable range because there is nothing left to fetch —
+                // the object is already fully received.
+                return 'complete';
             } else {
                 throw new Error(`Range resume failed: HTTP ${response.status}`);
             }
@@ -2703,6 +2841,7 @@ export function createResilientDownloadStream(
             throw new Error('No response body');
         }
         reader = response.body.getReader();
+        return 'opened';
     };
 
     // Race a read against the stall timer; on stall, abort the in-flight
@@ -2728,16 +2867,44 @@ export function createResilientDownloadStream(
         }
     };
 
+    // Any throw from enqueue/close means the stream is closed or errored — the
+    // consumer is gone. Tag it so the retry loop cannot mistake it for a
+    // transient network fault and refetch forever.
+    const enqueueChunk = (
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        chunk: Uint8Array,
+    ) => {
+        try {
+            controller.enqueue(chunk);
+        } catch (e) {
+            throw new StreamConsumerGoneError('enqueue', e);
+        }
+    };
+
+    const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+        try {
+            controller.close();
+        } catch (e) {
+            throw new StreamConsumerGoneError('close', e);
+        }
+    };
+
     return new ReadableStream<Uint8Array>({
         async pull(controller) {
             while (true) {
+                // Cancellation is checked on every loop entry, not just on the
+                // first: each `await` below is a point where cancel() can land.
+                if (cancelled) {
+                    return;
+                }
                 try {
-                    if (!reader) {
-                        await openAttempt();
+                    if (!reader && (await openAttempt()) === 'complete') {
+                        closeStream(controller);
+                        return;
                     }
                     const { done, value } = await readWithStallGuard();
                     if (done || !value) {
-                        controller.close();
+                        closeStream(controller);
                         return;
                     }
 
@@ -2755,15 +2922,20 @@ export function createResilientDownloadStream(
                     }
 
                     received += chunk.length;
-                    failures = 0; // Reset the retry budget on forward progress
-                    controller.enqueue(chunk);
+                    enqueueChunk(controller, chunk);
+                    // Reset the retry budget only once bytes actually reached
+                    // the consumer. Resetting before the enqueue meant a
+                    // permanently failing enqueue never exhausted maxRetries.
+                    failures = 0;
                     return;
                 } catch (e) {
                     dropAttempt();
-                    if (e instanceof PermanentDownloadError) {
-                        throw e;
+                    if (cancelled) {
+                        // Nobody is listening; erroring the stream here would
+                        // only produce an unhandled rejection.
+                        return;
                     }
-                    if (failures >= maxRetries) {
+                    if (!shouldRetryDownloadAttempt(e, { failures, maxRetries })) {
                         throw e instanceof Error ? e : new Error(String(e));
                     }
                     const delay = retryDelays[Math.min(failures, retryDelays.length - 1)];
@@ -2778,6 +2950,7 @@ export function createResilientDownloadStream(
             }
         },
         cancel() {
+            cancelled = true;
             dropAttempt();
         },
     });
@@ -2834,7 +3007,14 @@ export async function downloadFile(
         downloadHeaders.Authorization = await keychain.authHeader();
     }
 
-    let response = await fetch(downloadUrl, { headers: downloadHeaders });
+    // Header-phase guard only: the timer is cleared the moment headers arrive,
+    // so the body (the actual download, potentially hours long) is never
+    // capped — the read-side stall detector takes over from there.
+    let response = await fetchWithHeaderTimeout(
+        downloadUrl,
+        { headers: downloadHeaders },
+        DOWNLOAD_STALL_TIMEOUT,
+    );
 
     // Handle 401 challenge-response for direct downloads
     if (response.status === 401 && keychain && !urlData.useSignedUrl) {
@@ -2844,7 +3024,11 @@ export async function downloadFile(
             if (nonce) {
                 keychain.nonce = nonce;
                 downloadHeaders.Authorization = await keychain.authHeader();
-                response = await fetch(downloadUrl, { headers: downloadHeaders });
+                response = await fetchWithHeaderTimeout(
+                    downloadUrl,
+                    { headers: downloadHeaders },
+                    DOWNLOAD_STALL_TIMEOUT,
+                );
             }
         }
     }
@@ -2898,6 +3082,10 @@ export async function downloadFile(
     // Created before the legacy branch so both paths get the same resilience.
     const bodyStream = createResilientDownloadStream({
         firstResponse: response,
+        // Lets a resume that already holds every byte close as complete
+        // instead of issuing an unsatisfiable Range and 416-ing the download
+        // away. Absent (0) on the fallback route, which sends no Content-Length.
+        expectedTotal: contentLength > 0 ? contentLength : undefined,
         getRequest: async (refreshUrl) => {
             if (refreshUrl) {
                 const fresh = await fetchDownloadUrlInfo(id, keychain);
