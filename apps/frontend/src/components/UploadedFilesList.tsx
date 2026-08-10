@@ -3,12 +3,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { getFileInfo } from '@/lib/api';
 import { formatBytes, formatTimeLimit } from '@/lib/utils';
-import { type UploadedFile, useAppStore } from '@/stores/app';
+import { buildShareUrl, type UploadedFile, useAppStore } from '@/stores/app';
 import { ShareDialog } from './ShareDialog';
 
 export function UploadedFilesList() {
-    const { uploadedFiles, clearUploadedFiles, removeUploadedFile, updateUploadedFile } =
-        useAppStore();
+    const {
+        uploadedFiles,
+        clearUploadedFiles,
+        removeUploadedFile,
+        forgetUploadedFile,
+        updateUploadedFile,
+    } = useAppStore();
     const [selectedFile, setSelectedFile] = useState<UploadedFile | null>(null);
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -26,18 +31,20 @@ export function UploadedFilesList() {
         for (const file of files) {
             const info = await getFileInfo(file.id, file.ownerToken);
             if (info.status === 'not_found') {
-                // File confirmed deleted on the server — safe to remove
-                removeUploadedFile(file.id);
+                // File confirmed deleted on the server — drop it locally only.
+                // Issuing another /delete here would 404 and be restored as a
+                // failed delete, looping forever.
+                forgetUploadedFile(file.id);
             } else if (info.status === 'ok' && info.dl >= info.dlimit) {
-                // Download limit reached - remove from list
-                removeUploadedFile(file.id);
+                // Download limit reached — the server already reaped it.
+                forgetUploadedFile(file.id);
             } else if (info.status === 'ok' && info.dl !== file.downloadCount) {
                 // Update download count
                 updateUploadedFile(file.id, { downloadCount: info.dl });
             }
             // status === 'error' → network issue, skip (don't remove)
         }
-    }, [removeUploadedFile, updateUploadedFile]);
+    }, [forgetUploadedFile, updateUploadedFile]);
 
     useEffect(() => {
         // Poll immediately on mount
@@ -68,7 +75,9 @@ export function UploadedFilesList() {
                         </h3>
                         <button
                             type="button"
-                            onClick={clearUploadedFiles}
+                            onClick={() => {
+                                void clearUploadedFiles();
+                            }}
                             className="text-paragraph-sm text-content-primary font-medium hover:text-content-secondary transition-colors"
                         >
                             Clear
@@ -122,10 +131,7 @@ export function UploadedFilesList() {
                                                 size="icon"
                                                 className="h-7 w-7 p-0"
                                                 onClick={() =>
-                                                    window.open(
-                                                        `${file.url}#${file.secretKey}`,
-                                                        '_blank',
-                                                    )
+                                                    window.open(buildShareUrl(file), '_blank')
                                                 }
                                             >
                                                 <Download className="h-4 w-4 text-content-primary" />
@@ -139,7 +145,9 @@ export function UploadedFilesList() {
                                             variant="ghost"
                                             size="icon"
                                             className="h-7 w-7 p-0"
-                                            onClick={() => removeUploadedFile(file.id)}
+                                            onClick={() => {
+                                                void removeUploadedFile(file.id);
+                                            }}
                                         >
                                             <X className="h-4 w-4 text-content-primary" />
                                         </Button>

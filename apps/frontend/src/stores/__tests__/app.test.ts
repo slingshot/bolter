@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock dependencies before importing the store
 vi.mock('@/lib/api', () => ({
-    deleteFile: vi.fn().mockResolvedValue(undefined),
+    deleteFile: vi.fn().mockResolvedValue(true),
 }));
 vi.mock('@/lib/sentry', () => ({
     captureError: vi.fn(),
@@ -10,7 +10,9 @@ vi.mock('@/lib/sentry', () => ({
 }));
 
 import { deleteFile } from '@/lib/api';
-import { type UploadedFile, useAppStore } from '@/stores/app';
+import { buildShareUrl, resolveExpiresAt, type UploadedFile, useAppStore } from '@/stores/app';
+
+const deleteFileMock = vi.mocked(deleteFile);
 
 function makeUploadedFile(overrides: Partial<UploadedFile> = {}): UploadedFile {
     return {
@@ -46,9 +48,11 @@ describe('useAppStore', () => {
             checkingSpeed: false,
             resumableUpload: null,
             config: null,
+            userTouchedSettings: false,
         });
         localStorage.clear();
         vi.clearAllMocks();
+        deleteFileMock.mockResolvedValue(true);
     });
 
     afterEach(() => {
@@ -225,23 +229,97 @@ describe('useAppStore', () => {
     });
 
     describe('removeUploadedFile', () => {
-        it('removes from the list and calls deleteFile', () => {
+        it('removes from the list and calls deleteFile', async () => {
             const file = makeUploadedFile({ id: 'to-remove', ownerToken: 'tok-123' });
             useAppStore.getState().addUploadedFile(file);
 
-            useAppStore.getState().removeUploadedFile('to-remove');
+            await useAppStore.getState().removeUploadedFile('to-remove');
 
             expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
             expect(deleteFile).toHaveBeenCalledWith('to-remove', 'tok-123');
         });
 
-        it('updates localStorage after removal', () => {
+        it('updates localStorage after removal', async () => {
             const file = makeUploadedFile({ id: 'remove-me' });
             useAppStore.getState().addUploadedFile(file);
-            useAppStore.getState().removeUploadedFile('remove-me');
+            await useAppStore.getState().removeUploadedFile('remove-me');
 
             const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string);
             expect(stored).toHaveLength(0);
+        });
+
+        // Regression: finding #37 — the owner token is the only credential that
+        // can delete the object, so it must survive a failed server delete.
+        it('restores the entry and its ownerToken when the server rejects the delete', async () => {
+            const file = makeUploadedFile({ id: 'unauth', ownerToken: 'tok-keep' });
+            useAppStore.getState().addUploadedFile(file);
+            deleteFileMock.mockResolvedValue(false); // e.g. HTTP 401 / 500
+
+            await useAppStore.getState().removeUploadedFile('unauth');
+
+            const remaining = useAppStore.getState().uploadedFiles;
+            expect(remaining).toHaveLength(1);
+            expect(remaining[0].id).toBe('unauth');
+            expect(remaining[0].ownerToken).toBe('tok-keep');
+
+            const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string);
+            expect(stored).toHaveLength(1);
+            expect(stored[0].ownerToken).toBe('tok-keep');
+        });
+
+        it('restores the entry when deleteFile throws a network error', async () => {
+            const file = makeUploadedFile({ id: 'netfail' });
+            useAppStore.getState().addUploadedFile(file);
+            deleteFileMock.mockRejectedValue(new Error('Failed to fetch'));
+
+            await useAppStore.getState().removeUploadedFile('netfail');
+
+            expect(useAppStore.getState().uploadedFiles.map((f) => f.id)).toEqual(['netfail']);
+        });
+
+        it('surfaces a retryable toast when the delete is not confirmed', async () => {
+            const file = makeUploadedFile({ id: 'toasty', name: 'secret.pdf' });
+            useAppStore.getState().addUploadedFile(file);
+            deleteFileMock.mockResolvedValue(false);
+
+            await useAppStore.getState().removeUploadedFile('toasty');
+
+            const { toasts } = useAppStore.getState();
+            expect(toasts).toHaveLength(1);
+            expect(toasts[0].title).toBe('Delete failed');
+            expect(toasts[0].variant).toBe('destructive');
+            expect(toasts[0].description).toContain('secret.pdf');
+        });
+
+        it('restores the entry at its original position', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'c' }));
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'b' }));
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'a' }));
+            // list order is [a, b, c]
+            deleteFileMock.mockResolvedValue(false);
+
+            await useAppStore.getState().removeUploadedFile('b');
+
+            expect(useAppStore.getState().uploadedFiles.map((f) => f.id)).toEqual(['a', 'b', 'c']);
+        });
+
+        it('is a no-op for an unknown id', async () => {
+            await useAppStore.getState().removeUploadedFile('nope');
+            expect(deleteFile).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('forgetUploadedFile', () => {
+        // Used by the poller when the server already reported the file gone —
+        // issuing another /delete there would 404 and be restored forever.
+        it('prunes locally without calling deleteFile', () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'gone' }));
+
+            useAppStore.getState().forgetUploadedFile('gone');
+
+            expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
+            expect(deleteFile).not.toHaveBeenCalled();
+            expect(JSON.parse(localStorage.getItem('uploadedFiles') as string)).toHaveLength(0);
         });
     });
 
@@ -259,28 +337,120 @@ describe('useAppStore', () => {
     });
 
     describe('clearUploadedFiles', () => {
-        it('removes localStorage entry and empties the list', () => {
+        it('removes localStorage entry and empties the list', async () => {
             const file1 = makeUploadedFile({ id: 'a' });
             const file2 = makeUploadedFile({ id: 'b' });
             useAppStore.getState().addUploadedFile(file1);
             useAppStore.getState().addUploadedFile(file2);
 
-            useAppStore.getState().clearUploadedFiles();
+            await useAppStore.getState().clearUploadedFiles();
 
             expect(useAppStore.getState().uploadedFiles).toHaveLength(0);
             expect(localStorage.getItem('uploadedFiles')).toBeNull();
         });
 
-        it('calls deleteFile for each file in background', () => {
+        it('calls deleteFile for each file', async () => {
             const file1 = makeUploadedFile({ id: 'del-1', ownerToken: 'tok-1' });
             const file2 = makeUploadedFile({ id: 'del-2', ownerToken: 'tok-2' });
             useAppStore.getState().addUploadedFile(file1);
             useAppStore.getState().addUploadedFile(file2);
 
-            useAppStore.getState().clearUploadedFiles();
+            await useAppStore.getState().clearUploadedFiles();
 
             expect(deleteFile).toHaveBeenCalledWith('del-1', 'tok-1');
             expect(deleteFile).toHaveBeenCalledWith('del-2', 'tok-2');
+        });
+
+        // Regression: finding #37 — a failed bulk delete used to drop every
+        // ownerToken at once, stranding live objects with no way to retry.
+        it('restores the files the server refused to delete', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'ok-1' }));
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'bad-1' }));
+            deleteFileMock.mockImplementation(async (id: string) => id !== 'bad-1');
+
+            await useAppStore.getState().clearUploadedFiles();
+
+            const remaining = useAppStore.getState().uploadedFiles;
+            expect(remaining.map((f) => f.id)).toEqual(['bad-1']);
+            const stored = JSON.parse(localStorage.getItem('uploadedFiles') as string);
+            expect(stored.map((f: UploadedFile) => f.id)).toEqual(['bad-1']);
+        });
+
+        it('warns when some files could not be deleted', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'x' }));
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'y' }));
+            deleteFileMock.mockResolvedValue(false);
+
+            await useAppStore.getState().clearUploadedFiles();
+
+            expect(useAppStore.getState().uploadedFiles).toHaveLength(2);
+            const { toasts } = useAppStore.getState();
+            expect(toasts).toHaveLength(1);
+            expect(toasts[0].title).toBe('Some files could not be deleted');
+            expect(toasts[0].variant).toBe('destructive');
+        });
+
+        it('does not toast when every delete is confirmed', async () => {
+            useAppStore.getState().addUploadedFile(makeUploadedFile({ id: 'z' }));
+
+            await useAppStore.getState().clearUploadedFiles();
+
+            expect(useAppStore.getState().toasts).toHaveLength(0);
+        });
+    });
+
+    describe('buildShareUrl', () => {
+        // Regression: finding #16 — a plaintext upload must not get a
+        // key-looking fragment that implies end-to-end encryption.
+        it('omits the key fragment for an unencrypted upload', () => {
+            const file = makeUploadedFile({ encrypted: false });
+            expect(buildShareUrl(file)).toBe('https://example.com/download/abc');
+        });
+
+        it('appends the key fragment for an encrypted upload', () => {
+            const file = makeUploadedFile({ encrypted: true });
+            expect(buildShareUrl(file)).toBe('https://example.com/download/abc#secret-key-b64');
+        });
+
+        it('keeps the fragment for legacy entries with an unknown flag', () => {
+            const file = makeUploadedFile();
+            expect(file.encrypted).toBeUndefined();
+            expect(buildShareUrl(file)).toBe('https://example.com/download/abc#secret-key-b64');
+        });
+    });
+
+    describe('resolveExpiresAt', () => {
+        const NOW = Date.UTC(2026, 7, 9, 12, 0, 0);
+
+        // Regression: finding #15 — the server TTL starts at /upload/url, so a
+        // resumed upload completing days later must not restart the clock.
+        it('uses the authoritative expiresAt from the completion response', () => {
+            const serverExpiry = NOW + 3 * 60 * 60 * 1000;
+            const result = resolveExpiresAt(
+                { id: 'f', expiresAt: serverExpiry, ttl: 10800 },
+                604800,
+                NOW,
+            );
+            expect(result.getTime()).toBe(serverExpiry);
+        });
+
+        it('falls back to the server ttl when expiresAt is absent', () => {
+            const result = resolveExpiresAt({ id: 'f', ttl: 60 }, 604800, NOW);
+            expect(result.getTime()).toBe(NOW + 60_000);
+        });
+
+        it('falls back to now + timeLimit when the server sends neither', () => {
+            const result = resolveExpiresAt({ id: 'f' }, 3600, NOW);
+            expect(result.getTime()).toBe(NOW + 3_600_000);
+        });
+
+        it('ignores non-numeric or nonsensical server values', () => {
+            expect(resolveExpiresAt({ expiresAt: 'soon' }, 60, NOW).getTime()).toBe(NOW + 60_000);
+            expect(resolveExpiresAt({ expiresAt: 0 }, 60, NOW).getTime()).toBe(NOW + 60_000);
+            expect(resolveExpiresAt({ expiresAt: Number.NaN }, 60, NOW).getTime()).toBe(
+                NOW + 60_000,
+            );
+            expect(resolveExpiresAt(null, 60, NOW).getTime()).toBe(NOW + 60_000);
         });
     });
 
@@ -392,6 +562,65 @@ describe('useAppStore', () => {
         it('setConfig handles null', () => {
             useAppStore.getState().setConfig(null);
             expect(useAppStore.getState().config).toBeNull();
+        });
+
+        // Regression: finding #49 — server-configured defaults were loaded into
+        // `config` but never applied to the active upload settings.
+        it('seeds the active timeLimit and downloadLimit from server defaults', () => {
+            useAppStore.getState().setConfig({
+                maxFileSize: 1_000_000_000,
+                maxFilesPerArchive: 100,
+                maxExpireSeconds: 604800,
+                maxDownloads: 100,
+                defaultExpireSeconds: 3600,
+                defaultDownloads: 5,
+                expireTimes: [3600, 604800],
+                downloadCounts: [5, 10],
+            });
+
+            expect(useAppStore.getState().timeLimit).toBe(3600);
+            expect(useAppStore.getState().downloadLimit).toBe(5);
+        });
+
+        it('does not clobber an explicit user choice with a late config', () => {
+            useAppStore.getState().setTimeLimit(604800);
+            useAppStore.getState().setDownloadLimit(20);
+
+            useAppStore.getState().setConfig({
+                maxFileSize: 1_000_000_000,
+                maxFilesPerArchive: 100,
+                maxExpireSeconds: 604800,
+                maxDownloads: 100,
+                defaultExpireSeconds: 3600,
+                defaultDownloads: 1,
+                expireTimes: [3600, 604800],
+                downloadCounts: [1, 20],
+            });
+
+            expect(useAppStore.getState().timeLimit).toBe(604800);
+            expect(useAppStore.getState().downloadLimit).toBe(20);
+        });
+
+        it('keeps the current values when the server sends no usable defaults', () => {
+            useAppStore.getState().setConfig({
+                maxFileSize: 1_000_000_000,
+                maxFilesPerArchive: 100,
+                maxExpireSeconds: 604800,
+                maxDownloads: 100,
+                defaultExpireSeconds: 0,
+                defaultDownloads: 0,
+                expireTimes: [3600],
+                downloadCounts: [1],
+            });
+
+            expect(useAppStore.getState().timeLimit).toBe(86400);
+            expect(useAppStore.getState().downloadLimit).toBe(1);
+        });
+
+        it('marks settings as user-touched only on an explicit change', () => {
+            expect(useAppStore.getState().userTouchedSettings).toBe(false);
+            useAppStore.getState().setTimeLimit(300);
+            expect(useAppStore.getState().userTouchedSettings).toBe(true);
         });
     });
 

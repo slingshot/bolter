@@ -22,6 +22,57 @@ export interface UploadedFile {
     expiresAt: Date;
     downloadLimit: number;
     downloadCount: number;
+    /**
+     * Whether the payload was end-to-end encrypted. Optional because history
+     * entries persisted before this field existed carry no answer — `undefined`
+     * means "unknown", and must never be rendered as "encrypted".
+     */
+    encrypted?: boolean;
+}
+
+/**
+ * Build the shareable link for an uploaded file.
+ *
+ * The `#<secretKey>` fragment is only meaningful for end-to-end encrypted
+ * uploads. Appending it to a plaintext upload makes the link *look* encrypted,
+ * which is exactly the false assurance finding #16 describes. Legacy entries
+ * (`encrypted === undefined`) keep the fragment so links shared before the flag
+ * existed keep working.
+ */
+export function buildShareUrl(file: Pick<UploadedFile, 'url' | 'secretKey' | 'encrypted'>): string {
+    if (file.encrypted === false) {
+        return file.url;
+    }
+    return `${file.url}#${file.secretKey}`;
+}
+
+/**
+ * Resolve the expiry to display/persist for a completed upload.
+ *
+ * The server starts the metadata TTL at `/upload/url`, not at `/upload/complete`
+ * — for a resumed upload those can be days apart. `/upload/complete` therefore
+ * returns the authoritative `expiresAt` (epoch ms) and `ttl` (seconds remaining);
+ * prefer them, and only fall back to the local `now + timeLimit` estimate when a
+ * server that predates the field is answering.
+ */
+export function resolveExpiresAt(
+    completion: unknown,
+    timeLimitSeconds: number,
+    now: number = Date.now(),
+): Date {
+    const source = (completion ?? {}) as { expiresAt?: unknown; ttl?: unknown };
+
+    const { expiresAt } = source;
+    if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0) {
+        return new Date(expiresAt);
+    }
+
+    const { ttl } = source;
+    if (typeof ttl === 'number' && Number.isFinite(ttl) && ttl >= 0) {
+        return new Date(now + ttl * 1000);
+    }
+
+    return new Date(now + timeLimitSeconds * 1000);
 }
 
 export interface AppState {
@@ -42,6 +93,12 @@ export interface AppState {
     setTimeLimit: (seconds: number) => void;
     downloadLimit: number;
     setDownloadLimit: (limit: number) => void;
+    /**
+     * Set once the user explicitly picks an expiry / download limit, so a
+     * late-arriving `/config` response can seed defaults without clobbering a
+     * deliberate choice.
+     */
+    userTouchedSettings: boolean;
 
     // Upload state
     isUploading: boolean;
@@ -63,9 +120,12 @@ export interface AppState {
     // Uploaded files history
     uploadedFiles: UploadedFile[];
     addUploadedFile: (file: UploadedFile) => void;
-    removeUploadedFile: (id: string) => void;
+    /** Delete on the server, then prune locally only if the server confirmed it. */
+    removeUploadedFile: (id: string) => Promise<void>;
+    /** Drop a history entry locally, without attempting a server delete. */
+    forgetUploadedFile: (id: string) => void;
     updateUploadedFile: (id: string, updates: Partial<UploadedFile>) => void;
-    clearUploadedFiles: () => void;
+    clearUploadedFiles: () => Promise<void>;
 
     // Resumable upload
     resumableUpload: PersistedUpload | null;
@@ -126,10 +186,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Settings
     encrypted: false,
     setEncrypted: (encrypted) => set({ encrypted }),
-    timeLimit: 86400, // 1 day
-    setTimeLimit: (timeLimit) => set({ timeLimit }),
+    timeLimit: 86400, // 1 day (replaced by the server default once /config loads)
+    setTimeLimit: (timeLimit) => set({ timeLimit, userTouchedSettings: true }),
     downloadLimit: 1,
-    setDownloadLimit: (downloadLimit) => set({ downloadLimit }),
+    setDownloadLimit: (downloadLimit) => set({ downloadLimit, userTouchedSettings: true }),
+    userTouchedSettings: false,
 
     // Upload state
     isUploading: false,
@@ -157,21 +218,40 @@ export const useAppStore = create<AppState>((set, get) => ({
             return { uploadedFiles: newFiles };
         });
     },
-    removeUploadedFile: (id) => {
+    removeUploadedFile: async (id) => {
         // Find the file to get its owner token for S3 deletion
-        const file = get().uploadedFiles.find((f) => f.id === id);
-        if (file) {
-            // Delete from S3 in the background (don't block UI)
-            deleteFile(id, file.ownerToken).catch((err) => {
-                console.warn('Failed to delete file from server:', err);
-                captureError(err, {
-                    operation: 'file.delete',
-                    extra: { fileId: id },
-                    level: 'warning',
-                });
-            });
+        const index = get().uploadedFiles.findIndex((f) => f.id === id);
+        if (index === -1) {
+            return;
+        }
+        const file = get().uploadedFiles[index];
+
+        // Optimistically hide the entry so the UI stays responsive…
+        set((state) => {
+            const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
+            saveUploadedFiles(newFiles);
+            return { uploadedFiles: newFiles };
+        });
+
+        // …but the ownerToken is the ONLY credential that can delete this
+        // object, so it may not be discarded until the server confirms.
+        const deleted = await confirmServerDelete(file);
+        if (deleted) {
+            return;
         }
 
+        set((state) => {
+            const newFiles = insertUploadedFileAt(state.uploadedFiles, file, index);
+            saveUploadedFiles(newFiles);
+            return { uploadedFiles: newFiles };
+        });
+        get().addToast({
+            title: 'Delete failed',
+            description: `"${file.name}" is still available on the server. Try removing it again.`,
+            variant: 'destructive',
+        });
+    },
+    forgetUploadedFile: (id) => {
         set((state) => {
             const newFiles = state.uploadedFiles.filter((f) => f.id !== id);
             saveUploadedFiles(newFiles);
@@ -187,22 +267,44 @@ export const useAppStore = create<AppState>((set, get) => ({
             return { uploadedFiles: newFiles };
         });
     },
-    clearUploadedFiles: () => {
-        // Delete all files from S3 in the background
+    clearUploadedFiles: async () => {
         const files = get().uploadedFiles;
-        for (const file of files) {
-            deleteFile(file.id, file.ownerToken).catch((err) => {
-                console.warn('Failed to delete file from server:', err);
-                captureError(err, {
-                    operation: 'file.delete',
-                    extra: { fileId: file.id },
-                    level: 'warning',
-                });
-            });
+        if (files.length === 0) {
+            localStorage.removeItem('uploadedFiles');
+            set({ uploadedFiles: [] });
+            return;
         }
 
+        // Optimistically clear, then restore whatever the server refused to
+        // delete — dropping those ownerTokens would strand the objects live.
         localStorage.removeItem('uploadedFiles');
         set({ uploadedFiles: [] });
+
+        const outcomes = await Promise.all(
+            files.map(async (file, index) => ({
+                file,
+                index,
+                deleted: await confirmServerDelete(file),
+            })),
+        );
+        const failed = outcomes.filter((o) => !o.deleted);
+        if (failed.length === 0) {
+            return;
+        }
+
+        set((state) => {
+            let newFiles = state.uploadedFiles;
+            for (const { file, index } of failed) {
+                newFiles = insertUploadedFileAt(newFiles, file, index);
+            }
+            saveUploadedFiles(newFiles);
+            return { uploadedFiles: newFiles };
+        });
+        get().addToast({
+            title: 'Some files could not be deleted',
+            description: `${failed.length} file${failed.length === 1 ? '' : 's'} are still available on the server. Try again.`,
+            variant: 'destructive',
+        });
     },
 
     // Resumable upload
@@ -211,7 +313,27 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Config
     config: null,
-    setConfig: (config) => set({ config }),
+    setConfig: (config) =>
+        set((state) => {
+            // Seed the active upload settings from the server defaults. Without
+            // this the hardcoded 86400 / 1 win, silently ignoring the admin's
+            // configured defaults and rendering the Select blank whenever the
+            // configured option list omits those values.
+            if (!config || state.userTouchedSettings) {
+                return { config };
+            }
+            const seeded: Partial<AppState> = { config };
+            if (
+                typeof config.defaultExpireSeconds === 'number' &&
+                config.defaultExpireSeconds > 0
+            ) {
+                seeded.timeLimit = config.defaultExpireSeconds;
+            }
+            if (typeof config.defaultDownloads === 'number' && config.defaultDownloads > 0) {
+                seeded.downloadLimit = config.defaultDownloads;
+            }
+            return seeded;
+        }),
 
     // Toasts
     toasts: [],
@@ -224,6 +346,44 @@ export const useAppStore = create<AppState>((set, get) => ({
 }));
 
 // Helper functions
+
+/**
+ * Ask the server to delete a file and report whether it is confirmed gone.
+ *
+ * `deleteFile` currently resolves `response.ok` and only rejects on a raw
+ * network error, so a 401/410/500 is indistinguishable from any other non-ok
+ * status here. Anything not confirmed is treated as "still live" — the entry and
+ * its ownerToken are kept so the user can retry. See the PR's cross-PR contract
+ * note for the richer `deleteFile` result shape this would prefer.
+ */
+async function confirmServerDelete(file: UploadedFile): Promise<boolean> {
+    try {
+        return await deleteFile(file.id, file.ownerToken);
+    } catch (err) {
+        console.warn('Failed to delete file from server:', err);
+        captureError(err, {
+            operation: 'file.delete',
+            extra: { fileId: file.id },
+            level: 'warning',
+        });
+        return false;
+    }
+}
+
+/** Re-insert a restored history entry at (approximately) its original position. */
+function insertUploadedFileAt(
+    files: UploadedFile[],
+    file: UploadedFile,
+    index: number,
+): UploadedFile[] {
+    if (files.some((f) => f.id === file.id)) {
+        return files;
+    }
+    const next = [...files];
+    next.splice(Math.max(0, Math.min(index, next.length)), 0, file);
+    return next;
+}
+
 function loadUploadedFiles(): UploadedFile[] {
     try {
         const stored = localStorage.getItem('uploadedFiles');

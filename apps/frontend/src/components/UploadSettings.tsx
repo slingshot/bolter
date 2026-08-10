@@ -9,6 +9,14 @@ import { Toggle } from '@/components/ui/toggle';
 import { formatDownloadLimit, formatTimeLimit } from '@/lib/utils';
 import { useAppStore } from '@/stores/app';
 
+/** Return `options` with `active` merged in (sorted ascending) if it is missing. */
+export function withActiveValue(options: number[], active: number): number[] {
+    if (options.includes(active)) {
+        return options;
+    }
+    return [...options, active].sort((a, b) => a - b);
+}
+
 export function UploadSettings() {
     const {
         encrypted,
@@ -20,8 +28,17 @@ export function UploadSettings() {
         config,
     } = useAppStore();
 
-    const expireTimes = config?.expireTimes || [300, 3600, 86400, 604800];
-    const downloadCounts = config?.downloadCounts || [1, 2, 3, 4, 5, 20, 50, 100];
+    // A Select renders blank when its value has no matching item — which happens
+    // whenever the configured default (or a previously chosen value) is not in
+    // the admin's option list. Always include the active value.
+    const expireTimes = withActiveValue(
+        config?.expireTimes || [300, 3600, 86400, 604800],
+        timeLimit,
+    );
+    const downloadCounts = withActiveValue(
+        config?.downloadCounts || [1, 2, 3, 4, 5, 20, 50, 100],
+        downloadLimit,
+    );
 
     return (
         <div className="flex flex-col gap-3">

@@ -14,11 +14,11 @@ import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
 import {
     cleanupExpiredUploads,
-    deleteUploadState,
+    discardResumableUpload,
     getAnyResumableUpload,
 } from '@/lib/upload-state';
 import { formatBytes } from '@/lib/utils';
-import { type UploadedFile, useAppStore } from '@/stores/app';
+import { resolveExpiresAt, type UploadedFile, useAppStore } from '@/stores/app';
 
 export function HomePage() {
     const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
@@ -103,9 +103,13 @@ export function HomePage() {
                     ownerToken: result.ownerToken,
                     name: file.name,
                     size: file.size,
-                    expiresAt: new Date(Date.now() + resumableUpload.timeLimit * 1000),
+                    // The server TTL started back at /upload/url — which for a
+                    // resume can be days ago — so trust the authoritative expiry
+                    // from /upload/complete over a local now+timeLimit estimate.
+                    expiresAt: resolveExpiresAt(result, resumableUpload.timeLimit),
                     downloadLimit: resumableUpload.downloadLimit,
                     downloadCount: 0,
+                    encrypted: resumableUpload.encrypted,
                 };
 
                 addUploadedFile(uploaded);
@@ -148,12 +152,18 @@ export function HomePage() {
     );
 
     const handleStartFresh = useCallback(() => {
-        if (resumableUpload) {
-            deleteUploadState(resumableUpload.fileId).catch(() => {
-                // Intentionally ignored — best-effort cleanup
-            });
-            setResumableUpload(null);
+        if (!resumableUpload) {
+            return;
         }
+        const { fileId, uploadId } = resumableUpload;
+        setResumableUpload(null);
+        // Abort the server-side multipart before dropping the local record —
+        // it holds the only copy of the uploadId, and without the abort the
+        // uploaded S3 parts stay billable and the provider file counter stays
+        // permanently incremented.
+        discardResumableUpload({ fileId, uploadId }).catch(() => {
+            // Intentionally ignored — best-effort cleanup
+        });
     }, [resumableUpload, setResumableUpload]);
 
     const handleUpload = useCallback(async () => {
@@ -211,9 +221,12 @@ export function HomePage() {
                 ownerToken: result.ownerToken,
                 name: files.length === 1 ? files[0].file.name : `${files.length} files`,
                 size: files.reduce((sum, f) => sum + f.file.size, 0),
-                expiresAt: new Date(Date.now() + timeLimit * 1000),
+                // The server started the TTL at /upload/url, not now — prefer the
+                // authoritative expiry it returns from /upload/complete.
+                expiresAt: resolveExpiresAt(result, timeLimit),
                 downloadLimit,
                 downloadCount: 0,
+                encrypted,
             };
 
             addUploadedFile(uploaded);

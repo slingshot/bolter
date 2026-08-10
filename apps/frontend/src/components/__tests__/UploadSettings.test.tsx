@@ -12,7 +12,7 @@ vi.mock('@/lib/sentry', () => ({
 }));
 
 import { useAppStore } from '@/stores/app';
-import { UploadSettings } from '../UploadSettings';
+import { UploadSettings, withActiveValue } from '../UploadSettings';
 
 describe('UploadSettings', () => {
     afterEach(() => {
@@ -24,6 +24,7 @@ describe('UploadSettings', () => {
             encrypted: false,
             timeLimit: 86400,
             downloadLimit: 1,
+            userTouchedSettings: false,
             config: {
                 maxFileSize: 1_000_000_000_000,
                 maxFilesPerArchive: 64,
@@ -136,5 +137,44 @@ describe('UploadSettings', () => {
         await user.click(option);
 
         expect(useAppStore.getState().timeLimit).toBe(3600);
+    });
+
+    // Regression: finding #49 — the Select sourced its value from the hardcoded
+    // store state but its options from `config`, so an admin option list that
+    // omitted the active value rendered the control blank.
+    describe('option list always contains the active value', () => {
+        it('merges the active value into a shorter configured list', () => {
+            expect(withActiveValue([3600, 604800], 86400)).toEqual([3600, 86400, 604800]);
+        });
+
+        it('leaves the list untouched when the value is already present', () => {
+            const options = [1, 5, 10];
+            expect(withActiveValue(options, 5)).toBe(options);
+        });
+
+        it('renders the expiry value even when the configured list omits it', () => {
+            const config = useAppStore.getState().config;
+            useAppStore.setState({
+                timeLimit: 86400,
+                config: config && { ...config, expireTimes: [3600, 604800] },
+            });
+
+            render(<UploadSettings />);
+
+            // Without the merge the trigger renders blank instead of "1 day"
+            expect(screen.getByText('1 day')).toBeInTheDocument();
+        });
+
+        it('renders the download limit even when the configured list omits it', () => {
+            const config = useAppStore.getState().config;
+            useAppStore.setState({
+                downloadLimit: 1,
+                config: config && { ...config, downloadCounts: [5, 10] },
+            });
+
+            render(<UploadSettings />);
+
+            expect(screen.getByText('1 download')).toBeInTheDocument();
+        });
     });
 });
