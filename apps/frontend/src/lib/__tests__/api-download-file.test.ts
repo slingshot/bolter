@@ -1,5 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { downloadFile } from '@/lib/api';
+
+// `downloadFile` streams to a `DownloadWriter` sink and returns an empty
+// saved-to-disk marker rather than the payload, so delivered-byte assertions
+// have to count what the writer received. `vi.hoisted` is required because
+// vitest lifts `vi.mock` factories above the imports, so the factory cannot
+// close over an ordinary module-level binding.
+const sink = vi.hoisted(() => ({ written: 0 }));
+
+vi.mock('@/lib/stream-saver', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/lib/stream-saver')>();
+    return {
+        ...actual,
+        createDownloadWriter: () =>
+            Promise.resolve({
+                strategy: 'memory' as const,
+                write: (chunk: Uint8Array) => {
+                    sink.written += chunk.length;
+                    return Promise.resolve();
+                },
+                close: () => Promise.resolve(),
+                abort: () => Promise.resolve(),
+            }),
+    };
+});
+
+const { downloadFile } = await import('@/lib/api');
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -45,6 +70,7 @@ describe('downloadFile', () => {
 
     beforeEach(() => {
         calls = [];
+        sink.written = 0;
     });
 
     afterEach(() => {
@@ -131,7 +157,10 @@ describe('downloadFile', () => {
 
         const result = await downloadFile('file-id', null);
         expect(result.filename).toBe('a.bin');
-        expect(result.blob.size).toBe(64);
+        // Bytes go to the writer sink now; the returned blob is the empty
+        // saved-to-disk marker, not the payload.
+        expect(result.blob.size).toBe(0);
+        expect(sink.written).toBe(64);
     });
 
     it('does not gate when the server omits the counters', async () => {
@@ -186,7 +215,8 @@ describe('downloadFile', () => {
         });
 
         const result = await downloadFile('file-id', null);
-        expect(result.blob.size).toBe(1000);
+        expect(result.blob.size).toBe(0);
+        expect(sink.written).toBe(1000);
         expect(calls.some((c) => c.includes('/download/complete/'))).toBe(true);
     });
 

@@ -24,6 +24,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **No accounts required** — generate a link, share it, done
 - **Resilient uploads** — stall detection, offline awareness, progress-based retries, IndexedDB-backed resume on page reload, and Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility
 - **Resilient downloads** — mid-stream failures resume via HTTP Range requests with stall detection and signed-URL refresh; every download is verified for completeness (and decryption integrity when encrypted) before it is reported successful
+- **Streaming saves** — encrypted, zipped and legacy multi-file downloads write straight to disk (File System Access API, with a service-worker stream for Safari/Firefox) instead of being buffered in memory, and a download only counts against the share's limit once the save has actually landed
 - **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
 - **Multi-provider S3** — dynamic storage provider management via API; seamlessly migrate between S3-compatible services (Cloudflare R2, Railway, AWS S3, etc.) while existing files remain accessible on their original provider
 - **Self-hostable** — Docker Compose, or run directly with Bun
@@ -155,6 +156,8 @@ bolter/
 | **HKDF key derivation** | Derives separate keys for content and metadata from a single secret |
 | **64KB record encryption** | Streaming-friendly — encrypt/decrypt without loading the entire file into memory |
 | **IndexedDB resume state** | Multipart upload state survives page reloads; users can resume interrupted uploads |
+| **Streaming download sink** | Browser-processed downloads write through a `DownloadWriter` (File System Access → service worker → capped in-memory buffer) so a large file is never fully retained; the in-memory last resort is capped at 2 GiB and warns first |
+| **Save before credit** | `/download/complete` is posted only after the save commits, so a failed or refused save can never consume one of a share's limited downloads |
 | **Safari/WebKit compat** | Handles empty stream chunks from iOS HEIC/HEVC transcoding; pre-resolves transcoded file sizes for accurate part allocation |
 
 ## Configuration

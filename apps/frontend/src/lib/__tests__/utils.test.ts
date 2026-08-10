@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     formatBytes,
     formatDownloadLimit,
@@ -7,6 +7,9 @@ import {
     formatTimeLimit,
     getFileExtension,
     getFileIcon,
+    isSavedToDisk,
+    markSavedToDisk,
+    triggerDownload,
 } from '@/lib/utils';
 
 describe('formatBytes', () => {
@@ -257,5 +260,67 @@ describe('getFileIcon', () => {
         expect(getFileIcon('application/octet-stream')).toBe('file');
         expect(getFileIcon('application/json')).toBe('file');
         expect(getFileIcon('')).toBe('file');
+    });
+});
+
+describe('triggerDownload', () => {
+    function captureAnchorSaves() {
+        const clicks: { href: string; download: string }[] = [];
+        const originalCreate = URL.createObjectURL;
+        const originalRevoke = URL.revokeObjectURL;
+        const createObjectURL = vi.fn(() => 'blob:mock');
+        URL.createObjectURL = createObjectURL as unknown as typeof URL.createObjectURL;
+        URL.revokeObjectURL = vi.fn() as unknown as typeof URL.revokeObjectURL;
+        const clickSpy = vi
+            .spyOn(HTMLAnchorElement.prototype, 'click')
+            .mockImplementation(function mockClick(this: HTMLAnchorElement) {
+                clicks.push({ href: this.getAttribute('href') || '', download: this.download });
+            });
+        return {
+            clicks,
+            createObjectURL,
+            restore() {
+                clickSpy.mockRestore();
+                URL.createObjectURL = originalCreate;
+                URL.revokeObjectURL = originalRevoke;
+            },
+        };
+    }
+
+    it('saves a real payload Blob through an object URL', () => {
+        const saves = captureAnchorSaves();
+        try {
+            triggerDownload(new Blob(['hello']), 'greeting.txt');
+            expect(saves.createObjectURL).toHaveBeenCalledTimes(1);
+            expect(saves.clicks).toEqual([{ href: 'blob:mock', download: 'greeting.txt' }]);
+        } finally {
+            saves.restore();
+        }
+    });
+
+    it('refuses to save a placeholder for bytes already streamed to disk', () => {
+        // Streaming saves (File System Access API / service worker) have
+        // already written the file. Saving the empty placeholder on top of it
+        // would deliver a 0-byte file to the user.
+        const saves = captureAnchorSaves();
+        try {
+            triggerDownload(markSavedToDisk(new Blob([])), 'movie.mkv');
+            expect(saves.createObjectURL).not.toHaveBeenCalled();
+            expect(saves.clicks).toEqual([]);
+        } finally {
+            saves.restore();
+        }
+    });
+});
+
+describe('markSavedToDisk / isSavedToDisk', () => {
+    it('marks a blob without changing its contents', async () => {
+        const blob = markSavedToDisk(new Blob(['abc']));
+        expect(isSavedToDisk(blob)).toBe(true);
+        expect(await blob.text()).toBe('abc');
+    });
+
+    it('leaves ordinary blobs unmarked', () => {
+        expect(isSavedToDisk(new Blob(['abc']))).toBe(false);
     });
 });
