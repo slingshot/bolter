@@ -1,0 +1,560 @@
+import { describe, expect, it } from 'vitest';
+import { MemoryPartStore, type PartStore } from '../part-store';
+import type {
+    CompletionEnvelope,
+    EngineLease,
+    EnginePartRecord,
+    EngineStateStore,
+    ProducerCheckpoint,
+} from '../state';
+import { runUploaders, type UploaderOpts } from '../uploader';
+
+function makeData(size: number): Uint8Array {
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i++) {
+        data[i] = i % 256;
+    }
+    return data;
+}
+
+// biome-ignore lint/suspicious/useAwait: async generator builds the AsyncIterable the PartStore contract requires
+async function* chunks(...arrays: Uint8Array[]) {
+    for (const a of arrays) {
+        yield a;
+    }
+}
+
+async function stage(store: PartStore, partNumber: number, bytes: Uint8Array): Promise<void> {
+    await store.stagePart(partNumber, chunks(bytes));
+}
+
+/** Pull queue over a fixed part list: null once drained. */
+function makeQueue(parts: { partNumber: number; size: number }[]) {
+    const queue = [...parts];
+    return () => Promise.resolve(queue.shift() ?? null);
+}
+
+/** Let pending promise chains settle (real zero-delay timers). */
+async function flush(times = 6): Promise<void> {
+    for (let i = 0; i < times; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+}
+
+/**
+ * Deterministic wall clock + timer queue. `advance` moves the clock and runs
+ * every callback that has come due, earliest first — a callback scheduled at
+ * 1s that only runs after a 6s jump sees the full 6s wall-clock delta, exactly
+ * like a throttled worker timer.
+ */
+function fakeClock() {
+    let t = 0;
+    const scheduled: { at: number; fn: () => void }[] = [];
+    return {
+        now: () => t,
+        setTimeoutFn: (fn: () => void, ms: number): unknown => {
+            scheduled.push({ at: t + ms, fn });
+            return 0;
+        },
+        advance(ms: number) {
+            t += ms;
+            while (true) {
+                let idx = -1;
+                for (let i = 0; i < scheduled.length; i++) {
+                    if (
+                        scheduled[i].at <= t &&
+                        (idx === -1 || scheduled[i].at < scheduled[idx].at)
+                    ) {
+                        idx = i;
+                    }
+                }
+                if (idx === -1) {
+                    return;
+                }
+                const [entry] = scheduled.splice(idx, 1);
+                entry.fn();
+            }
+        },
+    };
+}
+
+/** Fake `EngineStateStore` backed by Maps, recording puts into `log`. */
+function fakeState(log: string[] = []) {
+    const leases = new Map<string, EngineLease>();
+    const envelopes = new Map<string, CompletionEnvelope>();
+    const checkpoints = new Map<string, ProducerCheckpoint>();
+    const parts = new Map<string, EnginePartRecord>();
+    const partPuts: EnginePartRecord[] = [];
+    const state: EngineStateStore = {
+        putLease(l) {
+            leases.set(l.fileId, l);
+            return Promise.resolve();
+        },
+        getLease(fileId) {
+            return Promise.resolve(leases.get(fileId));
+        },
+        putEnvelope(e) {
+            envelopes.set(e.fileId, e);
+            return Promise.resolve();
+        },
+        getEnvelope(fileId) {
+            return Promise.resolve(envelopes.get(fileId));
+        },
+        putCheckpoint(c) {
+            checkpoints.set(c.fileId, c);
+            return Promise.resolve();
+        },
+        getCheckpoint(fileId) {
+            return Promise.resolve(checkpoints.get(fileId));
+        },
+        putPart(p) {
+            log.push(`putPart:${p.partNumber}:${p.uploaded ? 'uploaded' : 'staged'}`);
+            partPuts.push({ ...p });
+            parts.set(`${p.fileId}:${p.partNumber}`, p);
+            return Promise.resolve();
+        },
+        getParts(fileId) {
+            return Promise.resolve(
+                [...parts.values()]
+                    .filter((p) => p.fileId === fileId)
+                    .sort((a, b) => a.partNumber - b.partNumber),
+            );
+        },
+        listLeases() {
+            return Promise.resolve([...leases.values()]);
+        },
+        clearUpload(fileId) {
+            leases.delete(fileId);
+            envelopes.delete(fileId);
+            checkpoints.delete(fileId);
+            for (const key of [...parts.keys()]) {
+                if (key.startsWith(`${fileId}:`)) {
+                    parts.delete(key);
+                }
+            }
+            return Promise.resolve();
+        },
+    };
+    return { state, partPuts, log };
+}
+
+/** `PartStore` wrapper recording read/delete order into `log`. */
+class RecordingPartStore implements PartStore {
+    constructor(
+        private readonly inner: PartStore,
+        private readonly log: string[],
+    ) {}
+
+    stagePart(partNumber: number, chunks: AsyncIterable<Uint8Array>): Promise<{ size: number }> {
+        return this.inner.stagePart(partNumber, chunks);
+    }
+
+    readPart(partNumber: number): Promise<Blob> {
+        this.log.push(`readPart:${partNumber}`);
+        return this.inner.readPart(partNumber);
+    }
+
+    deletePart(partNumber: number): Promise<void> {
+        this.log.push(`deletePart:${partNumber}`);
+        return this.inner.deletePart(partNumber);
+    }
+
+    listParts(): Promise<{ partNumber: number; size: number }[]> {
+        return this.inner.listParts();
+    }
+
+    destroy(): Promise<void> {
+        return this.inner.destroy();
+    }
+}
+
+/**
+ * Base options: wall clock is real but timers never fire, so nothing depends
+ * on cadence unless a test injects the fake clock explicitly.
+ */
+function baseOpts(over: Partial<UploaderOpts>): UploaderOpts {
+    return {
+        urls: [
+            'https://s3.example.com/part1',
+            'https://s3.example.com/part2',
+            'https://s3.example.com/part3',
+        ],
+        maxConcurrent: 2,
+        store: new MemoryPartStore(),
+        state: fakeState().state,
+        fileId: 'up_test',
+        uploadPart: () => Promise.reject(new Error('uploadPart not faked')),
+        refreshUrls: () => Promise.reject(new Error('refreshUrls should not be called')),
+        now: () => Date.now(),
+        isOnline: () => true,
+        retryDelayMs: () => 0,
+        onProgress: () => undefined,
+        onRetry: () => undefined,
+        signal: new AbortController().signal,
+        setTimeoutFn: () => 0,
+        ...over,
+    };
+}
+
+describe('runUploaders', () => {
+    it('uploads all parts, recording uploaded+etag before deleting staged bytes', async () => {
+        const log: string[] = [];
+        const store = new RecordingPartStore(new MemoryPartStore(), log);
+        const { state, partPuts } = fakeState(log);
+        await stage(store, 1, makeData(4));
+        await stage(store, 2, makeData(4));
+        await stage(store, 3, makeData(2));
+
+        const progress: number[] = [];
+        const uploadPart: UploaderOpts['uploadPart'] = (url) =>
+            Promise.resolve({ etag: `etag-${url.slice(-1)}` });
+
+        const etags = await runUploaders(
+            makeQueue([
+                { partNumber: 1, size: 4 },
+                { partNumber: 2, size: 4 },
+                { partNumber: 3, size: 2 },
+            ]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 2,
+                onProgress: (total) => {
+                    progress.push(total);
+                },
+            }),
+        );
+
+        expect(etags).toEqual(
+            new Map([
+                [1, 'etag-1'],
+                [2, 'etag-2'],
+                [3, 'etag-3'],
+            ]),
+        );
+        expect(await store.listParts()).toEqual([]);
+        expect(partPuts).toEqual([
+            {
+                fileId: 'up_test',
+                partNumber: 1,
+                size: 4,
+                staged: true,
+                uploaded: true,
+                etag: 'etag-1',
+            },
+            {
+                fileId: 'up_test',
+                partNumber: 2,
+                size: 4,
+                staged: true,
+                uploaded: true,
+                etag: 'etag-2',
+            },
+            {
+                fileId: 'up_test',
+                partNumber: 3,
+                size: 2,
+                staged: true,
+                uploaded: true,
+                etag: 'etag-3',
+            },
+        ]);
+        // The uploaded+etag record commits before the staged bytes are released [R11].
+        for (const partNumber of [1, 2, 3]) {
+            const put = log.indexOf(`putPart:${partNumber}:uploaded`);
+            const del = log.indexOf(`deletePart:${partNumber}`);
+            expect(put).toBeGreaterThanOrEqual(0);
+            expect(del).toBeGreaterThan(put);
+        }
+        expect(progress[progress.length - 1]).toBe(10);
+    });
+
+    it('re-reads the staged part so retries are byte-identical', async () => {
+        const clock = fakeClock();
+        const log: string[] = [];
+        const store = new RecordingPartStore(new MemoryPartStore(), log);
+        const { state } = fakeState(log);
+        await stage(store, 1, makeData(6));
+
+        const bodies: Uint8Array[] = [];
+        let retries = 0;
+        const uploadPart: UploaderOpts['uploadPart'] = async (_url, body) => {
+            bodies.push(new Uint8Array(await body.arrayBuffer()));
+            if (bodies.length === 1) {
+                throw new Error('network error');
+            }
+            return { etag: 'etag-1' };
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 6 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                retryDelayMs: () => 50,
+                onRetry: () => {
+                    retries += 1;
+                },
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        await flush();
+        expect(retries).toBe(1);
+        clock.advance(50); // retry backoff elapses
+        await flush();
+
+        const etags = await run;
+        expect(etags).toEqual(new Map([[1, 'etag-1']]));
+        expect(log.filter((e) => e === 'readPart:1')).toHaveLength(2);
+        expect(bodies).toHaveLength(2);
+        expect(bodies[0]).toEqual(makeData(6));
+        expect(bodies[1]).toEqual(bodies[0]);
+    });
+
+    it('aborts a stalled attempt on wall-clock delta and retries it', async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let retries = 0;
+        const attempts: { signal: AbortSignal }[] = [];
+        const uploadPart: UploaderOpts['uploadPart'] = (_url, _body, hooks) => {
+            attempts.push({ signal: hooks.signal });
+            if (attempts.length === 1) {
+                // Reports progress once, then hangs until aborted.
+                return new Promise((_resolve, reject) => {
+                    hooks.onProgress(1);
+                    hooks.signal.addEventListener('abort', () =>
+                        reject(new Error('transport aborted')),
+                    );
+                });
+            }
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                stallMs: 5000,
+                retryDelayMs: () => 100,
+                onRetry: () => {
+                    retries += 1;
+                },
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        await flush();
+        expect(attempts).toHaveLength(1);
+
+        // The stall check was scheduled at +1s but only fires after a 6s jump —
+        // it must measure the wall-clock delta, not trust its own cadence.
+        clock.advance(6001);
+        await flush();
+        expect(attempts[0].signal.aborted).toBe(true);
+        expect(retries).toBe(1);
+
+        clock.advance(100); // retry backoff
+        await flush();
+        const etags = await run;
+        expect(attempts).toHaveLength(2);
+        expect(etags).toEqual(new Map([[1, 'etag-1']]));
+    });
+
+    it('gates retries on connectivity, polling isOnline at 1s wall-clock intervals', async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let online = true;
+        let calls = 0;
+        const uploadPart: UploaderOpts['uploadPart'] = () => {
+            calls += 1;
+            if (calls === 1) {
+                online = false;
+                return Promise.reject(new Error('network error'));
+            }
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                retryDelayMs: () => 0,
+                isOnline: () => online,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        await flush();
+        expect(calls).toBe(1);
+        clock.advance(0); // zero-delay retry backoff elapses
+        await flush();
+
+        // Still offline: connectivity polls fire but no retry is attempted.
+        for (let i = 0; i < 3; i++) {
+            clock.advance(1000);
+            await flush();
+        }
+        expect(calls).toBe(1);
+
+        online = true;
+        clock.advance(1000);
+        await flush();
+        expect(calls).toBe(2);
+        expect(await run).toEqual(new Map([[1, 'etag-1']]));
+    });
+
+    it('rejects the run on a non-retryable error and aborts in-flight workers', async () => {
+        const store = new MemoryPartStore();
+        const { state, partPuts } = fakeState();
+        await stage(store, 1, makeData(4));
+        await stage(store, 2, makeData(4));
+
+        let part1Signal: AbortSignal | undefined;
+        const uploadPart: UploaderOpts['uploadPart'] = (url, _body, hooks) => {
+            if (url.endsWith('part1')) {
+                part1Signal = hooks.signal;
+                return new Promise((_resolve, reject) => {
+                    hooks.signal.addEventListener('abort', () =>
+                        reject(new Error('transport aborted')),
+                    );
+                });
+            }
+            return Promise.reject(new Error('HTTP 400 (Bad Request)'));
+        };
+
+        await expect(
+            runUploaders(
+                makeQueue([
+                    { partNumber: 1, size: 4 },
+                    { partNumber: 2, size: 4 },
+                ]),
+                baseOpts({ store, state, uploadPart, maxConcurrent: 2 }),
+            ),
+        ).rejects.toThrow('HTTP 400');
+
+        expect(part1Signal?.aborted).toBe(true);
+        expect(partPuts.filter((p) => p.uploaded)).toEqual([]);
+        // Nothing was deleted: both staged parts survive for resume.
+        expect((await store.listParts()).map((p) => p.partNumber)).toEqual([1, 2]);
+    });
+
+    it('gives up after maxAttemptsPerPart retryable failures', async () => {
+        const clock = fakeClock();
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let calls = 0;
+        let retries = 0;
+        const uploadPart: UploaderOpts['uploadPart'] = () => {
+            calls += 1;
+            return Promise.reject(new Error('network error'));
+        };
+
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                maxAttemptsPerPart: 2,
+                retryDelayMs: () => 10,
+                onRetry: () => {
+                    retries += 1;
+                },
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+            }),
+        );
+        run.catch(() => undefined); // assert below; avoid unhandled rejection between flushes
+        await flush();
+        clock.advance(10);
+        await flush();
+
+        await expect(run).rejects.toThrow('network error');
+        expect(calls).toBe(2);
+        expect(retries).toBe(1);
+    });
+
+    it('refreshes expired URLs once per part and retries with the fresh URL', async () => {
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let refreshes = 0;
+        const seen: string[] = [];
+        const uploadPart: UploaderOpts['uploadPart'] = (url) => {
+            seen.push(url);
+            if (seen.length === 1) {
+                return Promise.reject(new Error('HTTP 403 (Forbidden)'));
+            }
+            return Promise.resolve({ etag: 'etag-1' });
+        };
+
+        const etags = await runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({
+                store,
+                state,
+                uploadPart,
+                maxConcurrent: 1,
+                urls: ['https://s3.example.com/stale1'],
+                refreshUrls: () => {
+                    refreshes += 1;
+                    return Promise.resolve(['https://s3.example.com/fresh1']);
+                },
+            }),
+        );
+
+        expect(refreshes).toBe(1);
+        expect(seen).toEqual(['https://s3.example.com/stale1', 'https://s3.example.com/fresh1']);
+        expect(etags).toEqual(new Map([[1, 'etag-1']]));
+    });
+
+    it('rejects on external cancel and aborts the in-flight attempt', async () => {
+        const store = new MemoryPartStore();
+        const { state } = fakeState();
+        await stage(store, 1, makeData(4));
+
+        let attemptSignal: AbortSignal | undefined;
+        const uploadPart: UploaderOpts['uploadPart'] = (_url, _body, hooks) => {
+            attemptSignal = hooks.signal;
+            return new Promise((_resolve, reject) => {
+                hooks.signal.addEventListener('abort', () =>
+                    reject(new Error('transport aborted')),
+                );
+            });
+        };
+
+        const cancel = new AbortController();
+        const run = runUploaders(
+            makeQueue([{ partNumber: 1, size: 4 }]),
+            baseOpts({ store, state, uploadPart, maxConcurrent: 1, signal: cancel.signal }),
+        );
+        run.catch(() => undefined);
+        await flush();
+        expect(attemptSignal?.aborted).toBe(false);
+
+        cancel.abort();
+        await expect(run).rejects.toThrow('Upload cancelled');
+        expect(attemptSignal?.aborted).toBe(true);
+        expect((await store.listParts()).map((p) => p.partNumber)).toEqual([1]);
+    });
+});

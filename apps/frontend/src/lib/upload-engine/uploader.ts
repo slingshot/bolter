@@ -1,0 +1,274 @@
+/**
+ * Pull-based concurrent uploader for the worker upload engine.
+ *
+ * N workers pull staged parts from a queue and PUT them with the injected
+ * `uploadPart` transport. Every attempt re-reads the committed part from the
+ * `PartStore`, so retries are byte-identical by construction. Stall detection
+ * is wall-clock based [R14]: a coarse poll measures `now()` since the last
+ * progress event — a throttled or suspended timer that fires late still sees
+ * the true delta, so cadence is never trusted. Retryable failures back off via
+ * the injected `retryDelayMs`, and while `isOnline()` reports offline the
+ * retry parks on a 1s wall-clock connectivity poll instead of burning
+ * attempts on a dead link. A 403-style pre-signed-URL expiry triggers one
+ * `refreshUrls()` per part. On success the uploaded+ETag record is persisted
+ * **before** the staged bytes are deleted [R11], so a crash between the two
+ * re-deletes rather than re-uploads.
+ *
+ * Worker-safe: no DOM globals — `setTimeout` and `AbortController` exist in
+ * dedicated workers (and the timer is injectable for deterministic tests).
+ */
+
+import { isRetryableError } from '@/lib/upload-shared';
+import type { PartStore } from './part-store';
+import type { EngineStateStore } from './state';
+
+/** Result of one part PUT. (Task 9's `EngineDeps['uploadPart']` shape.) */
+export interface UploadPartResult {
+    etag: string;
+}
+
+export interface UploaderOpts {
+    urls: string[]; // index 0 = part 1
+    maxConcurrent: number;
+    store: PartStore;
+    state: EngineStateStore;
+    fileId: string;
+    uploadPart(
+        url: string,
+        body: Blob,
+        hooks: { onProgress(loaded: number): void; signal: AbortSignal },
+    ): Promise<UploadPartResult>;
+    refreshUrls(): Promise<string[]>;
+    now(): number; // wall clock (Date.now)
+    isOnline(): boolean; // fed by connectivity relay
+    stallMs?: number; // default 60_000 wall-clock without progress
+    maxAttemptsPerPart?: number; // default 6
+    retryDelayMs(attempt: number): number; // from upload-shared (Task 1)
+    onProgress(totalBytesSent: number): void;
+    onRetry(): void;
+    signal: AbortSignal;
+    /** Injectable timer for deterministic tests; defaults to `setTimeout`. */
+    setTimeoutFn?: (fn: () => void, ms: number) => unknown;
+}
+
+const DEFAULT_STALL_MS = 60_000;
+const DEFAULT_MAX_ATTEMPTS = 6;
+/** Coarse stall-poll interval — checks compute wall-clock deltas, so a poll
+ * that fires late (throttling, suspension) still measures correctly. */
+const STALL_POLL_MS = 1_000;
+const ONLINE_POLL_MS = 1_000;
+
+/** Pre-signed URL expiry surfaces as a 403 from the bucket. */
+function isUrlExpiryError(error: Error): boolean {
+    const msg = (error.message || '').toLowerCase();
+    return msg.includes('http 403') || msg.includes('forbidden');
+}
+
+/**
+ * Upload every part the queue yields; resolves to `partNumber → ETag` once the
+ * queue returns null and all in-flight parts have finished. Pull-based: the
+ * stager feeds the queue as parts commit. Any worker's terminal failure (or
+ * the caller's abort signal) aborts every other in-flight attempt and rejects
+ * the whole run.
+ */
+export async function runUploaders(
+    partsToUpload: () => Promise<{ partNumber: number; size: number } | null>,
+    opts: UploaderOpts,
+): Promise<Map<number, string>> {
+    const stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
+    const maxAttempts = Math.max(1, opts.maxAttemptsPerPart ?? DEFAULT_MAX_ATTEMPTS);
+    const setTimeoutFn = opts.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+
+    let urls = opts.urls;
+    const etags = new Map<number, string>();
+
+    // Run-wide abort: external cancel or another worker's terminal failure.
+    // `fatal` keeps the originating error so late-aborted workers rethrow the
+    // real cause instead of their own transport-abort noise.
+    const run = new AbortController();
+    let fatal: Error | undefined;
+    const abortError = () => fatal ?? new Error('Upload cancelled');
+    const abortRun = (reason?: Error) => {
+        if (run.signal.aborted) {
+            return;
+        }
+        fatal = fatal ?? reason;
+        run.abort();
+    };
+    const throwIfAborted = () => {
+        if (run.signal.aborted) {
+            throw abortError();
+        }
+    };
+
+    if (opts.signal.aborted) {
+        throw abortError();
+    }
+    const onExternalAbort = () => abortRun();
+    opts.signal.addEventListener('abort', onExternalAbort, { once: true });
+
+    /** Rejects when the run aborts — raced against queue pulls so a worker
+     * parked on an empty queue still unwinds on cancel. */
+    const aborted = new Promise<never>((_resolve, reject) => {
+        run.signal.addEventListener('abort', () => reject(abortError()), { once: true });
+    });
+    aborted.catch(() => undefined); // handled by racers; never unhandled
+
+    const sleep = (ms: number) =>
+        new Promise<void>((resolve, reject) => {
+            if (run.signal.aborted) {
+                reject(abortError());
+                return;
+            }
+            const onAbort = () => reject(abortError());
+            run.signal.addEventListener('abort', onAbort, { once: true });
+            setTimeoutFn(() => {
+                run.signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, ms);
+        });
+
+    const waitForOnline = async () => {
+        while (!opts.isOnline()) {
+            throwIfAborted();
+            await sleep(ONLINE_POLL_MS);
+        }
+    };
+
+    // Progress = completed part bytes + the current attempt's transferred
+    // bytes. A failed attempt's contribution is dropped (its bytes will be
+    // re-sent), so totals stay truthful across retries.
+    let completedBytes = 0;
+    const inFlight = new Map<number, number>();
+    const emitProgress = () => {
+        let total = completedBytes;
+        for (const loaded of inFlight.values()) {
+            total += loaded;
+        }
+        opts.onProgress(total);
+    };
+
+    /** One attempt: re-read the committed part, PUT it, stall-watch it. */
+    const attemptPart = async (partNumber: number): Promise<UploadPartResult> => {
+        const url = urls[partNumber - 1];
+        if (!url) {
+            throw new Error(`no pre-signed URL for part ${partNumber}`);
+        }
+        // Byte-identity across retries: every attempt re-reads the store.
+        const body = await opts.store.readPart(partNumber);
+
+        const attempt = new AbortController();
+        let stallError: Error | undefined;
+        const onRunAbort = () => attempt.abort();
+        run.signal.addEventListener('abort', onRunAbort, { once: true });
+
+        let lastProgressAt = opts.now();
+        let settled = false;
+        const checkStall = () => {
+            if (settled || attempt.signal.aborted) {
+                return;
+            }
+            if (opts.now() - lastProgressAt > stallMs) {
+                stallError = new Error(
+                    `Upload stalled: no progress for ${stallMs}ms on part ${partNumber}`,
+                );
+                attempt.abort();
+                return;
+            }
+            setTimeoutFn(checkStall, STALL_POLL_MS);
+        };
+        setTimeoutFn(checkStall, STALL_POLL_MS);
+
+        try {
+            return await opts.uploadPart(url, body, {
+                onProgress: (loaded) => {
+                    lastProgressAt = opts.now();
+                    inFlight.set(partNumber, loaded);
+                    emitProgress();
+                },
+                signal: attempt.signal,
+            });
+        } catch (err) {
+            if (stallError) {
+                // The transport rejects with its own abort error; the stall is
+                // the real (retryable) cause.
+                throw stallError;
+            }
+            throw err;
+        } finally {
+            settled = true;
+            run.signal.removeEventListener('abort', onRunAbort);
+        }
+    };
+
+    const uploadOnePart = async (partNumber: number, size: number): Promise<void> => {
+        let urlRefreshed = false;
+        for (let attempt = 0; ; attempt++) {
+            throwIfAborted();
+            try {
+                const { etag } = await attemptPart(partNumber);
+                inFlight.delete(partNumber);
+                completedBytes += size;
+                emitProgress();
+                // Durable ordering [R11]: commit the uploaded+ETag record
+                // first — a crash between the two re-deletes, never re-uploads.
+                await opts.state.putPart({
+                    fileId: opts.fileId,
+                    partNumber,
+                    size,
+                    staged: true,
+                    uploaded: true,
+                    etag,
+                });
+                await opts.store.deletePart(partNumber);
+                etags.set(partNumber, etag);
+                return;
+            } catch (err) {
+                inFlight.delete(partNumber);
+                emitProgress();
+                // A run-level abort wins over whatever this attempt threw.
+                throwIfAborted();
+                const error = err instanceof Error ? err : new Error(String(err));
+                if (isUrlExpiryError(error) && !urlRefreshed) {
+                    // Pre-signed URLs expired — refresh once per part, retry
+                    // immediately (no backoff: this is not a transport fault).
+                    urlRefreshed = true;
+                    urls = await opts.refreshUrls();
+                    opts.onRetry();
+                    continue;
+                }
+                if (!isRetryableError(error) || attempt + 1 >= maxAttempts) {
+                    throw error;
+                }
+                opts.onRetry();
+                await sleep(opts.retryDelayMs(attempt));
+                await waitForOnline();
+            }
+        }
+    };
+
+    const workerLoop = async (): Promise<void> => {
+        while (true) {
+            throwIfAborted();
+            const next = await Promise.race([partsToUpload(), aborted]);
+            if (next === null) {
+                return;
+            }
+            await uploadOnePart(next.partNumber, next.size);
+        }
+    };
+
+    try {
+        const workers = Array.from({ length: Math.max(1, opts.maxConcurrent) }, () =>
+            workerLoop().catch((err: unknown) => {
+                const error = err instanceof Error ? err : new Error(String(err));
+                abortRun(error);
+                throw error;
+            }),
+        );
+        await Promise.all(workers);
+        return etags;
+    } finally {
+        opts.signal.removeEventListener('abort', onExternalAbort);
+    }
+}
