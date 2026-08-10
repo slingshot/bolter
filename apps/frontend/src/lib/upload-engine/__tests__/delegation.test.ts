@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chunkedFile, FakeXhr, multipartUploadInfo } from '@/lib/__tests__/upload-xhr-fake';
 import type { PersistedUpload } from '@/lib/upload-state';
-import { currentUploadAttempt, setWorkerFactory } from '../client';
+import { currentUploadAttempt, resetEligibilityCacheForTests, setWorkerFactory } from '../client';
 import type { ClientToWorker, EngineProbeResult, WorkerToClient } from '../protocol';
 import { openEngineState } from '../state';
 
@@ -134,6 +134,9 @@ describe('engine delegation in uploadFiles', () => {
         FakeXhr.reset();
         vi.stubGlobal('XMLHttpRequest', FakeXhr);
         FakeEngineWorker.reset();
+        // The capability verdict is cached for the session — each test needs
+        // its own probe, not the previous test's.
+        resetEligibilityCacheForTests();
         // happy-dom has no Worker global; the probe's capability check only
         // needs it to exist — actual spawning goes through the factory.
         vi.stubGlobal('Worker', FakeEngineWorker);
@@ -309,6 +312,60 @@ describe('engine delegation in uploadFiles', () => {
             reason: 'backend-declined-multipart',
         });
         // Home stamps the success event from this — it must credit legacy.
+        expect(currentUploadAttempt()?.engine).toBe('legacy');
+    });
+
+    it('bails to legacy before the speed test when the zipped size is under the threshold', async () => {
+        // The delegation gate upstream sees the *declared input* size (160MB,
+        // pre-zip). DEFLATE takes this batch well under the multipart
+        // threshold, so the engine — which only runs multipart — must bail as
+        // soon as the real size is known: before the 10s speed test and
+        // before allocating an upload the backend would decline anyway.
+        const { trackUploadAttempt } = await import('@/lib/plausible');
+        vi.mocked(trackUploadAttempt).mockClear();
+        uploadUrlResponse = {
+            useSignedUrl: true,
+            multipart: false,
+            id: 'file-id',
+            owner: 'owner-token',
+            url: 'https://s3.example.com/single',
+        };
+
+        const zipProgress: number[] = [];
+        const result = await uploadFiles(
+            {
+                files: [makeFile(1024, 80 * MB, 'a.bin'), makeFile(1024, 80 * MB, 'b.bin')],
+                encrypted: false,
+                onZipProgress: (p) => zipProgress.push(p),
+            },
+            new Keychain(),
+            new Canceller(),
+        );
+
+        expect(result.id).toBe('file-id');
+        // Neither preflight cost was paid by the abandoned engine attempt…
+        expect(fetchCalls.filter((u) => u.includes('/upload/speedtest'))).toEqual([]);
+        // …and the only allocation is the legacy pipeline's own, sized by the
+        // zipped bytes, so nothing had to be released.
+        expect(uploadUrlBodies.length).toBe(1);
+        expect(Number(uploadUrlBodies[0].fileSize)).toBeLessThanOrEqual(100 * MB);
+        expect(fetchCalls.some((u) => u.includes('/delete/'))).toBe(false);
+
+        // The legacy pipeline reused the zip the engine attempt built rather
+        // than running a second DEFLATE pass — a rebuild would rewind the zip
+        // progress the user just watched reach 100%.
+        expect(zipProgress[zipProgress.length - 1]).toBe(100);
+        expect(zipProgress).toEqual([...zipProgress].sort((a, b) => a - b));
+
+        // Legacy did the upload, and telemetry says so.
+        expect(FakeXhr.sends.length).toBe(1);
+        expect(fetchCalls.some((u) => u.includes('/upload/complete'))).toBe(true);
+        const attempts = vi.mocked(trackUploadAttempt).mock.calls.map(([props]) => props);
+        expect(attempts[0]).toMatchObject({ engine: 'worker' });
+        expect(attempts[attempts.length - 1]).toMatchObject({
+            engine: 'legacy',
+            reason: 'below-threshold',
+        });
         expect(currentUploadAttempt()?.engine).toBe('legacy');
     });
 

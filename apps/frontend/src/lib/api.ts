@@ -972,19 +972,22 @@ async function uploadFilesPipeline(
     // the legacy multipart gate but is evaluated on the declared input size —
     // this branch deliberately sits ahead of zip construction and
     // encryption-stream creation [R8], so the exact zipped size is not known
-    // yet (the engine path computes it before allocation, exactly as the
-    // legacy path does).
+    // yet. It is a *pre-filter*: the engine re-applies the same gate on the
+    // real post-zip size before spending anything, and declines back to here.
     const declaredInputSize = files.reduce((sum, f) => sum + f.size, 0);
     const engineGateSize = encrypted
         ? calculateEncryptedSize(declaredInputSize)
         : declaredInputSize;
+    let engineHandoff: EngineDeclineHandoff | undefined;
     if (engineGateSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
         const eligibility = await probeEligibility();
         if (eligibility.eligible) {
-            const engineResult = await uploadFilesViaEngine(options, keychain, canceller);
+            const handoff: EngineDeclineHandoff = {};
+            const engineResult = await uploadFilesViaEngine(options, keychain, canceller, handoff);
             if (engineResult) {
                 return engineResult;
             }
+            engineHandoff = handoff;
         } else {
             console.log(
                 `[Upload] Engine ineligible (${eligibility.reason ?? 'unknown'}) — using legacy pipeline`,
@@ -1032,6 +1035,14 @@ async function uploadFilesPipeline(
             streamingZipStream = streamingZip.stream;
             zipFilename = streamingZip.filename;
             estimatedZipSize = streamingZip.estimatedSize;
+        } else if (engineHandoff?.zip) {
+            // A declined engine attempt already built this exact zip — same
+            // files, same deduplicated names, same DEFLATE settings. Reusing
+            // it skips a second compression pass over hundreds of megabytes,
+            // and keeps the zip progress the user just watched reach 100%
+            // from rewinding to 0.
+            uploadBlob = engineHandoff.zip.blob;
+            zipFilename = engineHandoff.zip.filename;
         } else {
             // Small files: use buffered zip for compression benefits and exact sizing
             const zipResult = await createZipFromUploadFiles(files, onZipProgress);
@@ -1568,18 +1579,32 @@ async function uploadFilesPipeline(
 }
 
 /**
+ * Work a declined engine attempt hands back to the legacy pipeline so the
+ * fallback does not redo it. Only the buffered zip is worth carrying: it is
+ * the one expensive artefact the engine builds before it can know its own
+ * size, and it is byte-identical to the one the legacy path would build.
+ */
+interface EngineDeclineHandoff {
+    zip?: { blob: Blob; filename: string };
+}
+
+/**
  * Upload through the worker+OPFS engine (`lib/upload-engine/`). Preflight and
  * allocation mirror the legacy path exactly; the resulting `EngineJob` +
  * `CompletionEnvelope` then cross into a dedicated worker that stages
  * record-aligned parts in OPFS, uploads them, and finishes `/upload/complete`
- * itself. Returns undefined when the backend declines multipart for this
- * allocation — the caller falls through to the legacy pipeline (the unused
- * allocation is released first).
+ * itself.
+ *
+ * Returns undefined to decline, and the caller falls through to the legacy
+ * pipeline: either the real (post-zip) size is not multipart-sized and the
+ * engine — which only runs multipart — never starts, or the backend declined
+ * multipart for an allocation that was made anyway (which is then released).
  */
 async function uploadFilesViaEngine(
     options: UploadOptions,
     keychain: Keychain,
     canceller: Canceller,
+    handoff: EngineDeclineHandoff,
 ): Promise<UploadResult | undefined> {
     const {
         files,
@@ -1621,6 +1646,7 @@ async function uploadFilesViaEngine(
             source = { kind: 'blob', blob: zipResult.blob };
             plainSize = zipResult.blob.size;
             zipFilename = zipResult.filename;
+            handoff.zip = { blob: zipResult.blob, filename: zipResult.filename };
             onZipProgress?.(100);
         }
     } else {
@@ -1628,6 +1654,19 @@ async function uploadFilesViaEngine(
         plainSize = files[0].size;
     }
     const totalSize = encrypted ? calculateEncryptedSize(plainSize) : plainSize;
+
+    // The delegation gate upstream could only see the declared input size.
+    // Now that the real one is known, apply the multipart gate the legacy
+    // path applies — DEFLATE routinely takes a multi-file batch under it, and
+    // the engine only runs multipart. Declining here, rather than after the
+    // preflight, is what keeps a compressible batch from paying a ~10s speed
+    // test and an allocation for a multipart the backend would decline on
+    // exactly this threshold (`useMultipart` in routes/upload.ts).
+    if (totalSize <= UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+        console.log('[Upload] Zipped size is not multipart-sized — using legacy pipeline');
+        recordEngineFallback('below-threshold');
+        return undefined;
+    }
 
     // Preflight speed test — identical to the legacy path.
     onSpeedTest?.('started');
