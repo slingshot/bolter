@@ -1,7 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { config } from '../config';
 import { providerLogger as logger } from '../logger';
-import { providerRegistry } from '../storage/provider-registry';
+import { ProviderInUseError, providerRegistry } from '../storage/provider-registry';
 
 const adminAuth = (headers: Record<string, string | undefined>) => {
     if (!config.adminApiKey) {
@@ -181,6 +181,8 @@ export const providerRoutes = new Elysia({ prefix: '/providers' })
                 return { error: auth.error };
             }
 
+            const force = query.force === 'true';
+
             try {
                 // Check if provider is the default
                 const cfg = providerRegistry.getProviderConfig(params.id);
@@ -193,18 +195,20 @@ export const providerRoutes = new Elysia({ prefix: '/providers' })
                     return { error: 'Cannot delete the default provider' };
                 }
 
-                const fileCount = await providerRegistry.getFileCount(params.id);
-                if (fileCount > 0 && query.force !== 'true') {
-                    set.status = 409;
-                    return {
-                        error: `Cannot delete provider "${params.id}" — ${fileCount} active file(s) still reference it. Use ?force=true to override.`,
-                    };
-                }
-
-                await providerRegistry.removeProvider(params.id);
-                logger.info({ providerId: params.id }, 'Provider deleted via API');
+                // Single source of truth for the in-use check: `force` is
+                // threaded down so the override documented below actually
+                // reaches the guard instead of being re-applied here and then
+                // thrown independently inside removeProvider.
+                await providerRegistry.removeProvider(params.id, { force });
+                logger.info({ providerId: params.id, force }, 'Provider deleted via API');
                 return { success: true };
             } catch (e) {
+                if (e instanceof ProviderInUseError) {
+                    set.status = 409;
+                    return {
+                        error: `Cannot delete provider "${params.id}" — ${e.fileCount} active file(s) still reference it. Use ?force=true to override.`,
+                    };
+                }
                 const message = e instanceof Error ? e.message : 'Failed to delete provider';
                 set.status = 400;
                 return { error: message };

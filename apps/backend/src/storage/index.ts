@@ -2,6 +2,7 @@ import type { CompletedPart } from '@aws-sdk/client-s3';
 import { captureError } from '../lib/sentry';
 import { ProviderNotFoundError, providerRegistry } from './provider-registry';
 import { redis } from './redis';
+import type { S3Storage } from './s3';
 
 export interface FileMetadata {
     id: string;
@@ -29,7 +30,7 @@ export interface FileMetadata {
  * was genuinely deleted; any other load failure propagates so callers never
  * silently sign against the wrong bucket.
  */
-async function resolveProviderForFile(id: string) {
+export async function resolveProviderForFile(id: string): Promise<S3Storage> {
     const providerId = await redis.hGet(id, 'providerId');
     if (providerId) {
         try {
@@ -47,16 +48,32 @@ async function resolveProviderForFile(id: string) {
 }
 
 /**
- * Resolve provider by an explicit ID (for multipart ops where we already know it).
- * Falls back to active provider if not provided, or default if that fails.
+ * Resolve a provider from an explicitly pinned provider ID — used by the
+ * multipart operations (create / sign part / complete / abort) that are
+ * deliberately pinned to the bucket the upload was started against.
+ *
+ * A pinned `providerId` is authoritative. On a registry cache miss we load the
+ * record from Redis (one shot) rather than substituting a *different* bucket:
+ * retargeting the active provider would send CompleteMultipartUpload against a
+ * bucket that never saw the upload, stranding a fully uploaded file. Cache
+ * misses are reachable in multi-replica deployments inside the provider cache
+ * TTL window, and persistently when a provider fails to load at startup.
+ *
+ * Only an absent `providerId` falls back to the active provider. A record that
+ * genuinely no longer exists falls back to the default provider, mirroring
+ * `resolveProviderForFile`; every other load failure propagates.
  */
-function resolveProviderById(providerId?: string) {
+export async function resolveProviderById(providerId?: string): Promise<S3Storage> {
     if (providerId) {
         try {
-            return providerRegistry.getProvider(providerId);
-        } catch {
-            console.warn(`Provider "${providerId}" not found, falling back to active`);
+            return await providerRegistry.getOrLoadProvider(providerId);
+        } catch (e) {
+            if (!(e instanceof ProviderNotFoundError)) {
+                throw e;
+            }
+            console.warn(`Provider "${providerId}" not found, falling back to default`);
         }
+        return providerRegistry.getDefaultProvider();
     }
     return providerRegistry.getActiveProvider();
 }
@@ -74,7 +91,7 @@ export const storage = {
         providerId?: string,
     ): Promise<string | null> {
         try {
-            const provider = resolveProviderById(providerId);
+            const provider = await resolveProviderById(providerId);
             return await provider.getSignedUploadUrl(id, expiresIn, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.sign-upload', extra: { id } });
@@ -89,7 +106,7 @@ export const storage = {
         providerId?: string,
     ): Promise<string | null> {
         try {
-            const provider = resolveProviderById(providerId);
+            const provider = await resolveProviderById(providerId);
             return await provider.createMultipartUpload(id, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.create-multipart', extra: { id } });
@@ -100,29 +117,29 @@ export const storage = {
 
     // --- Multipart operations (target specific provider if known) ---
 
-    getSignedMultipartUploadUrl(
+    async getSignedMultipartUploadUrl(
         id: string,
         uploadId: string,
         partNumber: number,
         expiresIn?: number,
         providerId?: string,
     ): Promise<string> {
-        const provider = resolveProviderById(providerId);
+        const provider = await resolveProviderById(providerId);
         return provider.getSignedMultipartUploadUrl(id, uploadId, partNumber, expiresIn);
     },
 
-    completeMultipartUpload(
+    async completeMultipartUpload(
         id: string,
         uploadId: string,
         parts: CompletedPart[],
         providerId?: string,
     ): Promise<void> {
-        const provider = resolveProviderById(providerId);
+        const provider = await resolveProviderById(providerId);
         return provider.completeMultipartUpload(id, uploadId, parts);
     },
 
-    abortMultipartUpload(id: string, uploadId: string, providerId?: string): Promise<void> {
-        const provider = resolveProviderById(providerId);
+    async abortMultipartUpload(id: string, uploadId: string, providerId?: string): Promise<void> {
+        const provider = await resolveProviderById(providerId);
         return provider.abortMultipartUpload(id, uploadId);
     },
 
@@ -159,18 +176,19 @@ export const storage = {
         const provider = await resolveProviderForFile(id);
 
         await Promise.all([
+            // Deliberate: an S3 delete failure must not strand undeletable
+            // Redis metadata, so only the object leg is swallowed
             provider.del(id).catch((e) => {
                 captureError(e, { operation: 's3.delete', extra: { id }, level: 'warning' });
             }),
-            redis.del(id),
+            // The provider bookkeeping is gated on DEL's reply: only the caller
+            // whose DEL actually removed the key decrements. Two concurrent
+            // deletes of the same file (an owner /delete racing the auto-delete
+            // from /download/complete) would otherwise each decrement, dropping
+            // the counter by two. The bookkeeping itself stays non-fatal — the
+            // metadata is gone either way.
+            providerId ? providerRegistry.deleteFileMetadata(providerId, id) : redis.del(id),
         ]);
-
-        // Decrement file counter for this provider
-        if (providerId) {
-            await providerRegistry.decrementFileCount(providerId).catch(() => {
-                // Non-critical — counter may drift slightly
-            });
-        }
     },
 
     // --- Provider info ---
@@ -183,6 +201,27 @@ export const storage = {
 
     async setField(id: string, field: string, value: string): Promise<void> {
         await redis.hSet(id, field, value);
+
+        // Pinning a file to a provider is also what registers it in that
+        // provider's live-file set — the set `providerRegistry.getFileCount`
+        // reads to decide whether a provider still holds files. Every upload
+        // records `providerId` through this method exactly once (`/upload/url`),
+        // so hooking the write here keeps the set populated without depending
+        // on any caller threading an extra argument.
+        //
+        // Bookkeeping must never fail an upload: the metadata hash is already
+        // written at this point, so a failure is reported and swallowed. The
+        // guard then under-counts, which leaves the provider deletable rather
+        // than wedging it — the direction this whole change is fixing.
+        if (field === 'providerId' && value) {
+            await providerRegistry.trackFile(value, id).catch((e) => {
+                captureError(e, {
+                    operation: 'provider.track-file',
+                    extra: { id, providerId: value },
+                    level: 'warning',
+                });
+            });
+        }
     },
 
     getField(id: string, field: string): Promise<string | null> {

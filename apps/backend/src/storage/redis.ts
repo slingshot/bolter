@@ -84,6 +84,20 @@ export class RedisStorage {
         await client.del(key);
     }
 
+    /**
+     * Delete `key`, reporting whether THIS call is the one that removed it.
+     *
+     * `DEL` is atomic and returns the number of keys it removed, so exactly one
+     * of N concurrent callers sees a non-zero reply. Gating follow-up
+     * bookkeeping (the provider file-count decrement) on that reply is what
+     * stops two racing deletes of the same file from each decrementing.
+     * `redis.del` discards the reply, which is why this exists.
+     */
+    async delIfPresent(key: string): Promise<boolean> {
+        const client = await this.getClient();
+        return (await client.del(key)) > 0;
+    }
+
     async exists(key: string): Promise<boolean> {
         const client = await this.getClient();
         const result = await client.exists(key);

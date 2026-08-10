@@ -21,6 +21,7 @@ const mockRedis = {
     set: mock(() => Promise.resolve()),
     incrBy: mock(() => Promise.resolve(0)),
     decrBy: mock(() => Promise.resolve(0)),
+    delIfPresent: mock(() => Promise.resolve(true)),
     rotateNonce: mock(() => Promise.resolve(true)),
 };
 
@@ -59,9 +60,19 @@ mock.module('../lib/sentry', () => ({
     }),
 }));
 
+// The real registry class, backed by the mocked redis/s3 modules above, so the
+// provider bookkeeping half of storage.del is exercised as real code rather
+// than re-implemented here.
+import { ProviderNotFoundError, ProviderRegistry } from '../storage/provider-registry';
+
+const registry = new ProviderRegistry();
+
 // Build a real-logic storage object that uses our mocked redis/s3 under the hood.
 // This mirrors the actual storage/index.ts logic but uses our mock references directly,
 // avoiding global mock.module conflicts when multiple test files run together.
+// (The production wiring of storage/index.ts itself — including the provider
+// file tracking in setField — is covered against the real module in
+// provider-storage.test.ts.)
 const storage = {
     redis: mockRedis,
 
@@ -119,11 +130,12 @@ const storage = {
     },
 
     async del(id: string): Promise<void> {
+        const providerId = await mockRedis.hGet(id, 'providerId');
         await Promise.all([
             mockS3.del(id).catch((e: unknown) => {
                 mockCaptureError(e, { operation: 's3.delete', extra: { id }, level: 'warning' });
             }),
-            mockRedis.del(id),
+            providerId ? registry.deleteFileMetadata(providerId, id) : mockRedis.del(id),
         ]);
     },
 
@@ -176,24 +188,28 @@ const storage = {
     },
 };
 
-// Also register this as the ../storage mock so other test files' mocks don't override us
-mock.module('../storage', () => ({
-    storage,
-}));
-
-mock.module('../storage/index', () => ({
-    storage,
-}));
-
-// Real registry class, backed by the mocked redis/s3 modules above
-import { ProviderNotFoundError, ProviderRegistry } from '../storage/provider-registry';
+// NOTE: `../storage` / `../storage/index` are deliberately NOT mock.module'd
+// here. Registering this local mirror under those paths would leak into every
+// later test file and make the real storage module unimportable — which is
+// exactly what stopped the provider file-tracking wiring from being testable.
+// Every other test file that needs a storage mock registers its own.
 
 describe('storage.del', () => {
     beforeEach(() => {
         mockS3.del.mockReset();
         mockRedis.del.mockReset();
+        mockRedis.hGet.mockReset();
+        mockRedis.sRem.mockReset();
+        mockRedis.decrBy.mockReset();
+        mockRedis.delIfPresent.mockReset();
+        mockRedis.set.mockReset();
         mockS3.del.mockResolvedValue(undefined);
         mockRedis.del.mockResolvedValue(undefined);
+        mockRedis.hGet.mockResolvedValue(null);
+        mockRedis.sRem.mockResolvedValue(undefined);
+        mockRedis.decrBy.mockResolvedValue(0);
+        mockRedis.set.mockResolvedValue(undefined);
+        mockRedis.delIfPresent.mockResolvedValue(true);
     });
 
     it('should call both S3 and Redis delete', async () => {
@@ -217,6 +233,66 @@ describe('storage.del', () => {
         mockRedis.del.mockRejectedValue(new Error('Redis unavailable'));
 
         await expect(storage.del('test-id')).rejects.toThrow('Redis unavailable');
+    });
+
+    it('should gate the counter decrement on this call actually removing the key', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+
+        await storage.del('test-id');
+
+        // Never a blind redis.del whose reply is discarded
+        expect(mockRedis.del).not.toHaveBeenCalled();
+        expect(mockRedis.delIfPresent).toHaveBeenCalledWith('test-id');
+        expect(mockRedis.decrBy).toHaveBeenCalledWith('provider:p1:filecount', 1);
+        expect(mockRedis.sRem).toHaveBeenCalledWith('provider:p1:files', 'test-id');
+    });
+
+    it('should not decrement when another caller already removed the key', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+        mockRedis.delIfPresent.mockResolvedValue(false);
+
+        await storage.del('test-id');
+
+        expect(mockRedis.decrBy).not.toHaveBeenCalled();
+        expect(mockRedis.sRem).not.toHaveBeenCalled();
+    });
+
+    it('should not decrement twice when two deletes race for the same file', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+
+        // Redis DEL semantics: only the first caller removes the key
+        let alreadyDeleted = false;
+        mockRedis.delIfPresent.mockImplementation(() => {
+            if (alreadyDeleted) {
+                return Promise.resolve(false);
+            }
+            alreadyDeleted = true;
+            return Promise.resolve(true);
+        });
+
+        await Promise.all([storage.del('test-id'), storage.del('test-id')]);
+
+        expect(mockRedis.decrBy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not fail a delete that succeeded when the counter update errors', async () => {
+        // The metadata hash is already gone at this point — reporting a failed
+        // delete here would be a lie. The counter is explicitly best-effort.
+        mockRedis.hGet.mockResolvedValue('p1');
+        mockRedis.decrBy.mockRejectedValue(new Error('Redis unavailable'));
+
+        await storage.del('test-id');
+
+        expect(mockRedis.delIfPresent).toHaveBeenCalledWith('test-id');
+    });
+
+    it('should not fail a delete when the live-file set bookkeeping errors', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+        mockRedis.sRem.mockRejectedValue(new Error('Redis unavailable'));
+
+        await storage.del('test-id');
+
+        expect(mockRedis.delIfPresent).toHaveBeenCalledWith('test-id');
     });
 });
 
