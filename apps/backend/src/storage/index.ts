@@ -1,7 +1,8 @@
 import type { CompletedPart } from '@aws-sdk/client-s3';
 import { captureError } from '../lib/sentry';
-import { ProviderNotFoundError, providerRegistry } from './provider-registry';
+import { providerRegistry } from './provider-registry';
 import { redis } from './redis';
+import { resolveProviderById, resolveProviderForFile } from './resolve-provider';
 
 export interface FileMetadata {
     id: string;
@@ -21,46 +22,6 @@ export interface FileMetadata {
     providerId?: string;
 }
 
-/**
- * Resolve the S3Storage instance for an existing file.
- * Reads the file's `providerId` from Redis and looks it up in the registry,
- * loading it from Redis on a cache miss. Falls back to the default provider
- * only for pre-migration files (no providerId) or when the provider record
- * was genuinely deleted; any other load failure propagates so callers never
- * silently sign against the wrong bucket.
- */
-async function resolveProviderForFile(id: string) {
-    const providerId = await redis.hGet(id, 'providerId');
-    if (providerId) {
-        try {
-            return await providerRegistry.getOrLoadProvider(providerId);
-        } catch (e) {
-            if (!(e instanceof ProviderNotFoundError)) {
-                throw e;
-            }
-            console.warn(
-                `Provider "${providerId}" not found for file ${id}, falling back to default`,
-            );
-        }
-    }
-    return providerRegistry.getDefaultProvider();
-}
-
-/**
- * Resolve provider by an explicit ID (for multipart ops where we already know it).
- * Falls back to active provider if not provided, or default if that fails.
- */
-function resolveProviderById(providerId?: string) {
-    if (providerId) {
-        try {
-            return providerRegistry.getProvider(providerId);
-        } catch {
-            console.warn(`Provider "${providerId}" not found, falling back to active`);
-        }
-    }
-    return providerRegistry.getActiveProvider();
-}
-
 export const storage = {
     // Redis operations
     redis,
@@ -74,7 +35,7 @@ export const storage = {
         providerId?: string,
     ): Promise<string | null> {
         try {
-            const provider = resolveProviderById(providerId);
+            const provider = await resolveProviderById(providerId);
             return await provider.getSignedUploadUrl(id, expiresIn, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.sign-upload', extra: { id } });
@@ -89,7 +50,7 @@ export const storage = {
         providerId?: string,
     ): Promise<string | null> {
         try {
-            const provider = resolveProviderById(providerId);
+            const provider = await resolveProviderById(providerId);
             return await provider.createMultipartUpload(id, objectExpires);
         } catch (e) {
             captureError(e, { operation: 's3.create-multipart', extra: { id } });
@@ -100,29 +61,29 @@ export const storage = {
 
     // --- Multipart operations (target specific provider if known) ---
 
-    getSignedMultipartUploadUrl(
+    async getSignedMultipartUploadUrl(
         id: string,
         uploadId: string,
         partNumber: number,
         expiresIn?: number,
         providerId?: string,
     ): Promise<string> {
-        const provider = resolveProviderById(providerId);
+        const provider = await resolveProviderById(providerId);
         return provider.getSignedMultipartUploadUrl(id, uploadId, partNumber, expiresIn);
     },
 
-    completeMultipartUpload(
+    async completeMultipartUpload(
         id: string,
         uploadId: string,
         parts: CompletedPart[],
         providerId?: string,
     ): Promise<void> {
-        const provider = resolveProviderById(providerId);
+        const provider = await resolveProviderById(providerId);
         return provider.completeMultipartUpload(id, uploadId, parts);
     },
 
-    abortMultipartUpload(id: string, uploadId: string, providerId?: string): Promise<void> {
-        const provider = resolveProviderById(providerId);
+    async abortMultipartUpload(id: string, uploadId: string, providerId?: string): Promise<void> {
+        const provider = await resolveProviderById(providerId);
         return provider.abortMultipartUpload(id, uploadId);
     },
 
@@ -159,18 +120,18 @@ export const storage = {
         const provider = await resolveProviderForFile(id);
 
         await Promise.all([
+            // Deliberate: an S3 delete failure must not strand undeletable
+            // Redis metadata, so only the object leg is swallowed
             provider.del(id).catch((e) => {
                 captureError(e, { operation: 's3.delete', extra: { id }, level: 'warning' });
             }),
-            redis.del(id),
+            // Metadata removal and the provider file-count decrement are one
+            // conditional operation: only the caller whose DEL actually removed
+            // the key decrements. Two concurrent deletes of the same file (an
+            // owner /delete racing the auto-delete from /download/complete)
+            // would otherwise each decrement, dropping the counter by two.
+            providerId ? providerRegistry.deleteFileMetadata(providerId, id) : redis.del(id),
         ]);
-
-        // Decrement file counter for this provider
-        if (providerId) {
-            await providerRegistry.decrementFileCount(providerId).catch(() => {
-                // Non-critical — counter may drift slightly
-            });
-        }
     },
 
     // --- Provider info ---

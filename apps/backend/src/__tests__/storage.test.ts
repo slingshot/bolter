@@ -21,7 +21,18 @@ const mockRedis = {
     set: mock(() => Promise.resolve()),
     incrBy: mock(() => Promise.resolve(0)),
     decrBy: mock(() => Promise.resolve(0)),
+    delAndDecrement: mock(() => Promise.resolve(true)),
     rotateNonce: mock(() => Promise.resolve(true)),
+};
+
+// Provider bookkeeping side of storage.del — mirrors
+// providerRegistry.deleteFileMetadata
+const mockRegistry = {
+    deleteFileMetadata: mock(async (providerId: string, fileId: string) => {
+        const removed = await mockRedis.delAndDecrement(fileId, `provider:${providerId}:filecount`);
+        await mockRedis.sRem(`provider:${providerId}:files`, fileId);
+        return removed;
+    }),
 };
 
 // --- Mock s3Storage ---
@@ -119,11 +130,12 @@ const storage = {
     },
 
     async del(id: string): Promise<void> {
+        const providerId = await mockRedis.hGet(id, 'providerId');
         await Promise.all([
             mockS3.del(id).catch((e: unknown) => {
                 mockCaptureError(e, { operation: 's3.delete', extra: { id }, level: 'warning' });
             }),
-            mockRedis.del(id),
+            providerId ? mockRegistry.deleteFileMetadata(providerId, id) : mockRedis.del(id),
         ]);
     },
 
@@ -192,8 +204,16 @@ describe('storage.del', () => {
     beforeEach(() => {
         mockS3.del.mockReset();
         mockRedis.del.mockReset();
+        mockRedis.hGet.mockReset();
+        mockRedis.sRem.mockReset();
+        mockRedis.decrBy.mockReset();
+        mockRedis.delAndDecrement.mockReset();
         mockS3.del.mockResolvedValue(undefined);
         mockRedis.del.mockResolvedValue(undefined);
+        mockRedis.hGet.mockResolvedValue(null);
+        mockRedis.sRem.mockResolvedValue(undefined);
+        mockRedis.decrBy.mockResolvedValue(0);
+        mockRedis.delAndDecrement.mockResolvedValue(true);
     });
 
     it('should call both S3 and Redis delete', async () => {
@@ -217,6 +237,36 @@ describe('storage.del', () => {
         mockRedis.del.mockRejectedValue(new Error('Redis unavailable'));
 
         await expect(storage.del('test-id')).rejects.toThrow('Redis unavailable');
+    });
+
+    it('should delete metadata and decrement the counter in one conditional op', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+
+        await storage.del('test-id');
+
+        // Never a blind redis.del + unconditional decrement pair
+        expect(mockRedis.del).not.toHaveBeenCalled();
+        expect(mockRedis.decrBy).not.toHaveBeenCalled();
+        expect(mockRedis.delAndDecrement).toHaveBeenCalledWith('test-id', 'provider:p1:filecount');
+    });
+
+    it('should not decrement twice when two deletes race for the same file', async () => {
+        mockRedis.hGet.mockResolvedValue('p1');
+
+        // Redis DEL semantics: only the first caller removes the key
+        let alreadyDeleted = false;
+        mockRedis.delAndDecrement.mockImplementation(async (_key: string, counterKey: string) => {
+            if (alreadyDeleted) {
+                return false;
+            }
+            alreadyDeleted = true;
+            await mockRedis.decrBy(counterKey, 1);
+            return true;
+        });
+
+        await Promise.all([storage.del('test-id'), storage.del('test-id')]);
+
+        expect(mockRedis.decrBy).toHaveBeenCalledTimes(1);
     });
 });
 

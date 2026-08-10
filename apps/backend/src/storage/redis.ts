@@ -84,6 +84,29 @@ export class RedisStorage {
         await client.del(key);
     }
 
+    /**
+     * Delete `key` and decrement `counterKey` only when THIS call is the one
+     * that actually removed the key (clamping the counter at 0).
+     *
+     * `DEL` is atomic and returns the number of keys it removed, so exactly one
+     * of N concurrent callers sees a non-zero reply. Gating the decrement on
+     * that reply is what stops two racing deletes of the same file from each
+     * decrementing the provider file counter. Returns true when this call
+     * removed the key.
+     */
+    async delAndDecrement(key: string, counterKey: string): Promise<boolean> {
+        const client = await this.getClient();
+        const removed = await client.del(key);
+        if (removed < 1) {
+            return false;
+        }
+        const remaining = await client.decrBy(counterKey, 1);
+        if (remaining < 0) {
+            await client.set(counterKey, '0');
+        }
+        return true;
+    }
+
     async exists(key: string): Promise<boolean> {
         const client = await this.getClient();
         const result = await client.exists(key);

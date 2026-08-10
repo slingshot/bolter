@@ -47,10 +47,32 @@ export class ProviderNotFoundError extends Error {
     }
 }
 
+/** Thrown when a provider still has live files and `force` was not requested. */
+export class ProviderInUseError extends Error {
+    readonly code = 'PROVIDER_IN_USE';
+    readonly fileCount: number;
+
+    constructor(providerId: string, fileCount: number) {
+        super(
+            `Cannot delete provider "${providerId}" — ${fileCount} active file(s) still reference it`,
+        );
+        this.name = 'ProviderInUseError';
+        this.fileCount = fileCount;
+    }
+}
+
 // --- Redis key helpers ---
 
 const PROVIDER_KEY_PREFIX = 'provider:';
 const PROVIDER_IDS_KEY = 'provider:ids';
+
+/**
+ * Slugs that would collide with the registry's own control keys under the
+ * `provider:` prefix. `provider:ids` is the SET indexing every provider id, so
+ * a provider named "ids" (or "IDS", "I.D.S", ...) would HSET its record onto
+ * that SET and fail with WRONGTYPE. Reject the name up front instead.
+ */
+const RESERVED_PROVIDER_IDS = new Set(['ids']);
 
 function providerKey(id: string): string {
     return `${PROVIDER_KEY_PREFIX}${id}`;
@@ -58,6 +80,11 @@ function providerKey(id: string): string {
 
 function filecountKey(id: string): string {
     return `${PROVIDER_KEY_PREFIX}${id}:filecount`;
+}
+
+/** SET of file ids currently stored on a provider (see `getFileCount`). */
+function filesKey(id: string): string {
+    return `${PROVIDER_KEY_PREFIX}${id}:files`;
 }
 
 // --- Secret encryption ---
@@ -407,6 +434,11 @@ export class ProviderRegistry {
         if (!id) {
             throw new Error('Provider name produces an empty slug');
         }
+        if (RESERVED_PROVIDER_IDS.has(id)) {
+            throw new Error(
+                `Provider name "${input.name}" is reserved — slug "${id}" collides with an internal registry key`,
+            );
+        }
         if (this.configs.has(id)) {
             throw new Error(`Provider "${id}" already exists`);
         }
@@ -499,7 +531,14 @@ export class ProviderRegistry {
         return updated;
     }
 
-    async removeProvider(id: string): Promise<void> {
+    /**
+     * Remove a provider. Refuses while files still live on it unless
+     * `options.force` is set — the caller's `force` intent is threaded all the
+     * way down here so the documented `?force=true` override actually works
+     * instead of the route skipping its own check only for this method to
+     * throw independently.
+     */
+    async removeProvider(id: string, options: { force?: boolean } = {}): Promise<void> {
         const cfg = this.configs.get(id);
         if (!cfg) {
             throw new Error(`Provider "${id}" not found`);
@@ -508,25 +547,24 @@ export class ProviderRegistry {
             throw new Error('Cannot delete the default provider');
         }
 
-        // Check active file count
-        const countStr = await redis.get(filecountKey(id));
-        const count = parseInt(countStr || '0', 10);
-        if (count > 0) {
-            throw new Error(
-                `Cannot delete provider "${id}" — ${count} active file(s) still reference it`,
-            );
+        if (!options.force) {
+            const count = await this.getFileCount(id);
+            if (count > 0) {
+                throw new ProviderInUseError(id, count);
+            }
         }
 
         // Remove from Redis
         await redis.del(providerKey(id));
         await redis.del(filecountKey(id));
+        await redis.del(filesKey(id));
         await redis.sRem(PROVIDER_IDS_KEY, id);
 
         // Remove from cache
         this.configs.delete(id);
         this.instances.delete(id);
 
-        logger.info({ providerId: id }, 'Provider removed');
+        logger.info({ providerId: id, force: options.force === true }, 'Provider removed');
     }
 
     listProviders(): StorageProviderPublic[] {
@@ -541,9 +579,39 @@ export class ProviderRegistry {
         return configToPublic(cfg);
     }
 
+    /**
+     * Number of files still live on this provider.
+     *
+     * Derived from the provider's file-id SET, NOT from the `:filecount`
+     * counter. Files normally end their life by Redis TTL expiry, which no
+     * listener observes, so the counter is only ever incremented in practice
+     * and drifts upward forever — gating deletion on it eventually makes a
+     * provider permanently undeletable even with zero live files. Membership is
+     * checked against the actual metadata hashes here and expired ids are
+     * pruned, so the answer is exact and self-healing.
+     */
     async getFileCount(id: string): Promise<number> {
-        const countStr = await redis.get(filecountKey(id));
-        return parseInt(countStr || '0', 10);
+        const fileIds = await redis.sMembers(filesKey(id));
+        if (fileIds.length === 0) {
+            return 0;
+        }
+
+        const stale: string[] = [];
+        let live = 0;
+        for (const fileId of fileIds) {
+            if (await redis.exists(fileId)) {
+                live++;
+            } else {
+                stale.push(fileId);
+            }
+        }
+
+        if (stale.length > 0) {
+            // Prune ids whose metadata already expired so the set stays bounded
+            await redis.sRem(filesKey(id), ...stale);
+        }
+
+        return live;
     }
 
     // --- Activation ---
@@ -601,8 +669,16 @@ export class ProviderRegistry {
 
     // --- File count tracking ---
 
-    async incrementFileCount(providerId: string): Promise<void> {
+    /**
+     * Record a new file on a provider. `fileId` is optional for backwards
+     * compatibility, but passing it is what makes `getFileCount` able to see
+     * TTL expiry — the raw counter alone can never shrink on its own.
+     */
+    async incrementFileCount(providerId: string, fileId?: string): Promise<void> {
         await redis.incrBy(filecountKey(providerId), 1);
+        if (fileId) {
+            await redis.sAdd(filesKey(providerId), fileId);
+        }
     }
 
     async decrementFileCount(providerId: string): Promise<void> {
@@ -611,6 +687,21 @@ export class ProviderRegistry {
         if (result < 0) {
             await redis.set(filecountKey(providerId), '0');
         }
+    }
+
+    /**
+     * Delete a file's metadata hash and decrement this provider's counter in a
+     * single conditional operation, so only the caller that actually removed
+     * the key decrements. Also drops the id from the provider's live-file set
+     * (idempotent, and never fatal — bookkeeping must not fail a delete).
+     * Returns true when this call removed the key.
+     */
+    async deleteFileMetadata(providerId: string, fileId: string): Promise<boolean> {
+        const removed = await redis.delAndDecrement(fileId, filecountKey(providerId));
+        await redis.sRem(filesKey(providerId), fileId).catch(() => {
+            // Non-critical — getFileCount prunes stale members on read
+        });
+        return removed;
     }
 
     // --- Cleanup ---
