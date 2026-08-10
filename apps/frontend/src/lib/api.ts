@@ -33,6 +33,7 @@ import {
     resumeEngineUploadInWorker,
     runEngineInWorker,
 } from './upload-engine/client';
+import { createEngineProgressReporter } from './upload-engine/progress-reporter';
 import type { EngineJob, EngineSource } from './upload-engine/protocol';
 import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
 import { withUploadLifecycle } from './upload-lifecycle';
@@ -1784,81 +1785,6 @@ async function uploadFilesViaEngine(
         url: `${window.location.origin}/download/${uploadInfo.id}`,
         ownerToken: uploadInfo.owner,
         duration: Date.now() - startTime,
-    };
-}
-
-/**
- * Adapt the engine's bytes-level progress events to the legacy
- * `UploadProgress` shape (smoothed speed, connection quality, offline
- * awareness), with a 1s poll so offline/stalled states surface even when no
- * bytes are flowing — mirroring the legacy pipeline's reporting.
- */
-function createEngineProgressReporter(
-    totalSize: number,
-    onProgress?: (progress: UploadProgress) => void,
-): { onProgress(sent: number, total: number): void; onRetry(): void; stop(): void } {
-    const startTime = Date.now();
-    let retryCount = 0;
-    let smoothedSpeed = 0;
-    let lastSent = 0;
-    let lastTime = startTime;
-    let lastForwardProgress = startTime;
-    let latestTotal = totalSize;
-
-    const emit = () => {
-        const now = Date.now();
-        const isOffline = !navigator.onLine;
-        let connectionQuality: UploadProgress['connectionQuality'];
-        if (isOffline) {
-            connectionQuality = 'offline';
-        } else if (smoothedSpeed === 0 || now - lastForwardProgress > 10000) {
-            connectionQuality = 'stalled';
-        } else if (smoothedSpeed < 1 * 1024 * 1024) {
-            connectionQuality = 'slow';
-        } else if (smoothedSpeed < 10 * 1024 * 1024) {
-            connectionQuality = 'fair';
-        } else {
-            connectionQuality = 'good';
-        }
-        onProgress?.({
-            loaded: Math.min(lastSent, latestTotal),
-            total: latestTotal,
-            percentage: latestTotal > 0 ? Math.min((lastSent / latestTotal) * 100, 100) : 0,
-            speed: smoothedSpeed,
-            remainingTime: smoothedSpeed > 0 ? (latestTotal - lastSent) / smoothedSpeed : 0,
-            retryCount,
-            isOffline,
-            connectionQuality,
-        });
-    };
-    const pollInterval = setInterval(emit, 1000);
-
-    return {
-        onProgress(sent: number, total: number) {
-            const now = Date.now();
-            if (total > 0) {
-                latestTotal = total;
-            }
-            if (sent > lastSent) {
-                const elapsed = (now - lastTime) / 1000;
-                if (elapsed > 0) {
-                    const instant = (sent - lastSent) / elapsed;
-                    smoothedSpeed =
-                        smoothedSpeed === 0 ? instant : smoothedSpeed * 0.7 + instant * 0.3;
-                }
-                lastSent = sent;
-                lastTime = now;
-                lastForwardProgress = now;
-            }
-            emit();
-        },
-        onRetry() {
-            retryCount++;
-            emit();
-        },
-        stop() {
-            clearInterval(pollInterval);
-        },
     };
 }
 
