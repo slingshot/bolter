@@ -13,9 +13,11 @@ import {
     createEncryptionStream,
     ECE_ENCRYPTED_RECORD_SIZE,
     ECE_RECORD_SIZE,
+    ECE_VERSION,
     generateIV,
     generateSecretKey,
     Keychain,
+    readEceVersion,
 } from '@/lib/crypto';
 import { captureError } from '@/lib/sentry';
 
@@ -318,7 +320,10 @@ describe('Encryption/Decryption streams', () => {
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
         expect(encrypted.length).toBeGreaterThan(plaintext.length); // overhead added
 
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encrypted,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -327,7 +332,10 @@ describe('Encryption/Decryption streams', () => {
         const plaintext = makeData(ECE_RECORD_SIZE); // exactly 64KB
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encrypted,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -336,7 +344,10 @@ describe('Encryption/Decryption streams', () => {
         const plaintext = makeData(150 * 1024); // 150KB
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encrypted,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -345,7 +356,10 @@ describe('Encryption/Decryption streams', () => {
         const plaintext = makeData(1024 * 1024); // 1MB
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encrypted,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -354,7 +368,10 @@ describe('Encryption/Decryption streams', () => {
         const plaintext = new Uint8Array([42]);
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
-        const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encrypted,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -393,7 +410,10 @@ describe('Encryption/Decryption streams', () => {
         expect(arrayToB64(encrypted)).not.toBe(arrayToB64(encryptedDefault));
 
         // Verify the default (counter=0) encryption does round-trip
-        const decrypted = await pipeThrough(encryptedDefault, createDecryptionStream(kc));
+        const decrypted = await pipeThrough(
+            encryptedDefault,
+            createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+        );
         expect(decrypted).toEqual(plaintext);
     });
 
@@ -404,7 +424,9 @@ describe('Encryption/Decryption streams', () => {
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc1));
 
-        await expect(pipeThrough(encrypted, createDecryptionStream(kc2))).rejects.toThrow();
+        await expect(
+            pipeThrough(encrypted, createDecryptionStream(kc2, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow();
     });
 
     it('decryption with wrong key rejects for multi-record data', async () => {
@@ -414,7 +436,9 @@ describe('Encryption/Decryption streams', () => {
 
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc1));
 
-        await expect(pipeThrough(encrypted, createDecryptionStream(kc2))).rejects.toThrow();
+        await expect(
+            pipeThrough(encrypted, createDecryptionStream(kc2, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow();
     });
 });
 
@@ -434,14 +458,17 @@ describe('Decryption stream integrity', () => {
     ];
 
     for (const size of roundtripSizes) {
-        it(`round-trips ${size} bytes`, async () => {
+        it(`round-trips ${size} bytes with the versioned reader`, async () => {
             const kc = new Keychain();
             const plaintext = makeData(size);
 
             const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
             expect(encrypted.length).toBe(calculateEncryptedSize(size));
 
-            const decrypted = await pipeThrough(encrypted, createDecryptionStream(kc));
+            const decrypted = await pipeThrough(
+                encrypted,
+                createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
+            );
             expect(decrypted).toEqual(plaintext);
             expect(vi.mocked(captureError)).not.toHaveBeenCalled();
         });
@@ -461,7 +488,9 @@ describe('Decryption stream integrity', () => {
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
         const truncated = encrypted.slice(0, encrypted.length - 10);
 
-        await expect(pipeThrough(truncated, createDecryptionStream(kc))).rejects.toThrow();
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow();
         expect(vi.mocked(captureError)).toHaveBeenCalledWith(
             expect.anything(),
             expect.objectContaining({ operation: 'crypto.decryptRecord' }),
@@ -475,7 +504,9 @@ describe('Decryption stream integrity', () => {
         const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
         const truncated = encrypted.slice(0, encrypted.length - 10);
 
-        await expect(pipeThrough(truncated, createDecryptionStream(kc))).rejects.toThrow();
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow();
     });
 
     it('decrypts legacy exact-multiple stream without trailing final record', async () => {
@@ -488,7 +519,9 @@ describe('Decryption stream integrity', () => {
         expect(encrypted.length).toBe(ECE_ENCRYPTED_RECORD_SIZE + 17);
         const legacy = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
 
-        const decrypted = await pipeThrough(legacy, createDecryptionStream(kc));
+        // eceVersion 0 = no marker in the file's metadata => pre-versioning
+        // upload, which may legitimately end without a final record.
+        const decrypted = await pipeThrough(legacy, createDecryptionStream(kc, { eceVersion: 0 }));
         expect(decrypted).toEqual(plaintext);
 
         // Missing final record is reported as warning telemetry, not a failure
@@ -501,12 +534,146 @@ describe('Decryption stream integrity', () => {
         );
     });
 
+    it('fails closed when a versioned stream is missing its final record', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE);
+
+        // A malicious storage provider truncates the stored object at an ECE
+        // record boundary and serves a matching Content-Length. The file is
+        // marked eceVersion=1, so the absent final record is an integrity
+        // failure — not the legacy exact-multiple case.
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
+
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow(/final record is missing/i);
+
+        // Reported as an error, not a warning
+        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ operation: 'crypto.missingFinalRecord' }),
+        );
+        expect(vi.mocked(captureError)).not.toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ level: 'warning' }),
+        );
+    });
+
+    it('fails closed when a versioned multi-record stream is truncated at a record boundary', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE * 3);
+
+        // Drop the trailing empty final record *and* the last full record:
+        // every surviving record still authenticates, so only the missing
+        // final marker can reveal the truncation.
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE * 2);
+
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow(/final record is missing/i);
+    });
+
+    it('fails closed when a versioned stream is truncated to nothing', async () => {
+        const kc = new Keychain();
+
+        await expect(
+            pipeThrough(new Uint8Array(0), createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
+        ).rejects.toThrow(/final record is missing/i);
+    });
+
+    it('treats an unknown future ECE version as versioned (fails closed)', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE);
+
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
+
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION + 1 })),
+        ).rejects.toThrow(/final record is missing/i);
+    });
+
+    it('keeps failing closed for version 1 files after ECE_VERSION is bumped', async () => {
+        const kc = new Keychain();
+        const plaintext = makeData(ECE_RECORD_SIZE);
+
+        const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+        const truncated = encrypted.slice(0, ECE_ENCRYPTED_RECORD_SIZE);
+
+        // Deliberately the literal 1, not ECE_VERSION: files already stored
+        // with the v1 marker must stay fail-closed forever. If the strictness
+        // test is ever rewritten against the moving ECE_VERSION constant,
+        // bumping that constant would silently reopen the truncation hole for
+        // every previously uploaded file — this test is what catches that.
+        await expect(
+            pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: 1 })),
+        ).rejects.toThrow(/final record is missing/i);
+    });
+
+    for (const size of roundtripSizes) {
+        it(`round-trips ${size} bytes with a legacy (unmarked) reader`, async () => {
+            const kc = new Keychain();
+            const plaintext = makeData(size);
+
+            // Complete ciphertext always carries its final record, so even the
+            // permissive legacy path must decrypt it with no telemetry at all.
+            const encrypted = await pipeThrough(plaintext, createEncryptionStream(kc));
+            const decrypted = await pipeThrough(
+                encrypted,
+                createDecryptionStream(kc, { eceVersion: 0 }),
+            );
+            expect(decrypted).toEqual(plaintext);
+            expect(vi.mocked(captureError)).not.toHaveBeenCalled();
+        });
+    }
+
     it('calculateEncryptedSize matches actual encrypted output for all sizes', async () => {
         const kc = new Keychain();
         for (const size of roundtripSizes) {
             const encrypted = await pipeThrough(makeData(size), createEncryptionStream(kc));
             expect(encrypted.length).toBe(calculateEncryptedSize(size));
         }
+    });
+});
+
+describe('readEceVersion', () => {
+    it('returns the current version constant for freshly written metadata', () => {
+        expect(readEceVersion({ files: [], eceVersion: ECE_VERSION })).toBe(ECE_VERSION);
+    });
+
+    it('survives an encrypt/decrypt metadata round-trip', async () => {
+        const kc = new Keychain();
+        const encrypted = await kc.encryptMetadata({
+            files: [{ name: 'a.bin', size: 1, type: 'application/octet-stream' }],
+            eceVersion: ECE_VERSION,
+        });
+        const decrypted = await kc.decryptMetadata(encrypted);
+        expect(readEceVersion(decrypted)).toBe(ECE_VERSION);
+    });
+
+    it('treats metadata without the marker as legacy', () => {
+        expect(readEceVersion({ files: [] })).toBe(0);
+    });
+
+    it('treats non-object metadata as legacy', () => {
+        expect(readEceVersion(undefined)).toBe(0);
+        expect(readEceVersion(null)).toBe(0);
+        expect(readEceVersion('1')).toBe(0);
+        expect(readEceVersion(1)).toBe(0);
+    });
+
+    it('treats a non-positive or non-numeric marker as legacy', () => {
+        expect(readEceVersion({ eceVersion: 0 })).toBe(0);
+        expect(readEceVersion({ eceVersion: -1 })).toBe(0);
+        expect(readEceVersion({ eceVersion: Number.NaN })).toBe(0);
+        expect(readEceVersion({ eceVersion: '1' })).toBe(0);
+        expect(readEceVersion({ eceVersion: true })).toBe(0);
+    });
+
+    it('passes through a higher (future) version', () => {
+        expect(readEceVersion({ eceVersion: 2 })).toBe(2);
     });
 });
 

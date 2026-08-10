@@ -14,6 +14,55 @@ const TAG_LENGTH = 16; // AES-GCM tag length
 const NONCE_LENGTH = 12; // AES-GCM nonce length
 export const ECE_ENCRYPTED_RECORD_SIZE = ECE_RECORD_SIZE + TAG_LENGTH + 1;
 
+/**
+ * ECE ciphertext format version, recorded per-file in the client-encrypted
+ * metadata blob (`eceVersion`) at upload time.
+ *
+ * ECE ciphertext carries no in-band version header, so the decryptor cannot
+ * distinguish a stream that legitimately ends without a final-flagged record
+ * (produced by pre-versioning clients whose plaintext was an exact
+ * record-size multiple) from one a malicious storage provider truncated at a
+ * record boundary. Recording the version alongside the file lets the
+ * decryptor fail closed for everything it knows was written by a client that
+ * always emits a final record, while still decrypting genuinely legacy data.
+ *
+ * The marker lives inside the AES-GCM-authenticated metadata (keyed by the
+ * secret in the download URL fragment), so neither the storage provider nor
+ * the metadata server can forge or strip it.
+ *
+ * Version 1 = the encryptor always emits a final-flagged record, including for
+ * exact-record-multiple and empty plaintexts.
+ */
+export const ECE_VERSION = 1;
+
+/**
+ * First ECE version whose writer is guaranteed to emit a final-flagged record.
+ *
+ * Deliberately a fixed floor rather than `ECE_VERSION`: every version from 1
+ * onwards always terminates the stream with a final record, so bumping
+ * `ECE_VERSION` for an unrelated format change must not silently downgrade the
+ * millions of already-stored v1 files back to the fail-open legacy path.
+ */
+const ECE_MIN_VERSION_WITH_FINAL_RECORD = 1;
+
+/**
+ * Read the ECE format version from a file's decrypted metadata.
+ *
+ * Returns 0 when the marker is absent or not a positive number, i.e. metadata
+ * written before versioning existed. Only that case is permitted to decrypt a
+ * stream with no trailing final record.
+ */
+export function readEceVersion(metadata: unknown): number {
+    if (typeof metadata !== 'object' || metadata === null) {
+        return 0;
+    }
+    const value = (metadata as { eceVersion?: unknown }).eceVersion;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        return 0;
+    }
+    return value;
+}
+
 // Key derivation info strings
 const KEY_INFO = encoder.encode('Content-Encoding: aes128gcm');
 // NONCE_INFO kept as a comment for documentation: encoder.encode('Content-Encoding: nonce')
@@ -309,12 +358,32 @@ async function encryptRecord(
     return new Uint8Array(encrypted);
 }
 
+export interface DecryptionStreamOptions {
+    /**
+     * ECE format version taken from the file's authenticated metadata via
+     * `readEceVersion(metadata)`. `>= ECE_MIN_VERSION_WITH_FINAL_RECORD` means
+     * the ciphertext was written by a client that always emits a final-flagged
+     * record, so a missing final record is truncation or tampering and fails
+     * closed. 0 means pre-versioning data, which may legitimately lack one and
+     * is decrypted with warning telemetry only.
+     *
+     * Required, with no default: omitting it would silently select the
+     * fail-open legacy path, which is precisely the vulnerability the marker
+     * exists to close. Callers that genuinely have no marker must say so by
+     * passing 0.
+     */
+    eceVersion: number;
+}
+
 /**
  * Create decryption transform stream for file content
  */
 export function createDecryptionStream(
     keychain: Keychain,
+    options: DecryptionStreamOptions,
 ): TransformStream<Uint8Array, Uint8Array> {
+    const eceVersion = options.eceVersion;
+    const requireFinalRecord = eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
     let recordCount = 0;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
@@ -374,17 +443,44 @@ export function createDecryptionStream(
                         extra: { recordCount, bufferLength: buffer.length },
                     });
                     controller.error(e instanceof Error ? e : new Error(String(e)));
+                    return;
                 }
-            } else if (!sawFinal) {
-                // Legacy uploads with exact-record-multiple plaintexts have no
-                // final-flagged record, so this is not an error — but new uploads
-                // always end with one, so track occurrences for telemetry.
-                captureError(new Error('Encrypted stream ended without final record'), {
-                    operation: 'crypto.missingFinalRecord',
-                    level: 'warning',
-                    extra: { recordCount },
-                });
             }
+
+            if (sawFinal) {
+                return;
+            }
+
+            if (requireFinalRecord) {
+                // Versioned ciphertext always ends with a final-flagged record.
+                // Its absence means the stored object was truncated at a record
+                // boundary — exactly what the final record exists to detect, and
+                // reachable by a malicious storage provider serving a matching
+                // Content-Length. Fail closed instead of handing back a partial
+                // file that looks complete.
+                const err = new Error(
+                    'Encrypted file is incomplete: the final record is missing, so this download was truncated or tampered with.',
+                );
+                console.error('Encrypted stream ended without final record', {
+                    recordCount,
+                    eceVersion,
+                });
+                captureError(err, {
+                    operation: 'crypto.missingFinalRecord',
+                    extra: { recordCount, eceVersion },
+                });
+                controller.error(err);
+                return;
+            }
+
+            // Pre-versioning uploads with exact-record-multiple plaintexts have
+            // no final-flagged record, so this is not an error for them — but
+            // track occurrences for telemetry.
+            captureError(new Error('Encrypted stream ended without final record'), {
+                operation: 'crypto.missingFinalRecord',
+                level: 'warning',
+                extra: { recordCount, eceVersion },
+            });
         },
     });
 }
