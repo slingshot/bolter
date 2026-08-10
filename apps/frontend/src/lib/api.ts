@@ -1704,12 +1704,23 @@ export async function resumeUpload(
         newlyUploadedBytes = multipartResult.actualSize;
     }
 
-    // True object size: bytes of the contiguous completed prefix plus the bytes
-    // actually streamed now. The old `totalParts * partSize` was allocated
-    // capacity, which overstates the size of essentially every resumed upload
-    // (the final part is nearly always partial) and makes every download report
-    // a spurious size mismatch.
-    const actualUploadedSize = alreadyUploaded + newlyUploadedBytes;
+    // True object size. The old `totalParts * partSize` was allocated capacity,
+    // which overstates the size of essentially every resumed upload (the final
+    // part is nearly always partial) and makes every download report a spurious
+    // size mismatch.
+    //
+    // `alreadyUploaded` is derived from the part grid, so it is only exact while
+    // the contiguous prefix consists of full (non-trailing) parts. Once the
+    // prefix reaches the end of the file — the "interrupted between the last
+    // part and /upload/complete" resume, where nothing is left to stream — the
+    // grid counts the partial trailing part as a whole one (21MB in 3x10MB
+    // parts would report 30MB). In that case the object is exactly the whole
+    // payload, so derive the size from the file itself.
+    const wholePayloadSize = state.encrypted ? calculateEncryptedSize(file.size) : file.size;
+    const prefixCoversWholeFile = skipBytes >= file.size;
+    const actualUploadedSize = prefixCoversWholeFile
+        ? wholePayloadSize
+        : alreadyUploaded + newlyUploadedBytes;
 
     if (cancel.cancelled) {
         throw new Error('Upload cancelled');
@@ -1961,6 +1972,15 @@ function uploadSinglePart(
  * Single-part upload with the same retry budget, backoff and offline pausing as
  * the multipart path. Without this a single dropped packet on a 90MB upload
  * discards the whole transfer with no retry and no resume record.
+ *
+ * No signed-URL refresh, deliberately. The PUT URL is signed for
+ * URL_EXPIRATION_SECONDS (7 days, upload.ts) while the worst-case retry window
+ * here is MAX_RETRIES + 1 attempts x STALL_TIMEOUT plus the capped backoff
+ * ladder — about 17 minutes — so the URL cannot expire mid-run. The only way to
+ * outlive it is an offline pause measured in days, which equally breaks the
+ * multipart path (part URLs are re-signed only by /upload/multipart/:id/resume
+ * on the next visit, never mid-run). Revisit if URL_EXPIRATION_SECONDS is cut to
+ * anything near the retry window.
  */
 async function uploadSinglePartWithRetry(
     blob: Blob,
@@ -1977,7 +1997,13 @@ async function uploadSinglePartWithRetry(
             return await uploadSinglePart(blob, url, onProgress, canceller);
         } catch (error: unknown) {
             if (canceller.cancelled) {
-                throw error;
+                // A mid-flight cancel aborts the XHR, which surfaces from
+                // uploadSinglePart as a raw `HTTP 0` (abort dispatches loadend
+                // with status 0). Normalise it the way the multipart read loop
+                // does — uploadFiles' own cancelled check sits after this await
+                // and never runs, so without this the caller shows
+                // "Upload failed: HTTP 0" instead of the cancel toast.
+                throw new Error('Upload cancelled');
             }
             const err = error instanceof Error ? error : new Error(String(error));
             const isRetryable = isRetryableError(err);

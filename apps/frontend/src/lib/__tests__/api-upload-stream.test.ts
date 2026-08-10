@@ -292,6 +292,37 @@ describe('stream-based multipart upload', () => {
             expect(fetchCalls.some((u) => u.includes('/delete/file-id'))).toBe(true);
         });
 
+        it('reports a mid-flight cancel as "Upload cancelled", not a raw HTTP error', async () => {
+            const canceller = new Canceller();
+
+            // The PUT never settles on its own — only the cancel's abort ends it
+            FakeXhr.onSend = () => {
+                /* park in flight */
+            };
+
+            const promise = uploadFiles(
+                { files: [makeFile(1024)], encrypted: false },
+                new Keychain(),
+                canceller,
+            );
+
+            // Wait for the PUT to actually be in flight
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(FakeXhr.sends.length).toBe(1);
+
+            canceller.cancel();
+
+            // Pre-fix: abort dispatches loadend with status 0, uploadSinglePart
+            // rejected with "HTTP 0" and the retry wrapper rethrew it verbatim,
+            // so Home.tsx showed "Upload failed: HTTP 0" instead of the cancel
+            // toast (uploadFiles' own cancelled check sits after the await).
+            await expect(promise).rejects.toThrow('Upload cancelled');
+            expect(FakeXhr.instances[0].aborted).toBe(true);
+            // The cancel still releases the server-side allocation
+            expect(fetchCalls.some((u) => u.includes('/delete/file-id'))).toBe(true);
+            expect(fetchCalls.some((u) => u.includes('/upload/complete'))).toBe(false);
+        });
+
         it('does not open a request for an already-cancelled upload', async () => {
             const canceller = new Canceller();
             canceller.cancel();

@@ -223,6 +223,73 @@ describe('resumeUpload', () => {
         expect(completeReq?.body?.actualSize).toBe(21_000_000);
     });
 
+    it('reports the true size when the completed prefix already covers the file', async () => {
+        // Interrupted between the LAST part upload and /upload/complete: the
+        // resume endpoint hands back no parts, so there is nothing to stream and
+        // no measured byte count to add. Deriving the size from the part grid
+        // counts the partial trailing part (1MB) as a whole 10MB part.
+        resumeResponse = { parts: [], partSize: 10_000_000, numParts: 3 };
+        const file = new File([new Uint8Array(21_000_000)], 'test.bin', {
+            lastModified: 1700000000000,
+        });
+
+        await resumeUpload(
+            file,
+            makeState({
+                fileSize: 21_000_000,
+                totalParts: 3,
+                completedParts: [
+                    { PartNumber: 1, ETag: '"etag1"' },
+                    { PartNumber: 2, ETag: '"etag2"' },
+                    { PartNumber: 3, ETag: '"etag3"' },
+                ],
+                contentFingerprint: await computeContentFingerprint(file),
+            }),
+        );
+
+        // Nothing is re-streamed on this path
+        expect(FakeXHR.sentBodies.length).toBe(0);
+        const completeReq = requests.find((r) => r.url.includes('/upload/complete'));
+        // Pre-fix: 3 × 10,000,000 = 30,000,000 — the audit's own example number.
+        expect(completeReq?.body?.actualSize).toBe(21_000_000);
+    });
+
+    it('reports the true ciphertext size for an encrypted finalize-only resume', async () => {
+        // Same path, encrypted: the object is the full ECE ciphertext, which is
+        // larger than file.size by the per-record tag+delimiter overhead.
+        const { calculateEncryptedSize, ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE, Keychain } =
+            await import('@/lib/crypto');
+        // 10 whole ECE records per part, so getEffectivePartSize() is exact
+        const partSize = 10 * ECE_ENCRYPTED_RECORD_SIZE;
+        const plaintextPartSize = 10 * ECE_RECORD_SIZE;
+        const plaintextSize = 2 * plaintextPartSize + 1234; // 2 full parts + tail
+        resumeResponse = { parts: [], partSize, numParts: 3 };
+        const file = new File([new Uint8Array(plaintextSize)], 'test.bin', {
+            lastModified: 1700000000000,
+        });
+
+        await resumeUpload(
+            file,
+            makeState({
+                encrypted: true,
+                secretKeyB64: new Keychain().secretKeyB64,
+                fileSize: plaintextSize,
+                partSize,
+                plaintextPartSize,
+                totalParts: 3,
+                completedParts: [
+                    { PartNumber: 1, ETag: '"etag1"' },
+                    { PartNumber: 2, ETag: '"etag2"' },
+                    { PartNumber: 3, ETag: '"etag3"' },
+                ],
+                contentFingerprint: await computeContentFingerprint(file),
+            }),
+        );
+
+        const completeReq = requests.find((r) => r.url.includes('/upload/complete'));
+        expect(completeReq?.body?.actualSize).toBe(calculateEncryptedSize(plaintextSize));
+    });
+
     // ---------------------------------------------------------------------
     // Finding 12 — a transient 5xx must not destroy persisted resume state
     // ---------------------------------------------------------------------
