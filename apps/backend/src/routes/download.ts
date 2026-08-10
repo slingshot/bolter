@@ -1,8 +1,23 @@
 import { Elysia, t } from 'elysia';
+import { clampDownloadLimit } from '../lib/download-limit';
 import { captureError } from '../lib/sentry';
 import { downloadLogger as logger } from '../logger';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
 import { storage } from '../storage';
+
+/**
+ * `S3Storage.getStream` tags the stream it returns with the object's
+ * `ContentLength`; the storage facade passes the object straight through, so
+ * read the tag defensively here. Emitting `Content-Length` on the fallback
+ * stream routes is what lets the client's truncation guard fire — a chunked
+ * response reports `contentLength === 0` and the guard is skipped.
+ */
+export function streamContentLength(stream: ReadableStream<Uint8Array>): number | undefined {
+    const { contentLength } = stream as ReadableStream<Uint8Array> & { contentLength?: unknown };
+    const usable =
+        typeof contentLength === 'number' && Number.isFinite(contentLength) && contentLength >= 0;
+    return usable ? contentLength : undefined;
+}
 
 /**
  * Schedule deletion of a limit-reached file after a 5-minute grace window.
@@ -10,8 +25,13 @@ import { storage } from '../storage';
  * dlimit via /params meanwhile). As a restart-surviving backstop the metadata
  * TTL is capped to the same window, preserving the original expiry in an
  * `expiresAt` field so /params can restore it.
+ *
+ * The TTL-cap chain is awaited before the caller responds: if `expiresAt` were
+ * written lazily, a `/params` raise landing in that window would read a null
+ * `expiresAt`, skip the TTL restore, and let the metadata expire at ~300s while
+ * the grace timer preserves the object — orphaning it in the bucket.
  */
-function scheduleLimitDeletion(id: string): void {
+async function scheduleLimitDeletion(id: string): Promise<void> {
     setTimeout(() => {
         storage
             .getMetadata(id)
@@ -29,21 +49,43 @@ function scheduleLimitDeletion(id: string): void {
                 });
             });
     }, 300000); // 5 min delay
-    storage
-        .getTTL(id)
-        .then(async (ttl) => {
-            if (ttl > 300) {
-                await storage.setField(
-                    id,
-                    'expiresAt',
-                    String(Math.floor(Date.now() / 1000) + ttl),
-                );
-                await storage.redis.expire(id, 300);
-            }
-        })
-        .catch(() => {
-            // Non-critical — natural TTL still applies
+
+    try {
+        const ttl = await storage.getTTL(id);
+        if (ttl > 300) {
+            await storage.setField(id, 'expiresAt', String(Math.floor(Date.now() / 1000) + ttl));
+            await storage.redis.expire(id, 300);
+        }
+    } catch {
+        // Non-critical — natural TTL still applies
+    }
+}
+
+/**
+ * Re-read the current download limit straight from Redis.
+ *
+ * Callers that increment and then decide whether to destroy the file must not
+ * judge against the `dlimit` snapshot taken before the increment — the owner
+ * may have raised it via `/params` in that window, and deleting against the
+ * stale value permanently destroys a file whose live limit is not reached.
+ * Falls back to the snapshot when the field is missing or unparseable.
+ */
+async function readCurrentDownloadLimit(id: string, fallback: number): Promise<number> {
+    try {
+        const raw = await storage.getField(id, 'dlimit');
+        if (raw === null) {
+            return fallback;
+        }
+        const parsed = parseInt(raw, 10);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    } catch (e) {
+        captureError(e, {
+            operation: 'download.reread-dlimit',
+            extra: { id },
+            level: 'warning',
         });
+        return fallback;
+    }
 }
 
 export const downloadRoutes = new Elysia()
@@ -131,7 +173,7 @@ export const downloadRoutes = new Elysia()
                     { id, dl: newDl, dlimit: metadata.dlimit },
                     'Download limit reached, scheduling deletion',
                 );
-                scheduleLimitDeletion(id);
+                await scheduleLimitDeletion(id);
             }
 
             // Redirect to S3
@@ -260,6 +302,10 @@ export const downloadRoutes = new Elysia()
             }
 
             set.headers['Content-Type'] = 'application/octet-stream';
+            const contentLength = streamContentLength(stream);
+            if (contentLength !== undefined) {
+                set.headers['Content-Length'] = String(contentLength);
+            }
             return stream;
         },
         {
@@ -307,6 +353,10 @@ export const downloadRoutes = new Elysia()
             }
 
             set.headers['Content-Type'] = 'application/octet-stream';
+            const contentLength = streamContentLength(stream);
+            if (contentLength !== undefined) {
+                set.headers['Content-Length'] = String(contentLength);
+            }
             return stream;
         },
         {
@@ -346,18 +396,22 @@ export const downloadRoutes = new Elysia()
             // Increment download counter
             const newDl = await storage.incrementDownloadCount(id);
 
+            // Re-read the limit before destroying anything: the owner may have
+            // raised dlimit via /params since the snapshot above, and deleting
+            // against the stale value kills a file that is still within its
+            // (just-extended) limit. Mirrors the fire-time re-check that
+            // scheduleLimitDeletion already performs.
+            const dlimit = await readCurrentDownloadLimit(id, metadata.dlimit);
+
             // Check if download limit reached
-            if (newDl >= metadata.dlimit) {
-                logger.info(
-                    { id, dl: newDl, dlimit: metadata.dlimit },
-                    'Download limit reached, deleting file',
-                );
+            if (newDl >= dlimit) {
+                logger.info({ id, dl: newDl, dlimit }, 'Download limit reached, deleting file');
                 try {
                     await storage.del(id);
                 } catch (e) {
                     captureError(e, {
                         operation: 'download.delete-on-limit',
-                        extra: { id, dl: newDl, dlimit: metadata.dlimit },
+                        extra: { id, dl: newDl, dlimit },
                     });
                 }
                 // Backstop: if the delete failed, cap the metadata TTL so
@@ -365,10 +419,10 @@ export const downloadRoutes = new Elysia()
                 storage.redis.expire(id, 300).catch(() => {
                     // Non-critical — natural TTL still applies
                 });
-                return { deleted: true, dl: newDl, dlimit: metadata.dlimit };
+                return { deleted: true, dl: newDl, dlimit };
             }
 
-            return { deleted: false, dl: newDl, dlimit: metadata.dlimit };
+            return { deleted: false, dl: newDl, dlimit };
         },
         {
             detail: {
@@ -565,12 +619,17 @@ export const downloadRoutes = new Elysia()
             }
 
             if (dlimit !== undefined) {
-                await storage.setField(id, 'dlimit', dlimit.toString());
+                // Clamp exactly as the upload route does at creation — an
+                // unbounded dlimit makes the `dl >= dlimit` gate unreachable
+                // (unlimited egress) and a non-integer corrupts the Redis
+                // round-trip
+                const nextLimit = clampDownloadLimit(dlimit);
+                await storage.setField(id, 'dlimit', nextLimit.toString());
 
                 // If the limit-reached TTL backstop was applied and this raise
                 // makes the file downloadable again, restore the original expiry
                 const metadata = await storage.getMetadata(id);
-                if (metadata && metadata.dl < dlimit) {
+                if (metadata && metadata.dl < nextLimit) {
                     const expiresAt = await storage.getField(id, 'expiresAt');
                     if (expiresAt) {
                         const remaining = parseInt(expiresAt, 10) - Math.floor(Date.now() / 1000);
@@ -593,7 +652,7 @@ export const downloadRoutes = new Elysia()
             },
             body: t.Object({
                 owner_token: t.String(),
-                dlimit: t.Optional(t.Number()),
+                dlimit: t.Optional(t.Integer({ minimum: 1 })),
             }),
             response: {
                 200: t.Object({ success: t.Boolean() }),
