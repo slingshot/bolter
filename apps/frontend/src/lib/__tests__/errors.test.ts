@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FileReadError } from '@/lib/errors';
+import { FileReadError, LimitReachedError } from '@/lib/errors';
 
 describe('FileReadError', () => {
     it('includes the filename in the message', () => {
@@ -50,5 +50,31 @@ describe('FileReadError', () => {
     it('handles empty filename', () => {
         const error = new FileReadError('', new Error('empty'));
         expect(error.message).toContain('""');
+    });
+});
+
+describe('LimitReachedError', () => {
+    it('has name set to exactly "LimitReachedError"', () => {
+        // Consumers duck-type on `name` (it survives module duplication and
+        // cross-bundle instanceof mismatches), so this string is a contract.
+        expect(new LimitReachedError().name).toBe('LimitReachedError');
+    });
+
+    it('is an instance of Error', () => {
+        expect(new LimitReachedError()).toBeInstanceOf(Error);
+    });
+
+    it('carries a user-facing default message about the download limit', () => {
+        expect(new LimitReachedError().message).toMatch(/download limit/i);
+    });
+
+    it('accepts a custom message', () => {
+        expect(new LimitReachedError('no downloads left').message).toBe('no downloads left');
+    });
+
+    it('has a proper stack trace', () => {
+        const error = new LimitReachedError();
+        expect(error.stack).toBeDefined();
+        expect(error.stack).toContain('LimitReachedError');
     });
 });
