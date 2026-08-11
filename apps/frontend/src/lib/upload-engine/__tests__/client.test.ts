@@ -68,7 +68,6 @@ function makeJob(): EngineJob {
         partUrls: ['https://bucket.example/part-1'],
         partSize: 4,
         encrypted: false,
-        maxConcurrent: 1,
         declaredTotalSize: 4,
         source: { kind: 'blob', blob: new Blob([new Uint8Array([1, 2, 3, 4])]) },
     };

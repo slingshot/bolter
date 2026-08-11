@@ -25,7 +25,6 @@ describe('UploadProgress', () => {
             isUploading: false,
             uploadProgress: null,
             zippingProgress: null,
-            checkingSpeed: false,
             currentCanceller: null,
         });
     });
@@ -134,15 +133,6 @@ describe('UploadProgress', () => {
         });
         render(<UploadProgress />);
         expect(screen.getByText('Retrying... (1 retry)')).toBeInTheDocument();
-    });
-
-    it('shows "Checking speed..." when checkingSpeed is true', () => {
-        useAppStore.setState({
-            isUploading: true,
-            checkingSpeed: true,
-        });
-        render(<UploadProgress />);
-        expect(screen.getByText('Checking speed...')).toBeInTheDocument();
     });
 
     it('shows zipping progress when zippingProgress is set and upload has not started', () => {

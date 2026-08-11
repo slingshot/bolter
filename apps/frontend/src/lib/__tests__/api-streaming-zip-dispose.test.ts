@@ -136,10 +136,6 @@ describe('uploadFiles — streaming zip disposal (finding 34)', () => {
             'fetch',
             vi.fn((url: string) => {
                 const target = String(url);
-                if (target.includes('/upload/speedtest')) {
-                    // Fail the preflight fast — measureUploadSpeed returns 0
-                    return Promise.resolve(new Response('nope', { status: 500 }));
-                }
                 if (target.includes('/upload/url')) {
                     return Promise.resolve(
                         new Response(JSON.stringify(uploadUrlResponse()), {

@@ -19,13 +19,13 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 
 - **Optional E2E encryption** — toggle on per-upload; AES-GCM with HKDF key derivation, entirely client-side via the Web Crypto API
 - **Zero knowledge when encrypted** — the server never sees plaintext files or encryption keys
-- **Files up to 1 TB** — multipart uploads with adaptive part sizing and resumability
+- **Files up to 1 TB** — multipart uploads with server-derived part sizing and resumability
 - **Self-destructing links** — configurable expiration (5 min to 6 months) and download limits
 - **No accounts required** — generate a link, share it, done
 - **Resilient uploads** — multipart uploads run in a dedicated Web Worker with an OPFS staged-part store: byte-identical retries, wall-clock stall detection that survives background-tab throttling, crash/reload resume (including finishing an interrupted upload with no file re-selection, and replaying a completion whose response was lost), and one-click resume from persisted file handles on Chromium. Environments without worker/OPFS support fall back automatically to the main-thread pipeline (stall detection, offline awareness, progress-based retries, IndexedDB-backed resume, Safari/WebKit empty-chunk filtering for HEIC/HEVC compatibility); setting `localStorage['bolter:upload-engine'] = 'off'` forces the fallback
 - **Resilient downloads** — mid-stream failures resume via HTTP Range requests with stall detection and signed-URL refresh; every download is verified for completeness (and decryption integrity when encrypted) before it is reported successful
 - **Streaming saves** — encrypted, zipped and legacy multi-file downloads write straight to disk (File System Access API, with a service-worker stream for Safari/Firefox) instead of being buffered in memory, and a download only counts against the share's limit once the save has actually landed
-- **Adaptive speed** — preflight speed test measures your connection and picks optimal part sizes
+- **No preflight tax** — part size is derived from the file size on the server (`clamp(fileSize / 1000, 64 MiB, 128 MiB)`), so an upload starts on its first real byte instead of spending up to 10s and 500 MB measuring the connection first. R2 requires every non-trailing part to be the same size, so the choice cannot adapt mid-upload anyway
 - **Multi-provider S3** — dynamic storage provider management via API; seamlessly migrate between S3-compatible services (Cloudflare R2, Railway, AWS S3, etc.) while existing files remain accessible on their original provider
 - **Self-hostable** — Docker Compose, or run directly with Bun
 - **Fully customizable** — white-label with your own branding, limits, and expiration options via environment variables
@@ -232,8 +232,6 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `POST` | `/upload/url` | Request a pre-signed upload URL |
 | `POST` | `/upload/multipart/:id` | Initiate a multipart upload |
 | `POST` | `/upload/multipart/:id/resume` | List completed parts (for resuming uploads) |
-| `POST` | `/upload/speedtest` | Generate pre-signed URLs for speed test |
-| `POST` | `/upload/speedtest/cleanup` | Clean up speed test objects |
 | `GET` | `/download/url/:id` | Get a pre-signed download URL (`410` once the download limit is reached) |
 | `GET` | `/providers` | List all storage providers (admin) |
 | `GET` | `/providers/:id` | Get storage provider details (admin) |

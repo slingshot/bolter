@@ -1,18 +1,37 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { UPLOAD_LIMITS } from '@bolter/shared';
+import { PART_SIZING, UPLOAD_LIMITS } from '@bolter/shared';
 import { Elysia, t } from 'elysia';
 import { config, deriveBaseUrl } from '../config';
 import { captureError } from '../lib/sentry';
 import { uploadLogger as logger } from '../logger';
-import { getReapRecord, scheduleObjectReap, unscheduleObjectReap } from '../reaper';
+import { scheduleObjectReap, unscheduleObjectReap } from '../reaper';
 import { type CompletedPart, storage } from '../storage';
 import { providerRegistry } from '../storage/provider-registry';
 
 const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
-const DEFAULT_PART_SIZE = UPLOAD_LIMITS.DEFAULT_PART_SIZE;
 const MAX_PARTS = UPLOAD_LIMITS.MAX_PARTS;
 const MAX_PART_SIZE = UPLOAD_LIMITS.MAX_PART_SIZE;
 const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
+
+/**
+ * Bound on trailing-part correction passes. `partSize` is MiB-aligned and the
+ * recomputed value strictly exceeds the previous one, so it grows by at least
+ * 1 MiB per pass, `numParts` is strictly decreasing, and the loop converges.
+ *
+ * Measured at 1 MiB granularity across the whole legal range: **5** passes
+ * worst case (at `fileSize` 4,567,982,337), and 913,036 of 953,579 inputs need
+ * none at all. Sample coarsely and you will not see this — every-1MB-to-2GB
+ * plus every-1GB-to-1TB tops out at 2, which is how an earlier "at most 3"
+ * claim here managed to be wrong in both directions.
+ *
+ * The bound exists so a future change to the sizing constants surfaces as a
+ * loud failure rather than a hang; it is deliberately far above 5 so ordinary
+ * retuning does not trip it.
+ */
+const MAX_TRAILING_PART_PASSES = 64;
+
+const MiB = 1024 * 1024;
+const ceilToMiB = (bytes: number) => Math.ceil(bytes / MiB) * MiB;
 
 interface PartInfo {
     partNumber: number;
@@ -21,18 +40,20 @@ interface PartInfo {
     maxSize: number;
 }
 
-export function calculateOptimalPartSize(
-    fileSize: number,
-    preferredPartSize?: number,
-): { partSize: number; numParts: number } {
-    let partSize = DEFAULT_PART_SIZE;
-
-    // Use client-preferred part size if provided and within valid bounds
-    if (preferredPartSize) {
-        if (preferredPartSize >= MIN_PART_SIZE && preferredPartSize <= MAX_PART_SIZE) {
-            partSize = preferredPartSize;
-        }
-    }
+/**
+ * Part size for a multipart upload, from file size alone.
+ *
+ * The client used to measure its own bandwidth with a 5x100MB/10s synthetic
+ * probe and send back a tier; that cost up to 500MB per upload to make a
+ * four-way choice, and R2's uniform-part requirement means the answer can
+ * never be revised mid-upload anyway. Deriving it here makes the decision
+ * reproducible from `fileSize` and keeps it in one place.
+ */
+export function calculateOptimalPartSize(fileSize: number): { partSize: number; numParts: number } {
+    let partSize = Math.min(
+        PART_SIZING.CEILING,
+        Math.max(PART_SIZING.FLOOR, ceilToMiB(fileSize / PART_SIZING.TARGET_PART_COUNT)),
+    );
 
     let numParts = Math.ceil(fileSize / partSize);
 
@@ -43,22 +64,34 @@ export function calculateOptimalPartSize(
             throw new Error('File too large: would require parts larger than 5GB limit');
         }
 
-        partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+        partSize = ceilToMiB(partSize);
         numParts = Math.ceil(fileSize / partSize);
     }
 
-    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MiB)
-    // This prevents R2 EntityTooSmall errors when compressed/encrypted size
-    // lands just above a multiple of partSize
-    if (numParts > 1) {
+    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MiB).
+    // R2 rejects a sub-5MiB non-trailing part as EntityTooSmall *after* the
+    // client has transferred every byte, so this must hold on every input.
+    //
+    // This is a loop, not a single pass. The recomputed, MiB-aligned partSize
+    // can itself leave a trailing part under the minimum: 529,000,001 bytes on
+    // 25MB parts and 616GB on 50MB parts both allocated illegally under the
+    // one-pass version. `numParts = ceil(fileSize / partSize)` guarantees the
+    // trailing part is > 0 on entry, so only the lower bound needs testing.
+    let trailingPasses = 0;
+    while (numParts > 1) {
         const lastPartSize = fileSize - (numParts - 1) * partSize;
-        if (lastPartSize > 0 && lastPartSize < MIN_PART_SIZE) {
-            numParts = numParts - 1;
-            partSize = Math.ceil(fileSize / numParts);
-            // Align to MB boundary
-            partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
-            numParts = Math.ceil(fileSize / partSize);
+        if (lastPartSize >= MIN_PART_SIZE) {
+            break;
         }
+        if (++trailingPasses > MAX_TRAILING_PART_PASSES) {
+            throw new Error(
+                `Part sizing failed to converge: fileSize=${fileSize} partSize=${partSize} numParts=${numParts}`,
+            );
+        }
+        numParts = numParts - 1;
+        // Align to MB boundary
+        partSize = ceilToMiB(Math.ceil(fileSize / numParts));
+        numParts = Math.ceil(fileSize / partSize);
     }
 
     return { partSize, numParts };
@@ -211,55 +244,6 @@ async function authorizeUploadMutation(
     return false;
 }
 
-// --- Speed-test rate limiting (#11) ---------------------------------------
-// `POST /upload/speedtest` is unauthenticated and each call mints 5 pre-signed
-// UploadPart URLs with no size constraint — an unbounded, repeatable write
-// amplification into billable incomplete-multipart storage.
-
-const SPEEDTEST_PREFIX = '__speedtest__';
-const SPEEDTEST_RATE_LIMIT = 5;
-const SPEEDTEST_RATE_WINDOW_MS = 5 * 60 * 1000;
-// A speed test that is never cleaned up by the client is swept by the reaper
-const SPEEDTEST_REAP_AFTER_MS = 15 * 60 * 1000;
-
-export class FixedWindowRateLimiter {
-    private readonly hits = new Map<string, number[]>();
-
-    constructor(
-        private readonly limit: number,
-        private readonly windowMs: number,
-    ) {}
-
-    take(key: string, now: number = Date.now()): boolean {
-        const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
-        if (recent.length >= this.limit) {
-            this.hits.set(key, recent);
-            return false;
-        }
-        recent.push(now);
-        this.hits.set(key, recent);
-
-        // Bound memory — drop buckets whose entries have all aged out
-        if (this.hits.size > 1000) {
-            for (const [k, times] of this.hits) {
-                if (times.every((t) => now - t >= this.windowMs)) {
-                    this.hits.delete(k);
-                }
-            }
-        }
-        return true;
-    }
-
-    reset(): void {
-        this.hits.clear();
-    }
-}
-
-export const speedTestRateLimiter = new FixedWindowRateLimiter(
-    SPEEDTEST_RATE_LIMIT,
-    SPEEDTEST_RATE_WINDOW_MS,
-);
-
 /**
  * Authoritative remaining lifetime of a file, read from the Redis TTL.
  *
@@ -284,31 +268,12 @@ async function readRemainingLifetime(id: string): Promise<{ expiresAt: number; t
     return { expiresAt: Date.now() + ttlSeconds * 1000, ttl: ttlSeconds };
 }
 
-/**
- * Visitor IP for rate limiting. `cf-connecting-ip` first — Cloudflare sets it to
- * the real visitor and it survives edge rewrites of `x-forwarded-for`.
- */
-export function clientIp(request: Request): string {
-    const cf = request.headers.get('cf-connecting-ip');
-    if (cf) {
-        return cf.trim();
-    }
-    const forwarded = request.headers.get('x-forwarded-for');
-    if (forwarded) {
-        const first = forwarded.split(',')[0]?.trim();
-        if (first) {
-            return first;
-        }
-    }
-    return 'unknown';
-}
-
 export const uploadRoutes = new Elysia()
     // Get upload URL(s)
     .post(
         '/upload/url',
         async ({ body, request, set }) => {
-            const { fileSize, encrypted, timeLimit, dlimit, preferredPartSize } = body;
+            const { fileSize, encrypted, timeLimit, dlimit } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info(
@@ -424,10 +389,7 @@ export const uploadRoutes = new Elysia()
             );
 
             if (useMultipart) {
-                const { partSize, numParts } = calculateOptimalPartSize(
-                    fileSize,
-                    preferredPartSize,
-                );
+                const { partSize, numParts } = calculateOptimalPartSize(fileSize);
 
                 logger.info(
                     {
@@ -682,6 +644,12 @@ export const uploadRoutes = new Elysia()
                 // value on the parseInt round-trip
                 timeLimit: t.Optional(t.Integer({ minimum: 1 })),
                 dlimit: t.Optional(t.Integer({ minimum: 1 })),
+                /**
+                 * Accepted and ignored. Browsers cache the old bundle, which
+                 * still sends a speed-test-derived tier; removing the field
+                 * risks a 400 for those clients depending on how Elysia treats
+                 * unknown properties. Delete one release after this ships.
+                 */
                 preferredPartSize: t.Optional(t.Number()),
             }),
             response: {
@@ -1292,7 +1260,8 @@ export const uploadRoutes = new Elysia()
             }
 
             const numParts = fileInfo.numParts || 0;
-            const partSize = Number(fileInfo.partSize || DEFAULT_PART_SIZE);
+            // Defensive only: `partSize` is always written at allocation.
+            const partSize = Number(fileInfo.partSize || PART_SIZING.FLOOR);
             const completedSet = new Set(completedPartNumbers);
 
             // Generate pre-signed URLs for parts NOT in completedPartNumbers
@@ -1364,167 +1333,6 @@ export const uploadRoutes = new Elysia()
                 400: t.Object({ error: t.String() }),
                 401: t.Object({ error: t.String() }),
                 404: t.Object({ error: t.String() }),
-            },
-        },
-    )
-
-    // Speed test — creates a multipart upload with 5 pre-signed part URLs.
-    // The client uploads 5x100MB parts concurrently to measure real throughput.
-    .post(
-        '/upload/speedtest',
-        async ({ request, set }) => {
-            const SPEEDTEST_NUM_PARTS = 5;
-            const testId = `${SPEEDTEST_PREFIX}${randomBytes(8).toString('hex')}`;
-
-            // Unauthenticated write amplification: each call mints 5 unbounded
-            // pre-signed UploadPart URLs, so an unthrottled loop can park
-            // terabytes of list-invisible incomplete-multipart data in the bucket
-            if (!speedTestRateLimiter.take(clientIp(request))) {
-                logger.warn({ testId }, 'Speed test rate limit exceeded');
-                set.status = 429;
-                return { error: 'Too many speed test requests' };
-            }
-
-            // Pin the provider for the whole test so cleanup can't abort against
-            // a different bucket after a concurrent provider activation
-            const providerId = storage.getActiveProviderId();
-
-            let uploadId: string | null = null;
-            try {
-                uploadId = await storage.createMultipartUpload(testId, undefined, providerId);
-                if (!uploadId) {
-                    return { error: 'Failed to create speed test upload' };
-                }
-
-                const parts = await Promise.all(
-                    Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
-                        storage
-                            .getSignedMultipartUploadUrl(
-                                testId,
-                                uploadId as string,
-                                i + 1,
-                                60,
-                                providerId,
-                            )
-                            .then((url) => ({ partNumber: i + 1, url })),
-                    ),
-                );
-
-                // Cleanup must not depend on the client coming back: register the
-                // test so the reaper aborts it if /speedtest/cleanup never arrives
-                await scheduleObjectReap({
-                    kind: 'speedtest',
-                    id: testId,
-                    providerId,
-                    uploadId,
-                    expiresAt: Date.now() + SPEEDTEST_REAP_AFTER_MS,
-                });
-
-                logger.info(
-                    { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS, providerId },
-                    'Speed test URLs generated',
-                );
-                return { testId, uploadId, parts };
-            } catch (e) {
-                logger.warn({ testId, error: e }, 'Speed test setup failed');
-                if (uploadId) {
-                    await storage
-                        .abortMultipartUpload(testId, uploadId, providerId)
-                        .catch(() => undefined);
-                }
-                return { error: 'Speed test setup failed' };
-            }
-        },
-        {
-            detail: {
-                tags: ['Speed Test'],
-                summary: 'Start upload speed test',
-                description:
-                    'Creates a temporary multipart upload with 5 pre-signed part URLs for measuring upload throughput. Rate limited per client IP; abandoned tests are swept server-side.',
-            },
-            response: {
-                200: t.Object({
-                    testId: t.Optional(t.String()),
-                    uploadId: t.Optional(t.String()),
-                    parts: t.Optional(
-                        t.Array(
-                            t.Object({
-                                partNumber: t.Number(),
-                                url: t.String(),
-                            }),
-                        ),
-                    ),
-                    error: t.Optional(t.String()),
-                }),
-                429: t.Object({
-                    error: t.String(),
-                }),
-            },
-        },
-    )
-
-    // Clean up speed test object after the test completes
-    .post(
-        '/upload/speedtest/cleanup',
-        async ({ body, set }) => {
-            const { testId, uploadId } = body;
-
-            // This route aborts an arbitrary uploadId — restrict it to keys the
-            // speed test could actually have created
-            if (!testId.startsWith(SPEEDTEST_PREFIX)) {
-                logger.warn({ testId }, 'Speed test cleanup rejected — not a speed test id');
-                set.status = 400;
-                return { ok: false, error: 'Invalid speed test id' };
-            }
-
-            // Use the provider pinned at creation time; resolving "active" here
-            // would abort against the wrong bucket after a provider change and
-            // leak the real test parts behind a swallowed NoSuchUpload
-            const record = await getReapRecord(testId);
-
-            let cleaned = true;
-            try {
-                // Abort the multipart upload (cleans up parts from S3)
-                const effectiveUploadId = uploadId || record?.uploadId;
-                if (effectiveUploadId) {
-                    await storage.abortMultipartUpload(
-                        testId,
-                        effectiveUploadId,
-                        record?.providerId,
-                    );
-                }
-                logger.info({ testId }, 'Speed test cleaned up');
-            } catch (e) {
-                cleaned = false;
-                logger.warn({ testId, error: e }, 'Failed to clean up speed test');
-            }
-
-            // Drop the sweep record only if the abort actually succeeded —
-            // otherwise leave it so the reaper retries the cleanup
-            if (cleaned) {
-                await unscheduleObjectReap(testId);
-            }
-            return { ok: true };
-        },
-        {
-            detail: {
-                tags: ['Speed Test'],
-                summary: 'Clean up speed test',
-                description:
-                    'Aborts the temporary multipart upload created by the speed test, removing all test parts from S3.',
-            },
-            body: t.Object({
-                testId: t.String(),
-                uploadId: t.Optional(t.String()),
-            }),
-            response: {
-                200: t.Object({
-                    ok: t.Boolean(),
-                }),
-                400: t.Object({
-                    ok: t.Boolean(),
-                    error: t.String(),
-                }),
             },
         },
     );

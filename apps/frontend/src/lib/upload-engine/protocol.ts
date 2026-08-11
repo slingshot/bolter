@@ -18,7 +18,6 @@ export interface EngineJob {
     partSize: number; // nominal per-part payload size (ciphertext size when encrypted)
     encrypted: boolean;
     secretKeyB64?: string;
-    maxConcurrent: number;
     declaredTotalSize: number; // payload bytes declared at allocation (ciphertext when encrypted)
     source: EngineSource;
 }

@@ -24,7 +24,15 @@ import { redis } from './storage/redis';
 export const REAP_KEY = 'bolter:reap';
 
 export interface ReapRecord {
-    /** 'file' records are gated on the metadata key being gone; 'speedtest' are not */
+    /**
+     * 'file' records are gated on the metadata key being gone; 'speedtest' are not.
+     *
+     * Nothing writes 'speedtest' any more — `POST /upload/speedtest` was deleted
+     * along with the preflight probe. The kind is retained deliberately: records
+     * live for 15 minutes, so some were still in Redis across that deploy, and
+     * they are not gated on a metadata key they never had. Safe to drop once no
+     * pre-deletion record can remain.
+     */
     kind: 'file' | 'speedtest';
     id: string;
     providerId?: string;

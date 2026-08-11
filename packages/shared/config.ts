@@ -12,7 +12,6 @@ export const BYTES = {
 export const UPLOAD_LIMITS = {
     MAX_FILE_SIZE: 1 * BYTES.TB, // 1TB max file size
     MULTIPART_THRESHOLD: 100 * BYTES.MB, // Use multipart for files > 100MB
-    DEFAULT_PART_SIZE: 200 * BYTES.MB, // 200MB per part (increased for 1TB support)
     MAX_PART_SIZE: 5 * BYTES.GB, // 5GB per part (R2/S3 limit)
     MIN_PART_SIZE: 5 * 1024 * 1024, // 5 MiB (5,242,880) — S3/R2 enforce MiB for non-trailing parts, not decimal MB
     MAX_PARTS: 10000, // Cloudflare R2 limit
@@ -37,6 +36,27 @@ export const UPLOAD_LIMITS = {
     MAX_REQUEST_BODY_BYTES: 4 * 1024 * 1024,
 } as const;
 
+/**
+ * Multipart part sizing, derived from file size alone.
+ *
+ * R2 requires every non-trailing part to be the same size (error 10048), so
+ * part size is decided once at allocation and can never adapt mid-upload —
+ * which is why measuring the client's bandwidth first was never worth its
+ * cost. Two facts set the bounds:
+ *
+ * - Writes per second against one object key equal `throughput / partSize`,
+ *   independent of concurrency. R2 documents a 1 write/sec/key limit; whether
+ *   it covers UploadPart is not stated, so FLOOR buys headroom (~1.5/sec even
+ *   on a 100 MB/s link) rather than betting on the permissive reading.
+ * - MAX_PARTS is 10,000. CEILING keeps the 1TB worst case at 7,451 parts.
+ */
+export const PART_SIZING = {
+    /** Aim for ~1000 parts; FLOOR and CEILING override this at both ends. */
+    TARGET_PART_COUNT: 1000,
+    FLOOR: 64 * 1024 * 1024,
+    CEILING: 128 * 1024 * 1024,
+} as const;
+
 // Time limits in seconds
 export const TIME_LIMITS = {
     MAX_EXPIRE_SECONDS: 86400 * 180, // 6 months
@@ -51,15 +71,6 @@ export const DOWNLOAD_LIMITS = {
     DEFAULT_DOWNLOADS: 1,
     DOWNLOAD_COUNTS: [1, 2, 3, 4, 5, 20, 50, 100],
 } as const;
-
-// Part size tiers based on observed upload speed
-// Slower connections use smaller parts to reduce wasted bandwidth on retries
-export const PART_SIZE_TIERS = [
-    { minSpeed: 50 * BYTES.MB, partSize: 200 * BYTES.MB }, // ≥50 MB/s
-    { minSpeed: 10 * BYTES.MB, partSize: 100 * BYTES.MB }, // 10-50 MB/s
-    { minSpeed: 2 * BYTES.MB, partSize: 50 * BYTES.MB }, // 2-10 MB/s
-    { minSpeed: 0, partSize: 25 * BYTES.MB }, // <2 MB/s
-] as const;
 
 // UI defaults
 export const UI_DEFAULTS = {

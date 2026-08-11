@@ -70,7 +70,8 @@ bolter/
 │   ├── frontend/          # React 18 + Vite + Tailwind CSS
 │   │   └── src/
 │   │       ├── components/   # UI components (Radix UI primitives)
-│   │       ├── lib/          # Core logic: crypto, API, upload state
+│   │       ├── lib/          # Core logic: crypto, API, upload/download state
+│   │       │   └── upload-engine/  # Worker+OPFS upload engine (default multipart path)
 │   │       ├── pages/        # Route pages (Home, Download)
 │   │       └── stores/       # Zustand state management
 │   │
@@ -95,14 +96,15 @@ bolter/
 | File | Purpose |
 |------|---------|
 | `apps/frontend/src/lib/crypto.ts` | AES-GCM encryption, HKDF key derivation |
-| `apps/frontend/src/lib/api.ts` | S3 multipart uploads, stall detection, adaptive part sizing |
-| `apps/frontend/src/lib/upload-state.ts` | IndexedDB persistence for upload resumability |
+| `apps/frontend/src/lib/api.ts` | Legacy S3 multipart pipeline, download logic, stall detection, worker-engine delegation |
+| `apps/frontend/src/lib/upload-engine/` | Worker+OPFS upload engine — the default path for multipart uploads (see `AGENTS.md` for the pipeline) |
+| `apps/frontend/src/lib/upload-state.ts` | IndexedDB persistence for *legacy* upload resumability (the engine uses its own DB) |
 | `apps/frontend/src/stores/app.ts` | Zustand store (upload state, config, files) |
-| `apps/backend/src/routes/upload.ts` | Pre-signed URL generation, multipart orchestration |
+| `apps/backend/src/routes/upload.ts` | Pre-signed URL generation, multipart orchestration, part sizing (`calculateOptimalPartSize`) |
 | `apps/backend/src/routes/download.ts` | URL signing, download count enforcement |
 | `apps/backend/src/storage/s3.ts` | S3 client abstraction |
 | `apps/backend/src/storage/redis.ts` | Redis metadata operations with TTL |
-| `packages/shared/config.ts` | Shared constants (sizes, limits, part size tiers) |
+| `packages/shared/config.ts` | Shared constants (sizes, limits, `PART_SIZING` bounds) |
 
 ## Development Workflow
 

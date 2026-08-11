@@ -64,6 +64,19 @@
         }
     },
     "files": {
-        "includes": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.json"]
+        "includes": [
+            "**/*.ts",
+            "**/*.tsx",
+            "**/*.js",
+            "**/*.jsx",
+            "**/*.json",
+            "!**/node_modules",
+            "!**/dist",
+            "!**/build",
+            "!**/.turbo",
+            "!**/coverage",
+            "!**/playwright-report",
+            "!**/test-results"
+        ]
     }
 }

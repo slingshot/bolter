@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import {
     BYTES,
     DOWNLOAD_LIMITS,
-    PART_SIZE_TIERS,
+    PART_SIZING,
     TIME_LIMITS,
     UI_DEFAULTS,
     UPLOAD_LIMITS,
@@ -42,10 +42,6 @@ describe('UPLOAD_LIMITS', () => {
         expect(UPLOAD_LIMITS.MULTIPART_THRESHOLD).toBe(100 * BYTES.MB);
     });
 
-    it('should set DEFAULT_PART_SIZE to 200 MB', () => {
-        expect(UPLOAD_LIMITS.DEFAULT_PART_SIZE).toBe(200 * BYTES.MB);
-    });
-
     it('should set MAX_PART_SIZE to 5 GB', () => {
         expect(UPLOAD_LIMITS.MAX_PART_SIZE).toBe(5 * BYTES.GB);
     });
@@ -69,61 +65,32 @@ describe('UPLOAD_LIMITS', () => {
         expect(partsNeeded).toBeLessThanOrEqual(UPLOAD_LIMITS.MAX_PARTS);
     });
 
-    it('should have MAX_FILE_SIZE / DEFAULT_PART_SIZE within MAX_PARTS', () => {
-        // The default part size should allow MAX_FILE_SIZE uploads without exceeding MAX_PARTS
-        const partsNeeded = Math.ceil(
-            UPLOAD_LIMITS.MAX_FILE_SIZE / UPLOAD_LIMITS.DEFAULT_PART_SIZE,
-        );
-        expect(partsNeeded).toBeLessThanOrEqual(UPLOAD_LIMITS.MAX_PARTS);
-    });
-
-    it('should have DEFAULT_PART_SIZE between MIN and MAX', () => {
-        expect(UPLOAD_LIMITS.DEFAULT_PART_SIZE).toBeGreaterThanOrEqual(UPLOAD_LIMITS.MIN_PART_SIZE);
-        expect(UPLOAD_LIMITS.DEFAULT_PART_SIZE).toBeLessThanOrEqual(UPLOAD_LIMITS.MAX_PART_SIZE);
-    });
-
     it('should have MULTIPART_THRESHOLD less than MAX_FILE_SIZE', () => {
         expect(UPLOAD_LIMITS.MULTIPART_THRESHOLD).toBeLessThan(UPLOAD_LIMITS.MAX_FILE_SIZE);
     });
 });
 
-describe('PART_SIZE_TIERS', () => {
-    it('should be sorted descending by minSpeed', () => {
-        for (let i = 1; i < PART_SIZE_TIERS.length; i++) {
-            expect(PART_SIZE_TIERS[i].minSpeed).toBeLessThan(PART_SIZE_TIERS[i - 1].minSpeed);
-        }
+describe('PART_SIZING', () => {
+    it('should keep the worst case inside R2 MAX_PARTS', () => {
+        // The ceiling is the only thing standing between a 1TB upload and the
+        // 10,000-part limit.
+        expect(UPLOAD_LIMITS.MAX_FILE_SIZE / PART_SIZING.CEILING).toBeLessThan(
+            UPLOAD_LIMITS.MAX_PARTS,
+        );
     });
 
-    it('should have the last tier with minSpeed = 0 (catch-all)', () => {
-        const lastTier = PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1];
-        expect(lastTier.minSpeed).toBe(0);
+    it('should keep both bounds inside R2 part-size limits', () => {
+        expect(PART_SIZING.FLOOR).toBeGreaterThanOrEqual(UPLOAD_LIMITS.MIN_PART_SIZE);
+        expect(PART_SIZING.CEILING).toBeLessThanOrEqual(UPLOAD_LIMITS.MAX_PART_SIZE);
+        expect(PART_SIZING.FLOOR).toBeLessThanOrEqual(PART_SIZING.CEILING);
     });
 
-    it('should have all partSizes within MIN_PART_SIZE and MAX_PART_SIZE bounds', () => {
-        for (const tier of PART_SIZE_TIERS) {
-            expect(tier.partSize).toBeGreaterThanOrEqual(UPLOAD_LIMITS.MIN_PART_SIZE);
-            expect(tier.partSize).toBeLessThanOrEqual(UPLOAD_LIMITS.MAX_PART_SIZE);
-        }
-    });
-
-    it('should have partSizes sorted descending (faster speed = larger parts)', () => {
-        for (let i = 1; i < PART_SIZE_TIERS.length; i++) {
-            expect(PART_SIZE_TIERS[i].partSize).toBeLessThanOrEqual(
-                PART_SIZE_TIERS[i - 1].partSize,
-            );
-        }
-    });
-
-    it('should have exactly 4 tiers', () => {
-        expect(PART_SIZE_TIERS).toHaveLength(4);
-    });
-
-    it('should have the fastest tier at 200 MB partSize', () => {
-        expect(PART_SIZE_TIERS[0].partSize).toBe(200 * BYTES.MB);
-    });
-
-    it('should have the slowest tier at 25 MB partSize', () => {
-        expect(PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize).toBe(25 * BYTES.MB);
+    it('should keep the write rate against one key at or below ~1.5/sec on a fast link', () => {
+        // writes/sec against a key = throughput / partSize, independent of
+        // concurrency. R2 documents 1 write/sec/key; whether that covers
+        // UploadPart is unstated, so the floor buys headroom.
+        const fastLinkBytesPerSecond = 100_000_000;
+        expect(fastLinkBytesPerSecond / PART_SIZING.FLOOR).toBeLessThan(1.6);
     });
 });
 
