@@ -14,11 +14,19 @@ const MAX_PART_SIZE = UPLOAD_LIMITS.MAX_PART_SIZE;
 const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
 
 /**
- * Bound on trailing-part correction passes. `partSize` only grows across
- * iterations, so `numParts` is monotonically non-increasing and the loop
- * converges — a full sweep of every 1 MB from the multipart threshold to 2 GB
- * and every 1 GB to 1 TB needs at most 3. This exists so a future change to the
- * sizing constants surfaces as a loud failure rather than a hang.
+ * Bound on trailing-part correction passes. `partSize` is MiB-aligned and the
+ * recomputed value strictly exceeds the previous one, so it grows by at least
+ * 1 MiB per pass, `numParts` is strictly decreasing, and the loop converges.
+ *
+ * Measured at 1 MiB granularity across the whole legal range: **5** passes
+ * worst case (at `fileSize` 4,567,982,337), and 913,036 of 953,579 inputs need
+ * none at all. Sample coarsely and you will not see this — every-1MB-to-2GB
+ * plus every-1GB-to-1TB tops out at 2, which is how an earlier "at most 3"
+ * claim here managed to be wrong in both directions.
+ *
+ * The bound exists so a future change to the sizing constants surfaces as a
+ * loud failure rather than a hang; it is deliberately far above 5 so ordinary
+ * retuning does not trip it.
  */
 const MAX_TRAILING_PART_PASSES = 64;
 

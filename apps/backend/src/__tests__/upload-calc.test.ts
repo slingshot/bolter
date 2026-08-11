@@ -121,29 +121,26 @@ describe('calculateOptimalPartSize invariants (sweep)', () => {
         const { partSize, numParts } = calculateOptimalPartSize(fileSize);
         const trailing = numParts > 1 ? fileSize - (numParts - 1) * partSize : fileSize;
 
-        // MiB alignment is deliberately outside this sweep: it describes how a
-        // part size is derived, not whether an allocation is legal, and R2
-        // enforces no such rule. The `align part size to MB boundary when
-        // auto-adjusting` case above covers the paths that recompute it.
-        //
         // Messages carry fileSize so a sweep failure is reproducible from the output.
         expect(numParts, `numParts for ${fileSize}`).toBeLessThanOrEqual(MAX_PARTS);
         expect(numParts, `numParts for ${fileSize}`).toBeGreaterThanOrEqual(1);
         expect(partSize, `partSize for ${fileSize}`).toBeLessThanOrEqual(MAX_PART_SIZE);
+        // Every path that sets partSize runs it through ceilToMiB, so alignment
+        // is unconditional. Asserting it here catches a future path that forgets.
+        expect(partSize % MB, `MiB alignment for ${fileSize}`).toBe(0);
         expect(numParts * partSize, `coverage for ${fileSize}`).toBeGreaterThanOrEqual(fileSize);
         if (numParts > 1) {
             expect(trailing, `trailing part for ${fileSize}`).toBeGreaterThanOrEqual(MIN_PART_SIZE);
         }
     }
 
-    it('should hold every 1MB from the multipart threshold to 2GB', () => {
-        for (let size = MULTIPART_THRESHOLD + 1; size < 2_000_000_000; size += 1_000_000) {
-            assertLegal(size);
-        }
-    });
-
-    it('should hold every 1GB from 2GB to MAX_FILE_SIZE', () => {
-        for (let size = 2_000_000_000; size <= MAX_FILE_SIZE; size += 1_000_000_000) {
+    // 1 MiB granularity across the WHOLE range, not 1 GB above 2 GB. Coarse
+    // sampling is why three wrong numbers reached the spec: every-1GB misses
+    // the 4-and-5-pass convergence cases entirely (it tops out at 2) and never
+    // sees the 130 MiB ceiling overshoot. ~953k inputs, a couple of seconds.
+    it('should hold at 1 MiB granularity across the entire legal range', () => {
+        const MiB = 1024 * 1024;
+        for (let size = MULTIPART_THRESHOLD + 1; size <= MAX_FILE_SIZE; size += MiB) {
             assertLegal(size);
         }
     });
@@ -155,6 +152,9 @@ describe('calculateOptimalPartSize invariants (sweep)', () => {
             MAX_FILE_SIZE - 1,
             115_000_000_000, // failed under the single-pass adjustment
             779_000_000_000, // failed under the single-pass adjustment
+            529_000_001, // fails TODAY on the 25MB tier (4.49 MiB trailing)
+            616_000_000_000, // fails TODAY on the 50MB tier (3.4 MiB trailing)
+            4_567_982_337, // worst observed convergence: 5 correction passes
         ]) {
             assertLegal(size);
         }

@@ -169,7 +169,9 @@ rejects as `10011 EntityTooSmall`. The adjustment drops to 149 parts, recomputes
 65 MiB / 147 parts. Two consequences the implementation must respect:
 
 - **`CEILING` is a target, not a hard cap.** The adjustment recomputes `partSize` upward and can
-  land slightly above 128 MiB (129 MiB, on 32 of the swept inputs). This is safe (three orders of
+  land slightly above 128 MiB — **130 MiB** max, first reached at `fileSize` 137,976,209,665, with
+  32,290 of the 1-MiB-granularity inputs above the ceiling. (An earlier draft said "129 MiB on 32
+  inputs"; both figures were artefacts of a 1 GB sampling step.) This is safe (three orders of
   magnitude below `MAX_PART_SIZE`) and correct — the trailing-part minimum outranks the sizing
   preference — but tests must not assert `partSize <= CEILING`. Assert `partSize <= MAX_PART_SIZE`.
 - **Part size is not drawn from a fixed set.** Anything downstream assuming a part size from a small
@@ -212,7 +214,10 @@ while (numParts > 1 && guard++ < 64) {
 ```
 
 `partSize` only ever grows across iterations, so `numParts` is monotonically non-increasing and the
-loop converges — measured worst case over the full sweep is **3 iterations**. The `guard` is a
+loop converges — measured worst case at 1 MiB granularity across the whole legal range is
+**5 iterations** (at `fileSize` 4,567,982,337); 913,036 of 953,579 inputs need none. (An earlier
+draft said 3. It was wrong in both directions: the coarse every-1MB-to-2GB-then-every-1GB sweep this
+spec originally specified tops out at 2 and never sees the 4- and 5-pass cases at all.) The `guard` is a
 belt-and-braces bound against a future constant change introducing a cycle, not a live concern; it
 must not be silently swallowed, so exhausting it should throw rather than return an illegal
 allocation. With the loop in place the sweep reports zero failures across every invariant.
@@ -235,18 +240,43 @@ const windowSize     = clamp(Math.floor(MAX_STAGED_BYTES / partSize), 3, 10);
 const maxConcurrency = Math.max(2, windowSize - WINDOW_SLACK);
 ```
 
-Derived from the *final* `partSize` — after the trailing-part adjustment, not before:
+**CORRECTED 2026-08-11.** The version of this section that was approved and implemented divided the
+budget by `windowSize` alone. That was wrong, and an adversarial review caught it after
+implementation: `takeNextPart` frees a window slot when an uploader **picks a part up**, not when
+its bytes are deleted, and an in-flight part stays on disk for its entire transfer because every
+attempt re-reads it from the store. Peak residency is therefore `windowSize + maxConcurrent` parts.
+The original tiers claimed 640 MiB and really held **1,152 MiB** at the common 64 MiB part size —
+1.8x over. The test specified in §6 asserted `windowSize * partSize <= budget`, which re-stated the
+same wrong model rather than measuring the footprint, so nothing caught it.
 
-| partSize | window | concurrency cap | OPFS staged | reached by |
+The budget must be divided by `windowSize + maxConcurrent`. Derived from the *final* `partSize` —
+after the trailing-part adjustment, not before:
+
+| partSize | window | pool cap | **resident** | reached by |
 |---|---|---|---|---|
-| 64 MiB | 10 | 8 | 640 MiB | ≤ 5 GB |
-| 65 MiB | 9 | 7 | 585 MiB | 10–50 GB (adjusted) |
-| 96 MiB | 6 | 4 | 576 MiB | ~100 GB |
-| 128 MiB | 5 | 3 | 640 MiB | ≥ ~137 GB |
+| 64 MiB | 6 | 4 | 640 MiB | ≤ 5 GB |
+| 65 MiB | 5 | 3 | 520 MiB | 10–50 GB (adjusted) |
+| 96 MiB | 4 | 2 | 576 MiB | ~100 GB |
+| 128 MiB | 3 | 2 | 640 MiB | ≥ ~137 GB |
+| 130 MiB | 3 | 2 | 650 MiB | trailing-part overshoot |
+
+**Why 640 MiB rather than raising the budget to fit the old tiers.** The binding constraint is
+Safari, not Chromium. Safari 17 (iOS 17 / macOS Sonoma) replaced the flat 1 GB per-origin quota with
+~60% of total disk, but **iOS 16 and earlier still enforce 1 GB**, and `navigator.storage.persist()`
+only exempts an origin from eviction in WebKit — unlike Firefox, it never raises the quota. 650 MiB
+worst case leaves 374 MiB of margin under the legacy cap. There is also no production evidence to
+lean on: the engine's Safari path was broken by the `move()` arity bug from the day it shipped until
+`bfe96ba8` (2026-08-11), so no Safari upload has ever exercised the staging window at any size.
+
+**The throughput cost is negligible**, which is why this is not a hard trade. At a 64 MiB part size
+on a 100 MB/s link, four uploaders idle ~3.6% of the time against ~1.8% for eight — parts this large
+already amortise request turnaround almost completely. Concurrency mattered when the floor under
+consideration was 16 MiB; at 64 MiB it barely does.
 
 The stager needs **no change** — it still receives a fixed `windowSize` at construction. Only the
-computation of that number moves. Note the `clamp(…, 3, 10)` lower bound is what guarantees
-`windowSize >= maxConcurrency`, so uploaders can never starve on an over-tight window.
+computation of that number moves. The `clamp(…, 3, 10)` lower bound guarantees
+`windowSize > maxConcurrency`, so uploaders can never starve on an over-tight window; above 128 MiB
+parts that floor outranks the budget, which is the 650 MiB overshoot in the table.
 
 ## 4. Adaptive concurrency
 
@@ -317,7 +347,7 @@ Two deliberate holdbacks:
 | `apps/backend/src/__tests__/upload-calc.test.ts` | Rewrite for the one-argument formula. Table-driven across the nine sizes in §2, asserting `partSize`, `numParts`, `numParts <= MAX_PARTS`, `partSize <= MAX_PART_SIZE` (**not** `<= CEILING` — the trailing-part fix may exceed it), and trailing part `>= MIN_PART_SIZE`. **Must include 10 GB and 50 GB**, the sizes where the adjustment fires — a table that samples only 100MB/1GB/100GB/1TB misses it entirely and would have let this spec's original wrong numbers ship |
 | `packages/shared/__tests__/config.test.ts` | Replace the `DEFAULT_PART_SIZE` invariants with `MAX_FILE_SIZE / CEILING < MAX_PARTS`, `FLOOR >= MIN_PART_SIZE`, `CEILING <= MAX_PART_SIZE`, `FLOOR <= CEILING` |
 | `apps/backend/src/__tests__/upload-calc.test.ts` (property) | **The load-bearing test.** Sweep `fileSize` every 1 MB from `MULTIPART_THRESHOLD` to 2 GB, then every 1 GB to 1 TB, plus boundary values, asserting on every input: `numParts <= MAX_PARTS`, `partSize <= MAX_PART_SIZE`, `numParts * partSize >= fileSize`, and trailing part `>= MIN_PART_SIZE` when `numParts > 1`. This is the sweep that found §2a; a table of sampled sizes cannot replace it |
-| `apps/backend/src/__tests__/upload-calc.test.ts` (regression) | Explicit cases for the two sizes where the single-pass adjustment failed under the new curve — 115 GB and 779 GB — plus 529,000,001 B and 616 GB, which fail today on the 25MB and 50MB tiers. Pin the iteration count at ≤ 3 so a future constant change that degrades convergence is visible |
+| `apps/backend/src/__tests__/upload-calc.test.ts` (regression) | Explicit cases for the two sizes where the single-pass adjustment failed under the new curve — 115 GB and 779 GB — plus 529,000,001 B and 616 GB, which fail today on the 25MB and 50MB tiers, and 4,567,982,337 (worst observed convergence, 5 passes). Do **not** pin the iteration count at ≤ 3 as an earlier draft said — that bound is wrong and the assertion would fail on correct code |
 | `apps/backend/src/__tests__/routes/upload.test.ts` | Delete speedtest route tests; assert `/upload/url` ignores a supplied `preferredPartSize` |
 | `apps/backend/src/__tests__/reaper.test.ts` | Keep the `'speedtest'` cases (kind is retained); add a case for a `'speedtest'`-kind record reaping correctly with no metadata key |
 | `apps/frontend/src/lib/upload-engine/__tests__/uploader.test.ts` | **New** controller cases: a transport returning 429 halves the pool; a clean transport grows to the cap; a retiring worker completes its in-flight part rather than aborting; an offline-shaped failure does *not* shrink; a late-firing probe timer still measures the correct wall-clock window |
@@ -354,6 +384,8 @@ connections hit today.
 - The property sweep passes on every input from `MULTIPART_THRESHOLD` to `MAX_FILE_SIZE`: no
   allocation can produce a trailing part under `MIN_PART_SIZE`, so the `EntityTooSmall` class of
   post-transfer failure is closed rather than merely made rarer.
-- OPFS staged bytes per upload stay at or below 640 MiB (down from ~1 GB).
+- OPFS **resident** bytes per upload — staged *plus* in flight — stay at or below 640 MiB, rising to
+  650 MiB only where the three-part window floor outranks the budget (down from ~1.6 GB). Measured
+  as `(windowSize + maxConcurrent) * partSize`, never as `windowSize * partSize`.
 - Telemetry reports the 429 count per upload, giving a direct read on whether R2's per-key write
   limit applies to `UploadPart`.

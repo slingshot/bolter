@@ -69,12 +69,28 @@ export interface EngineTuning {
 const WINDOW_SLACK = 2;
 
 /**
- * Total OPFS bytes one run may hold staged.
+ * Total OPFS bytes one run may hold resident.
  *
  * The window used to be a *part count* (`maxConcurrent + WINDOW_SLACK`), which
- * let the disk footprint track whatever part size the backend picked — ~1 GB
- * at the old 200MB default. Budgeting bytes and deriving both knobs from the
- * budget bounds the footprint regardless of allocation.
+ * let the disk footprint track whatever part size the backend picked — ~1.6 GB
+ * at the old 200MB default.
+ *
+ * This budget bounds **residency, not the window**, and those differ:
+ * `takeNextPart` frees a window slot when an uploader *picks a part up*, not
+ * when its bytes are deleted, and an in-flight part stays on disk for its
+ * entire transfer because every attempt re-reads it from the store. Peak
+ * residency is therefore `windowSize + maxConcurrent` parts, and dividing the
+ * budget by the window alone understated the real footprint by up to 1.8x
+ * (10 + 8 parts of 64 MiB = 1,152 MiB against a claimed 640 MiB).
+ *
+ * 640 MiB is chosen against Safari, not Chromium. Safari 17 (iOS 17 / macOS
+ * Sonoma) replaced the old flat 1 GB per-origin quota with ~60% of total disk,
+ * but iOS 16 and earlier still enforce that 1 GB — and `navigator.storage
+ * .persist()` only exempts an origin from eviction in WebKit, it never raises
+ * the quota. Staying under 640 MiB keeps a whole upload inside the legacy
+ * limit with margin. The throughput cost is negligible: at a 64 MiB part size
+ * four uploaders on a 100 MB/s link idle ~3.6% of the time against ~1.8% for
+ * eight, because parts this large already amortise request turnaround.
  */
 const MAX_STAGED_BYTES = 640 * 1024 * 1024;
 const MIN_WINDOW = 3;
@@ -87,19 +103,23 @@ const MAX_WINDOW = 10;
  * pool floor of 2 still leaves a spare slot — so uploaders can never starve on
  * a window too tight to stage ahead of them.
  *
- * MIN_WINDOW outranks the byte budget: above ~213 MiB parts three staged parts
- * exceed 640 MiB. Allocation never gets there (`PART_SIZING.CEILING` is
- * 128 MiB, and the trailing-part correction only nudges it a MiB or two), and
- * a window that cannot stage ahead of the pool would be worse than the
- * overshoot.
+ * MIN_WINDOW outranks the byte budget: above 128 MiB parts the five-part floor
+ * (3 staged + 2 in flight) exceeds 640 MiB. That is reachable — the
+ * trailing-part correction pushes `PART_SIZING.CEILING` to at most 130 MiB —
+ * but the overshoot peaks at 650 MiB (1.6%), and a window that cannot stage
+ * ahead of the pool would be worse than the overshoot.
  */
 export function deriveConcurrency(partSize: number): {
     windowSize: number;
     maxConcurrent: number;
 } {
+    const affordableParts = Math.floor(MAX_STAGED_BYTES / Math.max(1, partSize));
+    // Solve `windowSize + maxConcurrent <= affordableParts` for the largest
+    // legal window. Since `maxConcurrent = windowSize - WINDOW_SLACK` above the
+    // pool floor, that sum is `2 * windowSize - WINDOW_SLACK`.
     const windowSize = Math.min(
         MAX_WINDOW,
-        Math.max(MIN_WINDOW, Math.floor(MAX_STAGED_BYTES / Math.max(1, partSize))),
+        Math.max(MIN_WINDOW, Math.floor((affordableParts + WINDOW_SLACK) / 2)),
     );
     return { windowSize, maxConcurrent: Math.max(2, windowSize - WINDOW_SLACK) };
 }
