@@ -318,7 +318,14 @@ const FAST = { maxAttemptsPerPart: 2, retryDelayMs: () => 0 };
  * from `partSize` against a 640 MiB staged-byte budget, so anything below
  * 64 MiB lands on the MAX_WINDOW clamp.
  */
-const { windowSize: TINY_WINDOW, maxConcurrent: TINY_POOL } = deriveConcurrency(4);
+const { windowSize: TINY_WINDOW, maxConcurrent: TINY_CAP } = deriveConcurrency(4);
+
+/**
+ * Workers the engine actually starts with: the AIMD pool opens at
+ * `min(4, cap)` and grows a step per quiet 10s window, which is far longer
+ * than any of these runs, so the pool stays at its opening size throughout.
+ */
+const TINY_POOL = Math.min(4, TINY_CAP);
 
 describe('runEngine', () => {
     it('runs a single-file job end-to-end: stage, upload, complete, clear', async () => {
@@ -336,7 +343,7 @@ describe('runEngine', () => {
 
         const result = await runEngine(job, envelope, h.deps, new AbortController().signal);
 
-        expect(result).toEqual({ actualSize: total });
+        expect(result).toMatchObject({ actualSize: total });
         expect(h.completions).toHaveLength(1);
         expect(h.completions[0].parts).toEqual([
             { PartNumber: 1, ETag: 'etag-1' },
@@ -347,7 +354,17 @@ describe('runEngine', () => {
         expectBytesEqual(concatBodies(h.bodies), data);
 
         // Events: progress along the way, done (with the actual size) last.
-        expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
+        expect(h.events[h.events.length - 1]).toMatchObject({ type: 'done', actualSize: total });
+        // …carrying how the pool sized itself. `pushbacks` is the field that
+        // settles whether R2's 1 write/sec/key limit covers UploadPart.
+        expect(result.concurrency).toEqual({
+            peak: TINY_POOL,
+            final: TINY_POOL,
+            pushbacks: 0,
+        });
+        expect(h.events[h.events.length - 1]).toMatchObject({
+            concurrency: { peak: TINY_POOL, final: TINY_POOL, pushbacks: 0 },
+        });
         expect(h.events.some((e) => e.type === 'progress' && e.totalBytes === total)).toBe(true);
         // Every progress event carries the worker's own clock reading, so the
         // main thread never times throughput by message delivery.
@@ -541,8 +558,8 @@ describe('runEngine', () => {
         h.failingParts.clear();
         const result = await runEngine(job, envelope, h.deps, new AbortController().signal, FAST);
 
-        expect(result).toEqual({ actualSize: total });
-        expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
+        expect(result).toMatchObject({ actualSize: total });
+        expect(h.events[h.events.length - 1]).toMatchObject({ type: 'done', actualSize: total });
         // All staging happened in run 1 — run 2 only uploaded and completed.
         expect(h.log.filter((e) => e.startsWith('stagePart:'))).toEqual([
             'stagePart:1',
@@ -604,7 +621,7 @@ describe('runEngine', () => {
 
         const result = await runEngine(job, envelope, h.deps, new AbortController().signal);
 
-        expect(result).toEqual({ actualSize: total });
+        expect(result).toMatchObject({ actualSize: total });
         // Only parts 2 and 3 were produced and uploaded, from the exact offset.
         expect(h.log.filter((e) => e.startsWith('stagePart:'))).toEqual([
             'stagePart:2',
@@ -705,7 +722,7 @@ describe('runEngine', () => {
 
         const result = await runEngine(job, envelope, h.deps, new AbortController().signal);
 
-        expect(result).toEqual({ actualSize: total });
+        expect(result).toMatchObject({ actualSize: total });
         // Part 2 was re-produced from the checkpoint and uploaded exactly
         // once — the stale staged record did not feed the queue a duplicate
         // whose readPart would race the winner's delete-after-upload.
@@ -719,7 +736,7 @@ describe('runEngine', () => {
             { PartNumber: 3, ETag: 'etag-3' },
         ]);
         expectBytesEqual(concatBodies(h.bodies), data.slice(MIN));
-        expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
+        expect(h.events[h.events.length - 1]).toMatchObject({ type: 'done', actualSize: total });
     });
 
     it('encrypted job uploads ciphertext cut at exact record multiples', async () => {
@@ -745,7 +762,7 @@ describe('runEngine', () => {
             new AbortController().signal,
         );
 
-        expect(result).toEqual({ actualSize: declaredTotalSize });
+        expect(result).toMatchObject({ actualSize: declaredTotalSize });
         // Non-final parts are exact encrypted-record multiples of the part size.
         expect(h.bodies.get(1)?.byteLength).toBe(partSize);
         expect(h.bodies.get(2)?.byteLength).toBe(partSize);

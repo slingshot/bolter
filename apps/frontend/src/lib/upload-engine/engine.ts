@@ -22,6 +22,7 @@
 import { createEncryptionStream, ECE_RECORD_SIZE, Keychain } from '@/lib/crypto';
 import { isRetryableError, retryDelayMs as sharedRetryDelayMs } from '@/lib/upload-shared';
 import { finalizeUpload } from './completion';
+import { createConcurrencyController } from './concurrency';
 import { type PartStore, PartStoreQuotaError } from './part-store';
 import { createSliceProducer, createZipProducer, type ProducerChunk } from './producer';
 import type { EngineFailureStage, EngineJob, WorkerToClient } from './protocol';
@@ -54,6 +55,11 @@ export interface EngineDeps {
 
 export interface EngineResult {
     actualSize: number;
+    /**
+     * How the AIMD pool ended up sizing itself, for telemetry only. Absent on
+     * paths that ran no uploaders (a completion replay uploads nothing).
+     */
+    concurrency?: { peak: number; final: number; pushbacks: number };
 }
 
 /** Optional knobs for deterministic tests; production callers omit this. */
@@ -175,7 +181,11 @@ export async function runEngine(
         });
         throw error;
     }
-    deps.onEvent({ type: 'done', actualSize: result.actualSize });
+    deps.onEvent({
+        type: 'done',
+        actualSize: result.actualSize,
+        ...(result.concurrency !== undefined && { concurrency: result.concurrency }),
+    });
     return result;
 }
 
@@ -197,6 +207,13 @@ async function runPipeline(
     // Both knobs come from the allocated part size, so the fresh-upload and
     // both resume paths cannot disagree about them.
     const { windowSize, maxConcurrent } = deriveConcurrency(job.partSize);
+    // Start conservative and let the run itself find the ceiling: AIMD is what
+    // replaced the preflight speed test as the adaptive element.
+    const concurrency = createConcurrencyController({
+        initial: Math.min(4, maxConcurrent),
+        min: 2,
+        max: maxConcurrent,
+    });
     throwIfCancelled(cancel);
 
     // Durable ordering: lease before any part-store write [R12], envelope as
@@ -396,6 +413,7 @@ async function runPipeline(
     const uploaderRun = runUploaders(takeNextPart, {
         urls: job.partUrls,
         maxConcurrent,
+        concurrency,
         store: deps.store,
         state: deps.state,
         fileId: job.fileId,
@@ -458,7 +476,14 @@ async function runPipeline(
     for (const size of sizes.values()) {
         actualSize += size;
     }
-    return { actualSize };
+    return {
+        actualSize,
+        concurrency: {
+            peak: concurrency.peak(),
+            final: concurrency.target(),
+            pushbacks: concurrency.pushbacks(),
+        },
+    };
 }
 
 interface ProductionPlan {

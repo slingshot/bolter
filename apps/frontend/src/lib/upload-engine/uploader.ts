@@ -29,6 +29,11 @@
  */
 
 import { isRetryableError } from '@/lib/upload-shared';
+import {
+    type ConcurrencyController,
+    createConcurrencyController,
+    isPushbackError,
+} from './concurrency';
 import type { PartStore } from './part-store';
 import type { EngineStateStore } from './state';
 
@@ -40,6 +45,16 @@ export interface UploadPartResult {
 export interface UploaderOpts {
     urls: string[]; // index 0 = part 1
     maxConcurrent: number;
+    /**
+     * Adaptive pool sizing. Omitted → a fixed pool of `maxConcurrent`, which is
+     * what the legacy-shaped tests and any non-adaptive caller expect.
+     */
+    concurrency?: ConcurrencyController;
+    /**
+     * A queue pull that parks longer than this counts as the pool idling —
+     * staging, not concurrency, is the bottleneck. Default 250ms wall clock.
+     */
+    idleThresholdMs?: number;
     store: PartStore;
     state: EngineStateStore;
     fileId: string;
@@ -81,6 +96,8 @@ const DEFAULT_IMMEDIATE_FAILURE_MS = 5_000;
  * second at the main thread, which is itself a source of the jank that used to
  * corrupt the reported speed. */
 const DEFAULT_PROGRESS_EMIT_MS = 250;
+/** Wall clock a worker may park on the queue before it counts as idle. */
+const DEFAULT_IDLE_THRESHOLD_MS = 250;
 /** Coarse stall-poll interval — checks compute wall-clock deltas, so a poll
  * that fires late (throttling, suspension) still measures correctly. */
 const STALL_POLL_MS = 1_000;
@@ -144,6 +161,13 @@ export async function runUploaders(
     const immediateFailureMs = opts.immediateFailureMs ?? DEFAULT_IMMEDIATE_FAILURE_MS;
     const progressEmitMs = Math.max(0, opts.progressEmitMs ?? DEFAULT_PROGRESS_EMIT_MS);
     const setTimeoutFn = opts.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+    const idleThresholdMs = opts.idleThresholdMs ?? DEFAULT_IDLE_THRESHOLD_MS;
+    // A controller pinned to a single value reproduces the previous fixed pool
+    // exactly, so the adaptive path is opt-in and every existing caller is
+    // unaffected.
+    const fixed = Math.max(1, opts.maxConcurrent);
+    const concurrency =
+        opts.concurrency ?? createConcurrencyController({ initial: fixed, min: fixed, max: fixed });
 
     // Offline inference [R14]: run-wide because a dead link fails every
     // worker's attempts alike, and any transferred byte anywhere proves the
@@ -227,6 +251,11 @@ export async function runUploaders(
             total += loaded;
         }
         opts.onProgress(total, at);
+        // Growth rides the progress cadence rather than its own timer: bytes
+        // only flow while the pool is actually working, so a stalled or offline
+        // run cannot grow itself. Shrink stays immediate and event-driven.
+        concurrency.tick(at);
+        reconcilePool();
     };
 
     /** One attempt: re-read the committed part, PUT it, stall-watch it. */
@@ -315,6 +344,12 @@ export async function runUploaders(
                 // A run-level abort wins over whatever this attempt threw.
                 throwIfAborted();
                 const error = err instanceof Error ? err : new Error(String(err));
+                if (isPushbackError(error)) {
+                    // R2 documents a 1 write/sec/key limit and does not say
+                    // whether UploadPart is exempt. If it is not, this is what
+                    // keeps the run alive instead of burning its attempt budget.
+                    concurrency.onPushback(opts.now());
+                }
                 if (isUrlExpiryError(error) && !urlRefreshed) {
                     // Pre-signed URLs expired — refresh once per part, retry
                     // immediately (no backoff: this is not a transport fault).
@@ -355,26 +390,63 @@ export async function runUploaders(
         }
     };
 
+    let activeWorkers = 0;
+    const workerPromises: Promise<void>[] = [];
+
     const workerLoop = async (): Promise<void> => {
-        while (true) {
-            throwIfAborted();
-            const next = await Promise.race([partsToUpload(), aborted]);
-            if (next === null) {
-                return;
+        try {
+            while (true) {
+                throwIfAborted();
+                // Cooperative shrink: retire at a part boundary. Aborting an
+                // in-flight PUT to shrink the pool would throw away exactly the
+                // bytes this whole design exists to conserve.
+                if (activeWorkers > concurrency.target()) {
+                    return;
+                }
+                const waitStart = opts.now();
+                const next = await Promise.race([partsToUpload(), aborted]);
+                if (opts.now() - waitStart > idleThresholdMs) {
+                    concurrency.onIdle();
+                }
+                if (next === null) {
+                    return;
+                }
+                await uploadOnePart(next.partNumber, next.size);
             }
-            await uploadOnePart(next.partNumber, next.size);
+        } finally {
+            // Synchronous with the `return` above, so the retire decision and
+            // its accounting cannot interleave: were the decrement deferred to
+            // a promise callback, every worker in a convoy would read the same
+            // pre-retirement count and the whole pool could retire at once.
+            activeWorkers -= 1;
         }
     };
 
-    try {
-        const workers = Array.from({ length: Math.max(1, opts.maxConcurrent) }, () =>
+    const spawnWorker = () => {
+        activeWorkers += 1;
+        workerPromises.push(
             workerLoop().catch((err: unknown) => {
                 const error = err instanceof Error ? err : new Error(String(err));
                 abortRun(error);
                 throw error;
             }),
         );
-        await Promise.all(workers);
+    };
+
+    const reconcilePool = () => {
+        while (!run.signal.aborted && activeWorkers < concurrency.target()) {
+            spawnWorker();
+        }
+    };
+
+    try {
+        reconcilePool();
+        // `workerPromises` grows while the run is in flight, so settle
+        // repeatedly until no new worker has appeared.
+        for (let settled = 0; settled < workerPromises.length; ) {
+            settled = workerPromises.length;
+            await Promise.all(workerPromises);
+        }
         return etags;
     } finally {
         opts.signal.removeEventListener('abort', onExternalAbort);
