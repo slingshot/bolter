@@ -73,7 +73,14 @@ export type WorkerToClient =
           name?: string;
           stack?: string;
       }
-    | { type: 'done'; actualSize: number };
+    | {
+          type: 'done';
+          actualSize: number;
+          /** Pool-sizing outcome for telemetry; absent on paths that ran no
+           * uploaders (a completion replay uploads nothing). Additive:
+           * consumers must tolerate its absence. */
+          concurrency?: { peak: number; final: number; pushbacks: number };
+      };
 
 /**
  * Internal eligibility-probe handshake (`probeEligibility`), sent to a

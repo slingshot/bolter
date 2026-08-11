@@ -417,7 +417,7 @@ describe('executeResume', () => {
 
         const result = await executeResume(FILE_ID, h.deps, new AbortController().signal);
 
-        expect(result).toEqual({ actualSize: total });
+        expect(result).toMatchObject({ actualSize: total });
         // Fresh pre-signed URLs were fetched with the lease's uploadToken.
         expect(h.refreshCalls).toEqual([{ fileId: FILE_ID, uploadToken: 'tok-1' }]);
         // Only the staged remainder was uploaded, byte-identically.
@@ -439,7 +439,7 @@ describe('executeResume', () => {
             },
         ]);
         expect(await h.state.getLease(FILE_ID)).toBeUndefined();
-        expect(h.events[h.events.length - 1]).toEqual({ type: 'done', actualSize: total });
+        expect(h.events[h.events.length - 1]).toMatchObject({ type: 'done', actualSize: total });
     });
 
     it('need-source: rejects with the source kind and completes nothing', async () => {

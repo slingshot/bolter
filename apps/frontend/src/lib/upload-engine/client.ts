@@ -157,6 +157,18 @@ function engineEvent(
     });
 }
 
+/** Report how the AIMD pool sized itself, on the attempt that ran it. */
+function concurrencyEvent(concurrency: { peak: number; final: number; pushbacks: number }): void {
+    const attempt = currentAttempt ?? beginTelemetryAttempt('worker');
+    trackEngineEvent({
+        attemptId: attempt.attemptId,
+        event: 'concurrency',
+        peak: concurrency.peak,
+        final: concurrency.final,
+        pushbacks: concurrency.pushbacks,
+    });
+}
+
 function flushPendingPersistResult(): void {
     if (pendingPersistDetail !== undefined && currentAttempt !== undefined) {
         trackEngineEvent({
@@ -412,7 +424,20 @@ function runWorkerJob(
                     hooks.onRetry();
                     break;
                 case 'done':
-                    settle(() => resolve({ actualSize: message.actualSize }));
+                    settle(() => {
+                        if (message.concurrency) {
+                            // The pool-sizing outcome is the evidence for
+                            // whether R2's per-key write limit covers
+                            // UploadPart [R16] — correlated by attempt id only.
+                            concurrencyEvent(message.concurrency);
+                        }
+                        resolve({
+                            actualSize: message.actualSize,
+                            ...(message.concurrency !== undefined && {
+                                concurrency: message.concurrency,
+                            }),
+                        });
+                    });
                     break;
                 case 'error':
                     settle(() => {
