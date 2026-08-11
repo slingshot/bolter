@@ -128,7 +128,12 @@ interface SyncAccessHandle {
 interface OpfsFileHandle {
     createSyncAccessHandle(): Promise<SyncAccessHandle>;
     getFile(): Promise<File>;
-    move?(name: string): Promise<void>;
+    /**
+     * Both arguments are mandatory in WebKit and accepted by Chromium; see
+     * `commitByRename`. Typing the one-argument Chromium overload here is
+     * what let the arity split reach production unnoticed.
+     */
+    move?(destination: OpfsDirectoryHandle, name: string): Promise<void>;
 }
 
 interface OpfsDirectoryHandle {
@@ -416,6 +421,16 @@ function writeFully(handle: SyncAccessHandle, chunk: Uint8Array, at: number): nu
  * Commit a fully-flushed temp entry to its committed name. Uses the native
  * rename (`FileSystemHandle.move`) when available; otherwise copies through a
  * fresh sync access handle and removes the temp.
+ *
+ * The rename is always issued in its two-argument `(destination, newName)`
+ * form. `move()` is specified by neither the WHATWG File System standard nor
+ * the WICG File System Access draft, and the two engines shipped different
+ * shapes of it: WebKit's `FileSystemHandle.idl` declares
+ * `move(FileSystemHandle destination, USVString newName)` with both arguments
+ * mandatory and no overloads, so Chromium's one-argument `move(newName)`
+ * rename throws `TypeError: Not enough arguments` from the bindings' arity
+ * check — even for a same-directory rename. Chromium accepts the
+ * two-argument form as well, so it is the only call that works on both.
  */
 async function commitByRename(
     dir: OpfsDirectoryHandle,
@@ -427,8 +442,16 @@ async function commitByRename(
     // rename cannot collide.
     await removeIfExists(dir, committed);
     if (typeof tmpHandle.move === 'function') {
-        await tmpHandle.move(committed);
-        return;
+        try {
+            await tmpHandle.move(dir, committed);
+            return;
+        } catch {
+            // Feature detection proves `move` exists, never that this engine
+            // accepts this call — the arity split above was invisible to
+            // `typeof`, and an unspecified method may differ again. A part
+            // whose bytes are already staged and flushed must not fail the
+            // upload over its rename, so fall through to the copy.
+        }
     }
     const bytes = new Uint8Array(await (await tmpHandle.getFile()).arrayBuffer());
     try {

@@ -498,6 +498,10 @@ describe('runEngine', () => {
             message: expect.stringContaining('network error'),
             retryable: true,
             stage: 'uploader',
+            // Carried so the facade can rethrow with the worker's own stack
+            // instead of collapsing every engine failure into one Sentry issue.
+            name: expect.any(String),
+            stack: expect.any(String),
         });
         // Resume material is intact: lease, eof checkpoint, part records.
         expect(await h.state.getLease(job.fileId)).toBeDefined();

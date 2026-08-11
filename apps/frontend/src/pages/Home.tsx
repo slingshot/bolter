@@ -24,6 +24,7 @@ import {
     currentUploadAttempt,
     discardEngineUpload,
     type EngineResumeCandidate,
+    EngineWorkerError,
     engineStartupMaintenance,
     resetUploadAttemptTelemetry,
 } from '@/lib/upload-engine/client';
@@ -501,6 +502,17 @@ export function HomePage() {
             } else {
                 captureError(e, {
                     operation: 'upload',
+                    // The engine's own failure taxonomy, promoted to tags so
+                    // the pipeline leg and the worker-side error class are
+                    // filterable in Sentry rather than buried in a message.
+                    ...(e instanceof EngineWorkerError && {
+                        tags: {
+                            engine: 'worker',
+                            ...(e.stage && { engine_stage: e.stage }),
+                            ...(e.workerName && { engine_error: e.workerName }),
+                            engine_retryable: String(e.retryable),
+                        },
+                    }),
                     extra: {
                         fileCount: files.length,
                         totalSize: files.reduce((sum, f) => sum + f.file.size, 0),
@@ -548,7 +560,13 @@ export function HomePage() {
 
     const totalSize = files.reduce((sum, f) => sum + f.file.size, 0);
     const maxSize = config?.maxFileSize || UPLOAD_LIMITS.MAX_FILE_SIZE;
-    const canUpload = files.length > 0 && totalSize <= maxSize && !isUploading;
+    // Read the server-advertised limit, not the shared constant: `/config` is
+    // the authority, so raising MAX_FILES_PER_ARCHIVE server-side takes effect
+    // without a frontend release. Enforced here because the server can only
+    // refuse at `/upload/complete` — after every byte has been transferred.
+    const maxFiles = config?.maxFilesPerArchive || UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE;
+    const tooManyFiles = files.length > maxFiles;
+    const canUpload = files.length > 0 && totalSize <= maxSize && !tooManyFiles && !isUploading;
 
     // How the engine resume card behaves: 'finish' needs no source,
     // 'one-click' re-acquires a persisted handle [R13], and 'discard-only'
@@ -775,6 +793,12 @@ export function HomePage() {
                                 {totalSize > maxSize && (
                                     <p className="text-center text-paragraph-xs text-red-600">
                                         Total size exceeds the {formatBytes(maxSize)} limit
+                                    </p>
+                                )}
+
+                                {tooManyFiles && (
+                                    <p className="text-center text-paragraph-xs text-red-600">
+                                        Too many files: {files.length} selected, limit is {maxFiles}
                                     </p>
                                 )}
                             </>

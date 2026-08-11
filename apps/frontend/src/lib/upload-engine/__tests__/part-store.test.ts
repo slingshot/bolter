@@ -64,7 +64,7 @@ class FakeFileEntry {
     data = new Uint8Array(0);
 
     constructor(
-        private readonly dir: FakeDirectory,
+        private dir: FakeDirectory,
         public name: string,
     ) {}
 
@@ -97,13 +97,33 @@ class FakeFileEntry {
         return Promise.resolve(new File([this.data as BlobPart], this.name));
     }
 
-    move(newName: string): Promise<void> {
+    /**
+     * WebKit's contract, which is the strict one: `FileSystemHandle.idl`
+     * declares `move(FileSystemHandle destination, USVString newName)` with
+     * no optionals and no overloads, so Chromium's one-argument rename
+     * throws `TypeError: Not enough arguments` before moving anything —
+     * synchronously, from the bindings' arity check. Chromium accepts this
+     * two-argument form too, so modelling the stricter engine is the only
+     * way the fake stays honest for both.
+     */
+    move(...args: [destination: FakeDirectory, newName: string]): Promise<void> {
+        if (args.length < 2) {
+            throw new TypeError('Not enough arguments');
+        }
+        const [destination, newName] = args;
         this.dir.entries.delete(this.name);
         this.name = newName;
-        this.dir.entries.set(newName, this);
+        destination.entries.set(newName, this);
+        this.dir = destination;
         return Promise.resolve();
     }
 }
+
+/** Saved so the move()-absent and move()-rejects cases can restore the default. */
+const moveDescriptor = Object.getOwnPropertyDescriptor(
+    FakeFileEntry.prototype,
+    'move',
+) as PropertyDescriptor;
 
 /** A directory that can be removed out from under a handle still holding it. */
 class FakeDirectory {
@@ -234,6 +254,53 @@ describe('OpfsPartStore', () => {
         await store.deletePart(1);
         expect(await store.listParts()).toEqual([]);
         await expect(store.readPart(1)).rejects.toThrow('part 1 is not committed');
+    });
+
+    it('commits by copying when the engine exposes no move()', async () => {
+        const { root } = installFakeOpfs();
+        Reflect.deleteProperty(FakeFileEntry.prototype as object, 'move');
+        try {
+            const store = new OpfsPartStore('up_nomove');
+            const { size } = await store.stagePart(1, chunks(new Uint8Array([4, 5, 6])));
+
+            expect(size).toBe(3);
+            expect(new Uint8Array(await (await store.readPart(1)).arrayBuffer())).toEqual(
+                new Uint8Array([4, 5, 6]),
+            );
+            const uploads = await root.getDirectoryHandle(UPLOADS_DIR);
+            const dir = await uploads.getDirectoryHandle('up_nomove');
+            expect([...dir.entries.keys()]).toEqual(['part-1.bin']);
+        } finally {
+            Object.defineProperty(FakeFileEntry.prototype, 'move', moveDescriptor);
+        }
+    });
+
+    it('commits by copying when move() exists but rejects', async () => {
+        const { root } = installFakeOpfs();
+        Object.defineProperty(FakeFileEntry.prototype, 'move', {
+            configurable: true,
+            writable: true,
+            // Any engine-specific rename fault — an arity mismatch like
+            // WebKit's, or a cross-directory refusal — must degrade to the
+            // copy path rather than failing the upload.
+            value: () => {
+                throw new TypeError('Not enough arguments');
+            },
+        });
+        try {
+            const store = new OpfsPartStore('up_badmove');
+            const { size } = await store.stagePart(1, chunks(new Uint8Array([7, 8])));
+
+            expect(size).toBe(2);
+            expect(new Uint8Array(await (await store.readPart(1)).arrayBuffer())).toEqual(
+                new Uint8Array([7, 8]),
+            );
+            const uploads = await root.getDirectoryHandle(UPLOADS_DIR);
+            const dir = await uploads.getDirectoryHandle('up_badmove');
+            expect([...dir.entries.keys()]).toEqual(['part-1.bin']);
+        } finally {
+            Object.defineProperty(FakeFileEntry.prototype, 'move', moveDescriptor);
+        }
     });
 
     it('resolves the staging directory once for the store’s lifetime', async () => {

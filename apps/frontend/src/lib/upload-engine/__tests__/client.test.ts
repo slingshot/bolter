@@ -9,6 +9,7 @@ vi.mock('@/lib/plausible', () => ({
 }));
 
 import {
+    EngineWorkerError,
     engineStartupMaintenance,
     probeEligibility,
     resetEligibilityCacheForTests,
@@ -286,6 +287,48 @@ describe('upload-engine client facade', () => {
         expect(vi.mocked(trackEngineEvent)).toHaveBeenCalledWith(
             expect.objectContaining({ event: 'failure', detail: 'stager-quota:retryable' }),
         );
+    });
+
+    it('adopts the worker-side stack, name and stage so failures group apart', async () => {
+        const { hooks } = makeHooks();
+        const { canceller } = makeCanceller();
+
+        const run = runEngineInWorker(makeJob(), makeEnvelope(), hooks, canceller);
+        const worker = FakeWorker.instances[0];
+        // Every worker failure is rethrown from the same three facade frames,
+        // and Sentry groups on the stack — so without the worker's own stack
+        // an OPFS rename fault and an HTTP 400 land in one issue.
+        worker.emit({
+            type: 'error',
+            message: 'Not enough arguments',
+            retryable: false,
+            stage: 'staging',
+            name: 'TypeError',
+            stack: 'TypeError: Not enough arguments\n    at commitByRename (part-store.ts:430:25)',
+        });
+
+        const err = (await run.catch((e: unknown) => e)) as EngineWorkerError;
+        expect(err).toBeInstanceOf(EngineWorkerError);
+        expect(err.stage).toBe('staging');
+        expect(err.workerName).toBe('TypeError');
+        expect(err.stack).toContain('commitByRename');
+    });
+
+    it('keeps its own stack when the worker reports none', async () => {
+        const { hooks } = makeHooks();
+        const { canceller } = makeCanceller();
+
+        const run = runEngineInWorker(makeJob(), makeEnvelope(), hooks, canceller);
+        FakeWorker.instances[0].emit({
+            type: 'error',
+            message: 'part sequence invalid: no parts',
+            retryable: false,
+        });
+
+        const err = (await run.catch((e: unknown) => e)) as EngineWorkerError;
+        expect(err.stack).toContain('EngineWorkerError');
+        expect(err.workerName).toBeUndefined();
+        expect(err.stage).toBeUndefined();
     });
 
     it('relays online/offline window events as connectivity messages', async () => {
