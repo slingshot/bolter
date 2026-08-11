@@ -22,6 +22,7 @@
 import { createEncryptionStream, ECE_RECORD_SIZE, Keychain } from '@/lib/crypto';
 import { isRetryableError, retryDelayMs as sharedRetryDelayMs } from '@/lib/upload-shared';
 import { finalizeUpload } from './completion';
+import { createConcurrencyController } from './concurrency';
 import { type PartStore, PartStoreQuotaError } from './part-store';
 import { createSliceProducer, createZipProducer, type ProducerChunk } from './producer';
 import type { EngineFailureStage, EngineJob, WorkerToClient } from './protocol';
@@ -197,6 +198,13 @@ async function runPipeline(
     // Both knobs come from the allocated part size, so the fresh-upload and
     // both resume paths cannot disagree about them.
     const { windowSize, maxConcurrent } = deriveConcurrency(job.partSize);
+    // Start conservative and let the run itself find the ceiling: AIMD is what
+    // replaced the preflight speed test as the adaptive element.
+    const concurrency = createConcurrencyController({
+        initial: Math.min(4, maxConcurrent),
+        min: 2,
+        max: maxConcurrent,
+    });
     throwIfCancelled(cancel);
 
     // Durable ordering: lease before any part-store write [R12], envelope as
@@ -396,6 +404,7 @@ async function runPipeline(
     const uploaderRun = runUploaders(takeNextPart, {
         urls: job.partUrls,
         maxConcurrent,
+        concurrency,
         store: deps.store,
         state: deps.state,
         fileId: job.fileId,
