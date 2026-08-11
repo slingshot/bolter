@@ -55,7 +55,6 @@ export function HomePage() {
         setCanceller,
         setKeychain,
         setZippingProgress,
-        setCheckingSpeed,
         addUploadedFile,
         addToast,
         config,
@@ -436,9 +435,6 @@ export function HomePage() {
                     onZipProgress: (percent) => {
                         setZippingProgress(percent);
                     },
-                    onSpeedTest: (phase) => {
-                        setCheckingSpeed(phase === 'started');
-                    },
                     onError: (error) => {
                         console.error('Upload error:', error);
                     },
@@ -537,7 +533,6 @@ export function HomePage() {
             setUploading(false);
             setUploadProgress(null);
             setZippingProgress(null);
-            setCheckingSpeed(false);
             setCanceller(null);
             setKeychain(null);
         }
@@ -555,7 +550,6 @@ export function HomePage() {
         clearFiles,
         addToast,
         setZippingProgress,
-        setCheckingSpeed,
     ]);
 
     const totalSize = files.reduce((sum, f) => sum + f.file.size, 0);

@@ -56,7 +56,6 @@ describe('useAppStore', () => {
             currentCanceller: null,
             currentKeychain: null,
             zippingProgress: null,
-            checkingSpeed: false,
             resumableUpload: null,
             config: null,
             userTouchedSettings: false,
@@ -696,11 +695,6 @@ describe('useAppStore', () => {
         it('setZippingProgress updates zippingProgress', () => {
             useAppStore.getState().setZippingProgress(42);
             expect(useAppStore.getState().zippingProgress).toBe(42);
-        });
-
-        it('setCheckingSpeed updates checkingSpeed', () => {
-            useAppStore.getState().setCheckingSpeed(true);
-            expect(useAppStore.getState().checkingSpeed).toBe(true);
         });
     });
 
