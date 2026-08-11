@@ -12,6 +12,12 @@ Bolter offers **optional end-to-end encryption** that users can enable per uploa
 4. **Upload** — only ciphertext is uploaded to S3/R2 via pre-signed URLs; the server never handles file data
 5. **Sharing** — the encryption key is placed in the URL hash fragment (`#`), which browsers never include in HTTP requests
 
+### Ciphertext-at-Rest Staging
+
+Large (multipart) uploads are staged in the browser's Origin Private File System (OPFS) by the worker upload engine before transfer. For encrypted uploads the engine stages ciphertext only; plaintext never exists at rest — encryption runs producer-side before bytes reach OPFS. This tightens the existing guarantee "plaintext never leaves the browser unencrypted" to "plaintext never exists at rest." For unencrypted uploads, staged bytes are byte-identical to what the bucket receives.
+
+OPFS is origin-private (not user-visible); staged data is deleted on completion or abort and garbage-collected once its upload lease disappears. The encryption secret persisted for resume in the engine's IndexedDB matches the legacy resume persistence posture (the secret was already stored for resumable uploads).
+
 > **Note**: Without encryption enabled, files are uploaded in plaintext to S3/R2. The server still never handles file data directly (uploads go through pre-signed URLs), but the storage provider can read the file contents.
 
 ### What the Server Knows

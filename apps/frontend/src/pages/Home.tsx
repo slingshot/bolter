@@ -8,10 +8,26 @@ import { UploadedFilesList } from '@/components/UploadedFilesList';
 import { UploadProgress } from '@/components/UploadProgress';
 import { UploadSettings } from '@/components/UploadSettings';
 import { Button } from '@/components/ui/button';
-import { Canceller, FileReadError, resumeUpload, uploadFiles } from '@/lib/api';
+import {
+    Canceller,
+    computeContentFingerprint,
+    FileReadError,
+    resumeEngineUpload,
+    resumeEngineUploadWithFile,
+    resumeUpload,
+    uploadFiles,
+} from '@/lib/api';
 import { Keychain } from '@/lib/crypto';
 import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
+import {
+    currentUploadAttempt,
+    discardEngineUpload,
+    type EngineResumeCandidate,
+    engineStartupMaintenance,
+    resetUploadAttemptTelemetry,
+} from '@/lib/upload-engine/client';
+import { verifyHandleFile } from '@/lib/upload-engine/resume';
 import {
     cleanupExpiredUploads,
     discardResumableUpload,
@@ -47,6 +63,7 @@ export function HomePage() {
     } = useAppStore();
 
     const resumeFileInputRef = useRef<HTMLInputElement>(null);
+    const [engineResumable, setEngineResumable] = useState<EngineResumeCandidate | null>(null);
 
     // Check for any resumable upload on mount
     useEffect(() => {
@@ -55,6 +72,40 @@ export function HomePage() {
             .then((state) => setResumableUpload(state))
             .catch(() => setResumableUpload(null));
     }, [setResumableUpload]);
+
+    // Worker-engine maintenance on mount: surface source-free resumes
+    // ("Finish upload — no file selection needed"), one-click resumes backed
+    // by a persisted file handle [R13], and garbage-collect orphaned OPFS
+    // staging directories (dirs whose upload lock is held by another tab are
+    // skipped). Candidates that cannot resume (multi-file mid-production,
+    // single-file without a persisted handle) still surface with "Start
+    // fresh" — without the discard they would leak their lease, staged
+    // ciphertext, and server-side multipart forever.
+    useEffect(() => {
+        let cancelled = false;
+        engineStartupMaintenance()
+            .then((candidates) => {
+                if (cancelled) {
+                    return;
+                }
+                setEngineResumable(
+                    candidates.find((c) => c.action === 'finish') ??
+                        candidates.find(
+                            (c) => c.action === 'need-source-single' && c.handle !== undefined,
+                        ) ??
+                        candidates[0] ??
+                        null,
+                );
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setEngineResumable(null);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     const handleResumeFileSelected = useCallback(
         async (file: File) => {
@@ -171,6 +222,171 @@ export function HomePage() {
         });
     }, [resumableUpload, setResumableUpload]);
 
+    // Shared completion for both worker-engine resume flows (source-free
+    // "finish" and one-click handle resume): upload-state wiring, the history
+    // entry, and toasts are identical — only the resume call differs.
+    const runEngineResume = useCallback(
+        async (
+            candidate: EngineResumeCandidate,
+            resume: (
+                canceller: Canceller,
+            ) => Promise<{ id: string; url: string; ownerToken: string }>,
+        ) => {
+            const canceller = new Canceller();
+            const keychain =
+                candidate.encrypted && candidate.secretKeyB64
+                    ? new Keychain(candidate.secretKeyB64)
+                    : new Keychain();
+
+            setUploading(true);
+            setUploadError(null);
+            setCanceller(canceller);
+            setKeychain(keychain);
+
+            try {
+                const result = await resume(canceller);
+
+                const uploaded: UploadedFile = {
+                    id: result.id,
+                    url: result.url,
+                    secretKey: keychain.secretKeyB64,
+                    ownerToken: result.ownerToken,
+                    name: candidate.fileName,
+                    size: candidate.size,
+                    // The server TTL started at /upload/url — anchor the expiry
+                    // at the lease's creation, not at completion.
+                    expiresAt: resolveExpiresAt(result, candidate.timeLimit, candidate.createdAt),
+                    downloadLimit: candidate.downloadLimit,
+                    downloadCount: 0,
+                    encrypted: candidate.encrypted,
+                };
+
+                addUploadedFile(uploaded);
+                setUploadedFile(uploaded);
+                setEngineResumable(null);
+
+                addToast({
+                    title: 'Upload resumed and completed!',
+                    description: 'Your file is ready to share.',
+                    variant: 'success',
+                });
+            } catch (e: unknown) {
+                const message = e instanceof Error ? e.message : String(e);
+                if (message !== 'Upload cancelled') {
+                    setUploadError(message);
+                    addToast({
+                        title: 'Resume failed',
+                        description: message,
+                        variant: 'destructive',
+                    });
+                }
+            } finally {
+                setUploading(false);
+                setUploadProgress(null);
+                setCanceller(null);
+                setKeychain(null);
+            }
+        },
+        [
+            setUploading,
+            setUploadError,
+            setCanceller,
+            setKeychain,
+            setUploadProgress,
+            addUploadedFile,
+            addToast,
+        ],
+    );
+
+    // Finish a worker-engine upload whose remaining bytes are all staged (or
+    // whose completion just needs replaying) — no file selection needed.
+    const handleEngineFinish = useCallback(() => {
+        if (!engineResumable) {
+            return;
+        }
+        const candidate = engineResumable;
+        void runEngineResume(candidate, (canceller) =>
+            resumeEngineUpload(
+                candidate.fileId,
+                (progress) => setUploadProgress(progress),
+                canceller,
+            ),
+        );
+    }, [engineResumable, runEngineResume, setUploadProgress]);
+
+    // One-click resume from a persisted File System Access handle [R13]:
+    // re-acquire the file (a permission prompt at most), verify it is still
+    // byte-identical to the interrupted upload's source, then feed it back
+    // into the engine as the resume source.
+    const handleEngineHandleResume = useCallback(async () => {
+        const candidate = engineResumable;
+        const handle = candidate?.handle;
+        const handleFacts = candidate?.handleFacts;
+        if (!candidate || !handle || !handleFacts) {
+            return;
+        }
+
+        let file: File;
+        try {
+            const permission = await (
+                handle as FileSystemFileHandle & {
+                    requestPermission?: (descriptor: { mode: 'read' }) => Promise<PermissionState>;
+                }
+            ).requestPermission?.({ mode: 'read' });
+            if (permission !== undefined && permission !== 'granted') {
+                addToast({
+                    title: 'Permission needed',
+                    description: 'Allow read access to the file to resume this upload.',
+                    variant: 'destructive',
+                });
+                return;
+            }
+            file = await handle.getFile();
+        } catch {
+            addToast({
+                title: 'File unavailable',
+                description:
+                    'The saved file could not be reopened. Start fresh to upload it again.',
+                variant: 'destructive',
+            });
+            return;
+        }
+
+        try {
+            await verifyHandleFile(file, handleFacts, computeContentFingerprint);
+        } catch {
+            addToast({
+                title: 'File has changed',
+                description:
+                    'The saved file no longer matches the interrupted upload. Start fresh to upload the current version.',
+                variant: 'destructive',
+            });
+            return;
+        }
+
+        await runEngineResume(candidate, (canceller) =>
+            resumeEngineUploadWithFile(
+                candidate.fileId,
+                file,
+                (progress) => setUploadProgress(progress),
+                canceller,
+            ),
+        );
+    }, [engineResumable, runEngineResume, addToast, setUploadProgress]);
+
+    const handleEngineStartFresh = useCallback(() => {
+        if (!engineResumable) {
+            return;
+        }
+        const { fileId } = engineResumable;
+        setEngineResumable(null);
+        // Aborts the server-side multipart via the lease's credentials, then
+        // clears engine state and the OPFS staging directory.
+        discardEngineUpload(fileId).catch(() => {
+            // Intentionally ignored — best-effort cleanup
+        });
+    }, [engineResumable]);
+
     const handleUpload = useCallback(async () => {
         if (files.length === 0) {
             return;
@@ -189,6 +405,9 @@ export function HomePage() {
         setCanceller(canceller);
         setKeychain(keychain);
         setZippingProgress(null);
+        // A small upload never reaches the engine delegation decision — clear
+        // the previous attempt so the success event cannot inherit its engine.
+        resetUploadAttemptTelemetry();
 
         addBreadcrumb('Upload started', {
             category: 'upload',
@@ -203,6 +422,10 @@ export function HomePage() {
             const result = await uploadFiles(
                 {
                     files: files.map((f) => f.file),
+                    // Positional File System Access handles (Chromium) — the
+                    // engine persists a single file's handle with its lease so
+                    // an interrupted upload can offer one-click resume [R13].
+                    handles: files.map((f) => f.handle),
                     encrypted,
                     timeLimit,
                     downloadLimit,
@@ -239,7 +462,11 @@ export function HomePage() {
             };
 
             addUploadedFile(uploaded);
-            trackUpload({ fileSize: uploaded.size, encrypted });
+            trackUpload({
+                fileSize: uploaded.size,
+                encrypted,
+                engine: currentUploadAttempt()?.engine ?? 'legacy',
+            });
             setUploadedFile(uploaded);
             clearFiles();
 
@@ -323,6 +550,19 @@ export function HomePage() {
     const maxSize = config?.maxFileSize || UPLOAD_LIMITS.MAX_FILE_SIZE;
     const canUpload = files.length > 0 && totalSize <= maxSize && !isUploading;
 
+    // How the engine resume card behaves: 'finish' needs no source,
+    // 'one-click' re-acquires a persisted handle [R13], and 'discard-only'
+    // covers uploads that cannot resume (multi-file mid-production,
+    // single-file without a handle) — those must still offer "Start fresh" so
+    // their staged data and server-side multipart can be discarded.
+    const engineResumeMode = engineResumable
+        ? engineResumable.action === 'finish'
+            ? 'finish'
+            : engineResumable.action === 'need-source-single' && engineResumable.handle
+              ? 'one-click'
+              : 'discard-only'
+        : null;
+
     return (
         <div className="pt-24 pb-16 px-6">
             <div className="max-w-main-card mx-auto flex flex-col gap-section">
@@ -383,7 +623,59 @@ export function HomePage() {
                             </div>
                         )}
 
-                        {!isUploading && !resumableUpload && (
+                        {!isUploading && !resumableUpload && engineResumable && (
+                            <div className="bg-overlay-subtle border border-border-medium rounded-element p-6 flex flex-col items-center gap-4 text-center">
+                                <Upload className="h-8 w-8 text-content-secondary" />
+                                <div>
+                                    <p className="text-paragraph-sm font-medium text-content-primary mb-1">
+                                        {engineResumeMode === 'finish'
+                                            ? 'Finish upload — no file selection needed'
+                                            : engineResumeMode === 'one-click'
+                                              ? 'Resume upload — no file selection needed'
+                                              : 'Interrupted upload cannot be resumed'}
+                                    </p>
+                                    <p className="text-paragraph-xs text-content-secondary">
+                                        <span className="font-medium">
+                                            {engineResumable.fileName}
+                                        </span>{' '}
+                                        ({formatBytes(engineResumable.size)}) &mdash;{' '}
+                                        {engineResumeMode === 'finish'
+                                            ? 'every remaining byte is already saved, so this upload can finish right away.'
+                                            : engineResumeMode === 'one-click'
+                                              ? 'a reference to the file was saved, so this upload can resume with one click.'
+                                              : engineResumable.action === 'need-source-multi'
+                                                ? 'multi-file uploads cannot continue after an interruption this early — start fresh to upload the files again and free the saved data.'
+                                                : 'this upload cannot continue automatically — start fresh to upload the file again and free the saved data.'}
+                                    </p>
+                                </div>
+                                <div className="flex gap-3 w-full">
+                                    {engineResumeMode === 'finish' && (
+                                        <Button className="flex-1" onClick={handleEngineFinish}>
+                                            Finish upload
+                                        </Button>
+                                    )}
+                                    {engineResumeMode === 'one-click' && (
+                                        <Button
+                                            className="flex-1"
+                                            onClick={handleEngineHandleResume}
+                                        >
+                                            Resume upload
+                                        </Button>
+                                    )}
+                                    {engineResumeMode === 'discard-only' ? (
+                                        <Button className="flex-1" onClick={handleEngineStartFresh}>
+                                            Start fresh
+                                        </Button>
+                                    ) : (
+                                        <Button variant="ghost" onClick={handleEngineStartFresh}>
+                                            Start fresh
+                                        </Button>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {!isUploading && !resumableUpload && !engineResumable && (
                             <>
                                 <DropZone />
 

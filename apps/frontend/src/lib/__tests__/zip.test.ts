@@ -377,6 +377,32 @@ describe('createStreamingZip (findings 4, 33, 34)', () => {
         await expect(zip.dispose()).resolves.toBeUndefined();
         await expect(zip.dispose()).resolves.toBeUndefined();
     });
+
+    it('uses the injected streamFactory instead of file.stream()', async () => {
+        const file = new File([new Uint8Array([1, 2, 3, 4])], 'a.bin');
+        let streamCalls = 0;
+        const originalStream = file.stream.bind(file);
+        file.stream = () => {
+            streamCalls++;
+            return originalStream();
+        };
+        let factoryCalls = 0;
+        const factory = () => {
+            factoryCalls++;
+            return new Blob([new Uint8Array([1, 2, 3, 4])]).stream() as ReadableStream<Uint8Array>;
+        };
+
+        const withFactory = await drain(
+            createStreamingZip([file], undefined, { streamFactory: factory }).stream,
+        );
+        expect(factoryCalls).toBe(1);
+        expect(streamCalls).toBe(0);
+
+        const without = await drain(createStreamingZip([file]).stream);
+        expect(streamCalls).toBe(1);
+        // Same file object → same lastModified in both archives.
+        expect(withFactory).toEqual(without); // byte-identical archives
+    });
 });
 
 describe('generateZipFilename', () => {

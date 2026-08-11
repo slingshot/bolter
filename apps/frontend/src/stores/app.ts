@@ -10,6 +10,13 @@ export interface FileItem {
     status: 'pending' | 'uploading' | 'completed' | 'error';
     progress: number;
     error?: string;
+    /**
+     * File System Access handle for this file (Chromium: top-level drag-drop
+     * or `showOpenFilePicker`). Persisted with the upload engine's lease so an
+     * interrupted upload can offer one-click resume — no manual re-pick.
+     * Folder-traversal files and plain `<input>` picks are handleless.
+     */
+    handle?: FileSystemFileHandle;
 }
 
 export interface UploadedFile {
@@ -97,7 +104,9 @@ export interface AppState {
 
     // Files to upload
     files: FileItem[];
-    addFiles: (files: File[]) => void;
+    /** `handles` is positional (parallel to `files`); entries without a File
+     * System Access handle pass `undefined`. */
+    addFiles: (files: File[], handles?: ReadonlyArray<FileSystemFileHandle | undefined>) => void;
     removeFile: (id: string) => void;
     clearFiles: () => void;
 
@@ -186,12 +195,13 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Files
     files: [],
-    addFiles: (newFiles) => {
-        const items: FileItem[] = newFiles.map((file) => ({
+    addFiles: (newFiles, handles) => {
+        const items: FileItem[] = newFiles.map((file, index) => ({
             id: generateUUID(),
             file,
             status: 'pending',
             progress: 0,
+            handle: handles?.[index],
         }));
         set((state) => ({ files: [...state.files, ...items] }));
     },

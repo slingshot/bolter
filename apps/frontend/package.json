@@ -10,7 +10,8 @@
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
         "test:watch": "vitest",
-        "test:coverage": "vitest run --coverage"
+        "test:coverage": "vitest run --coverage",
+        "e2e": "playwright test"
     },
     "dependencies": {
         "@bolter/shared": "workspace:*",
@@ -36,6 +37,7 @@
         "zustand": "^4.4.7"
     },
     "devDependencies": {
+        "@playwright/test": "^1.62.1",
         "@sentry/vite-plugin": "^4.7.0",
         "@testing-library/jest-dom": "^6.9.1",
         "@testing-library/react": "^16.3.2",

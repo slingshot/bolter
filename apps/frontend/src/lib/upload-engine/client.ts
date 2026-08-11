@@ -1,0 +1,741 @@
+/**
+ * Main-thread facade for the worker upload engine: eligibility probe, worker
+ * spawn, typed message relay, connectivity relay, and cancel escalation.
+ *
+ * This is the one engine module that intentionally runs on the main thread —
+ * it owns the `window` online/offline relay and the `localStorage` kill
+ * switch, and must never be imported from the worker.
+ *
+ * Cancel is an acknowledged protocol [R6]: the client posts `cancel` and the
+ * worker aborts its XHRs, performs the authenticated server-side abort, and
+ * acks with `cancelled` before running its local cleanup. If no ack arrives
+ * within 10s wall-clock (worker crashed or suspended), the client terminates
+ * the worker and performs the authenticated abort *and the worker's local
+ * teardown* (engine records + OPFS staging) itself — preserving the
+ * guarantees of the legacy synchronous `Canceller.cancel()`, which also
+ * deletes its persisted resume state on cancel.
+ */
+
+import { newUploadAttemptId, trackEngineEvent, trackUploadAttempt } from '../plausible';
+import { acquireUploadLock, onStoragePersistResult } from '../upload-lifecycle';
+import type { EngineResult } from './engine';
+import { OpfsPartStore, UPLOADS_DIR } from './part-store';
+import type {
+    ClientToWorker,
+    EngineJob,
+    EngineProbeRequest,
+    EngineProbeResult,
+    WorkerToClient,
+} from './protocol';
+import { planResume, reconcileEngineState } from './resume';
+import {
+    type CompletionEnvelope,
+    type EngineLease,
+    type EngineStateStore,
+    type HandleSourceFacts,
+    openEngineState,
+} from './state';
+
+/** `localStorage[ENGINE_KILL_SWITCH_KEY] === 'off'` disables the engine. */
+export const ENGINE_KILL_SWITCH_KEY = 'bolter:upload-engine';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+
+const CANCEL_ACK_TIMEOUT_MS = 10_000;
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Absolute cap on engine lease retention, mirroring the legacy store's 7-day
+ * `cleanupExpiredUploads` cutoff. A lease also expires with the server
+ * metadata TTL (`envelope.timeLimit`) — past it the multipart is dead
+ * server-side and nothing local is worth keeping.
+ */
+const ENGINE_LEASE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Worker creation is injectable for tests, but the `new Worker(new URL(...))`
+// literal must stay in this module for Vite's static analysis [R17].
+let workerFactory: () => Worker = () =>
+    new Worker(new URL('./engine.worker.ts', import.meta.url), { type: 'module' });
+
+export function setWorkerFactory(f: () => Worker): void {
+    workerFactory = f;
+}
+
+export interface EngineEligibility {
+    eligible: boolean;
+    reason?: string;
+}
+
+export interface EngineClientHooks {
+    /** `atMs` is the worker's own clock reading for these bytes — see the
+     * `progress` message in `protocol.ts`. Relayed verbatim so speed is never
+     * timed by main-thread delivery. */
+    onProgress(sent: number, total: number, atMs?: number): void;
+    onRetry(): void;
+}
+
+/** Terminal engine failure relayed from the worker; `retryable` mirrors the
+ * engine's classification so callers can offer resume vs start-fresh. */
+export class EngineWorkerError extends Error {
+    readonly retryable: boolean;
+
+    constructor(message: string, retryable: boolean) {
+        super(message);
+        this.name = 'EngineWorkerError';
+        this.retryable = retryable;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry [R16] — every event correlates on a random per-attempt id, never
+// a file identifier. This data is the evidence for eventually deleting the
+// legacy pipeline.
+// ---------------------------------------------------------------------------
+
+/** The engine decision recorded for the in-flight upload attempt. */
+export interface UploadAttemptTelemetry {
+    attemptId: string;
+    engine: 'worker' | 'legacy';
+}
+
+let currentAttempt: UploadAttemptTelemetry | undefined;
+let pendingPersistDetail: string | undefined;
+
+/**
+ * The most recent delegation decision — Home.tsx stamps the upload success
+ * event with its `engine`. Undefined until a probe (or engine resume) runs,
+ * and after `resetUploadAttemptTelemetry`.
+ */
+export function currentUploadAttempt(): UploadAttemptTelemetry | undefined {
+    return currentAttempt;
+}
+
+/**
+ * Called at upload start so an upload that never reaches the delegation
+ * decision (below the multipart threshold) cannot inherit the previous
+ * attempt's engine label.
+ */
+export function resetUploadAttemptTelemetry(): void {
+    currentAttempt = undefined;
+}
+
+/** Mint the attempt this run's engine events correlate on. Callers emit
+ * their primary event, then `flushPendingPersistResult()`. */
+function beginTelemetryAttempt(engine: 'worker' | 'legacy'): UploadAttemptTelemetry {
+    currentAttempt = { attemptId: newUploadAttemptId(), engine };
+    return currentAttempt;
+}
+
+function engineEvent(
+    event: 'failure' | 'resume' | 'cancel' | 'replay' | 'persist-result',
+    detail?: string,
+): void {
+    const attempt = currentAttempt ?? beginTelemetryAttempt('worker');
+    trackEngineEvent({
+        attemptId: attempt.attemptId,
+        event,
+        ...(detail !== undefined && { detail }),
+    });
+}
+
+function flushPendingPersistResult(): void {
+    if (pendingPersistDetail !== undefined && currentAttempt !== undefined) {
+        trackEngineEvent({
+            attemptId: currentAttempt.attemptId,
+            event: 'persist-result',
+            detail: pendingPersistDetail,
+        });
+        pendingPersistDetail = undefined;
+    }
+}
+
+// The lifecycle wrapper requests storage.persist() before the delegation
+// decision has minted an attempt id, so an early result is buffered and
+// flushed with the attempt it belongs to.
+onStoragePersistResult((result) => {
+    if (currentAttempt !== undefined) {
+        engineEvent('persist-result', result);
+    } else {
+        pendingPersistDetail = result;
+    }
+});
+
+/**
+ * Record that an upload the probe already labeled `worker` fell back to the
+ * legacy pipeline after the delegation decision (e.g. the backend sized the
+ * allocation below its multipart threshold and declined). Without the
+ * re-label the attempt — and the success event Home stamps from it — would
+ * credit the worker engine for an upload the legacy path performed,
+ * corrupting the evidence base for deleting the legacy pipeline [R16].
+ */
+export function recordEngineFallback(reason: string): void {
+    const attempt = beginTelemetryAttempt('legacy');
+    trackUploadAttempt({ engine: 'legacy', reason, attemptId: attempt.attemptId });
+    flushPendingPersistResult();
+}
+
+function killSwitchOn(): boolean {
+    try {
+        return (
+            typeof localStorage !== 'undefined' &&
+            localStorage.getItem(ENGINE_KILL_SWITCH_KEY) === 'off'
+        );
+    } catch {
+        // Storage access can throw in privacy modes — that alone is not a veto
+        // (the OPFS round trip below is the real capability check).
+        return false;
+    }
+}
+
+/**
+ * Worker + OPFS capability is a property of the browser, not of the upload —
+ * it cannot change between two uploads of one session. The first probe's
+ * promise is therefore reused for the rest of the session, negative verdicts
+ * included: an unhappy probe is the expensive one (a spawned-but-hung worker
+ * costs a full `PROBE_TIMEOUT_MS`), and re-paying that on every upload buys
+ * an answer that cannot have changed.
+ */
+let capabilityProbe: Promise<EngineEligibility> | undefined;
+
+/** Test seam: forget the cached capability verdict. */
+export function resetEligibilityCacheForTests(): void {
+    capabilityProbe = undefined;
+}
+
+function probeCapability(): Promise<EngineEligibility> {
+    // `probeEnvironment` resolves rather than rejects on every failure it
+    // anticipates; the catch covers the rest, so one unlucky probe can never
+    // cache a rejected promise for the session.
+    capabilityProbe ??= probeEnvironment().catch(
+        (err): EngineEligibility => ({
+            eligible: false,
+            reason: err instanceof Error ? err.message : String(err),
+        }),
+    );
+    return capabilityProbe;
+}
+
+/**
+ * Per-upload eligibility probe: kill switch → cached capability probe (worker
+ * spawn → OPFS `getDirectory` → 1-byte sync-access-handle write/read round
+ * trip). Any failure means the caller falls through to the legacy pipeline
+ * silently. Either outcome is the delegation decision, so it emits the
+ * attempt telemetry event [R16].
+ */
+export async function probeEligibility(): Promise<EngineEligibility> {
+    // The kill switch is deliberately outside the cache: it is flipped by
+    // hand mid-session to move a stuck user back onto the legacy pipeline, so
+    // it has to take effect on the very next upload — not the next reload.
+    const result: EngineEligibility = killSwitchOn()
+        ? { eligible: false, reason: 'kill-switch' }
+        : await probeCapability();
+    const attempt = beginTelemetryAttempt(result.eligible ? 'worker' : 'legacy');
+    trackUploadAttempt({
+        engine: attempt.engine,
+        ...(result.eligible || result.reason === undefined ? {} : { reason: result.reason }),
+        attemptId: attempt.attemptId,
+    });
+    flushPendingPersistResult();
+    return result;
+}
+
+async function probeEnvironment(): Promise<EngineEligibility> {
+    if (typeof Worker === 'undefined') {
+        return { eligible: false, reason: 'no-worker' };
+    }
+    let worker: Worker;
+    try {
+        worker = workerFactory();
+    } catch {
+        return { eligible: false, reason: 'worker-spawn-failed' };
+    }
+    try {
+        const result = await new Promise<EngineProbeResult>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('probe timed out')), PROBE_TIMEOUT_MS);
+            worker.onmessage = (event: MessageEvent) => {
+                const message = event.data as EngineProbeResult | undefined;
+                if (message?.type === 'probe-result') {
+                    clearTimeout(timer);
+                    resolve(message);
+                }
+            };
+            worker.onerror = (event) => {
+                clearTimeout(timer);
+                reject(new Error(event.message || 'engine worker failed to start'));
+            };
+            worker.postMessage({ type: 'probe' } satisfies EngineProbeRequest);
+        });
+        return result.ok
+            ? { eligible: true }
+            : { eligible: false, reason: result.reason ?? 'probe-failed' };
+    } catch (err) {
+        return {
+            eligible: false,
+            reason: err instanceof Error ? err.message : String(err),
+        };
+    } finally {
+        worker.terminate();
+    }
+}
+
+/**
+ * Run one engine job in a fresh worker. Resolves on `done`, rejects with
+ * `EngineWorkerError` on `error` and with a plain cancellation error once a
+ * cancel completes (acked or escalated). Relays `online`/`offline` window
+ * events to the worker as `connectivity` messages for the whole run.
+ */
+export function runEngineInWorker(
+    job: EngineJob,
+    envelope: CompletionEnvelope,
+    hooks: EngineClientHooks,
+    canceller: { onCancel(cb: () => void): void },
+): Promise<EngineResult> {
+    return runWorkerJob(
+        { type: 'start', job, envelope },
+        { fileId: job.fileId, uploadId: job.uploadId, uploadToken: job.uploadToken },
+        hooks,
+        canceller,
+    );
+}
+
+/**
+ * Resume a persisted engine upload in a fresh worker (`executeResume` runs
+ * in-worker: completion replay or finish-staged). The lease supplies the
+ * uploadId/uploadToken the cancel-escalation abort needs.
+ */
+export async function resumeEngineUploadInWorker(
+    fileId: string,
+    hooks: EngineClientHooks,
+    canceller: { onCancel(cb: () => void): void },
+): Promise<EngineResult> {
+    const lease = await getEngineLease(fileId);
+    if (!lease) {
+        throw new Error(`no engine lease for upload ${fileId} — nothing to resume`);
+    }
+    // A resume is a fresh telemetry attempt: mint the id its engine events
+    // correlate on, report which resume-tree branch ran (the plan action is a
+    // fixed vocabulary — no file identifiers [R16]), and flag completion
+    // replays explicitly.
+    beginTelemetryAttempt('worker');
+    try {
+        const state = await openEngineState();
+        const [envelope, checkpoint, parts] = await Promise.all([
+            state.getEnvelope(fileId),
+            state.getCheckpoint(fileId),
+            state.getParts(fileId),
+        ]);
+        const plan = planResume(lease, envelope, checkpoint, parts);
+        engineEvent('resume', plan.action);
+        if (plan.action === 'replay-complete') {
+            engineEvent('replay');
+        }
+    } catch {
+        engineEvent('resume'); // branch unknown — still count the resume
+    }
+    flushPendingPersistResult();
+    return runWorkerJob(
+        { type: 'resume', fileId },
+        { fileId, uploadId: lease.uploadId, uploadToken: lease.uploadToken },
+        hooks,
+        canceller,
+    );
+}
+
+/** Credentials the cancel-escalation path needs for the main-thread abort. */
+interface WorkerAbortIdentity {
+    fileId: string;
+    uploadId: string;
+    uploadToken?: string;
+}
+
+function runWorkerJob(
+    initial: ClientToWorker,
+    identity: WorkerAbortIdentity,
+    hooks: EngineClientHooks,
+    canceller: { onCancel(cb: () => void): void },
+): Promise<EngineResult> {
+    const worker = workerFactory();
+    return new Promise<EngineResult>((resolve, reject) => {
+        let settled = false;
+        let cancelRequested = false;
+        let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+
+        const post = (message: ClientToWorker) => worker.postMessage(message);
+        const onOnline = () => post({ type: 'connectivity', online: true });
+        const onOffline = () => post({ type: 'connectivity', online: false });
+        if (typeof window !== 'undefined') {
+            window.addEventListener('online', onOnline);
+            window.addEventListener('offline', onOffline);
+        }
+
+        const settle = (finish: () => void) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            if (escalationTimer !== undefined) {
+                clearTimeout(escalationTimer);
+            }
+            if (typeof window !== 'undefined') {
+                window.removeEventListener('online', onOnline);
+                window.removeEventListener('offline', onOffline);
+            }
+            finish();
+        };
+
+        worker.onmessage = (event: MessageEvent) => {
+            const message = event.data as WorkerToClient;
+            switch (message.type) {
+                case 'progress':
+                    hooks.onProgress(message.bytesSent, message.totalBytes, message.atMs);
+                    break;
+                case 'retry':
+                    hooks.onRetry();
+                    break;
+                case 'done':
+                    settle(() => resolve({ actualSize: message.actualSize }));
+                    break;
+                case 'error':
+                    settle(() => {
+                        worker.terminate();
+                        // Failure telemetry carries the pipeline stage [R16]
+                        // — quota exhaustion, transport faults, and
+                        // completion rejections must be distinguishable.
+                        const severity = message.retryable ? 'retryable' : 'fatal';
+                        engineEvent(
+                            'failure',
+                            message.stage ? `${message.stage}:${severity}` : severity,
+                        );
+                        reject(new EngineWorkerError(message.message, message.retryable));
+                    });
+                    break;
+                case 'cancelled':
+                    // Ack received: the worker still has local cleanup to run
+                    // (part-store destroy, state clear) and closes itself when
+                    // finished — terminating here would kill that cleanup
+                    // mid-flight [R6].
+                    settle(() => {
+                        engineEvent('cancel', 'acked');
+                        reject(new Error('Upload cancelled'));
+                    });
+                    break;
+            }
+        };
+        worker.onerror = (event) => {
+            settle(() => {
+                worker.terminate();
+                engineEvent('failure', 'worker-crash');
+                reject(new EngineWorkerError(event.message || 'engine worker crashed', true));
+            });
+        };
+
+        canceller.onCancel(() => {
+            if (settled || cancelRequested) {
+                return;
+            }
+            cancelRequested = true;
+            post({ type: 'cancel' });
+            // Escalation [R6]: no ack within the window means the worker is
+            // crashed or suspended — kill it and run the authenticated abort
+            // plus the worker's local teardown from the main thread instead.
+            escalationTimer = setTimeout(() => {
+                settle(() => {
+                    worker.terminate();
+                    engineEvent('cancel', 'escalated');
+                    void escalatedCancelCleanup(identity);
+                    reject(new Error('Upload cancelled'));
+                });
+            }, CANCEL_ACK_TIMEOUT_MS);
+        });
+
+        post(initial);
+    });
+}
+
+/**
+ * The escalation path's replacement for the worker's `cancelCleanup`: after
+ * the terminate, run the authenticated server-side abort and then the same
+ * local teardown the acked path performs (engine records + OPFS staging).
+ * Without it a cancelled upload leaves a phantom "Finish upload" resume card,
+ * the staged ciphertext + `secretKeyB64` survive indefinitely behind the
+ * lease, and — if the abort also failed — clicking Finish could genuinely
+ * publish the upload the user cancelled. Every step is best-effort: the
+ * bucket lifecycle rule and startup GC reap whatever a failed step leaves.
+ */
+async function escalatedCancelCleanup(identity: WorkerAbortIdentity): Promise<void> {
+    // Server-side abort first — mirrors the worker's cancelCleanup order, so
+    // the local records survive until the abort has had its chance.
+    await abortEngineUpload(identity.fileId, identity.uploadId, identity.uploadToken).catch(
+        () => undefined,
+    );
+    await clearEngineUploadLocally(identity.fileId);
+}
+
+/** Local half of a discard: engine DB records + the OPFS staging directory. */
+async function clearEngineUploadLocally(fileId: string): Promise<void> {
+    try {
+        const state = await openEngineState();
+        await state.clearUpload(fileId);
+    } catch {
+        // best-effort — lease-expiry GC covers leftovers
+    }
+    await new OpfsPartStore(fileId).destroy().catch(() => undefined);
+}
+
+/**
+ * Main-thread authenticated multipart abort — the same `/upload/abort/:id`
+ * contract the worker uses, for the cancel-escalation path where the worker
+ * can no longer be trusted to make the call itself.
+ */
+export async function abortEngineUpload(
+    fileId: string,
+    uploadId: string,
+    uploadToken?: string,
+): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/upload/abort/${fileId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, ...(uploadToken !== undefined && { uploadToken }) }),
+    });
+    if (!response.ok) {
+        throw new Error(`failed to abort upload: HTTP ${response.status}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine persistence access + startup maintenance (resume offers, OPFS GC)
+// ---------------------------------------------------------------------------
+
+/** The engine lease for `fileId`, or undefined when none (or no IndexedDB). */
+export async function getEngineLease(fileId: string): Promise<EngineLease | undefined> {
+    try {
+        const state = await openEngineState();
+        return await state.getLease(fileId);
+    } catch {
+        return undefined; // no engine DB → nothing the engine could resume
+    }
+}
+
+/** True when `fileId` belongs to the worker engine (routing for resumes). */
+export async function hasEngineLease(fileId: string): Promise<boolean> {
+    return (await getEngineLease(fileId)) !== undefined;
+}
+
+/**
+ * A persisted engine upload the resume UI can offer. `action: 'finish'`
+ * covers both `replay-complete` and `finish-staged` plans — neither needs the
+ * source re-picked ("Finish upload — no file selection needed"). The
+ * `need-source-*` actions are surfaced for later tasks (persisted-handle
+ * one-click resume; multi-file start-fresh).
+ */
+export interface EngineResumeCandidate {
+    fileId: string;
+    fileName: string;
+    size: number; // original input bytes (manifest sum)
+    encrypted: boolean;
+    secretKeyB64?: string;
+    timeLimit: number;
+    downloadLimit: number;
+    createdAt: number;
+    action: 'finish' | 'need-source-single' | 'need-source-multi';
+    /**
+     * Persisted File System Access handle for a `need-source-single` resume
+     * (Chromium [R13]) — present only when its verification facts survived
+     * too, i.e. only when one-click resume is actually possible.
+     */
+    handle?: FileSystemFileHandle;
+    /** Verification facts for `handle`'s file (see `verifyHandleFile`). */
+    handleFacts?: HandleSourceFacts;
+}
+
+/**
+ * Startup maintenance: expire dead leases, plan a resume offer for each
+ * surviving engine lease, then garbage-collect OPFS staging directories with
+ * no lease — skipping any directory whose `upload:<fileId>` Web Lock is held
+ * by a live holder [R12]. Expiry is the engine's equivalent of the legacy
+ * `cleanupExpiredUploads`: past `min(envelope.timeLimit, 7 days)` the
+ * multipart is gone server-side, so retaining the lease would only preserve
+ * `secretKeyB64` and staged ciphertext in origin storage indefinitely.
+ * Never throws; an environment without OPFS/IndexedDB simply yields no
+ * candidates.
+ */
+export async function engineStartupMaintenance(): Promise<EngineResumeCandidate[]> {
+    // Warm the capability cache off the critical path. Startup is the one
+    // moment the answer can be computed while nobody is waiting on it, so the
+    // session's first upload finds it already decided instead of paying the
+    // worker spawn + OPFS round trip — or a PROBE_TIMEOUT_MS hang — inline.
+    // Deliberately `probeCapability`, not `probeEligibility`: the latter mints
+    // the delegation-decision telemetry attempt, which must stay one per
+    // upload. One per page load would inflate the very attempt counts that are
+    // the evidence for deleting the legacy pipeline [R16], and would leave a
+    // stale engine label in `currentUploadAttempt()` for Home's success event.
+    // The kill switch still gates it: a disabled engine spawns nothing.
+    if (!killSwitchOn()) {
+        void probeCapability();
+    }
+    let state: EngineStateStore;
+    try {
+        state = await openEngineState();
+    } catch {
+        return [];
+    }
+    const leases = await state.listLeases().catch(() => [] as EngineLease[]);
+    const live = new Set<string>();
+    const candidates: EngineResumeCandidate[] = [];
+    const now = Date.now();
+    for (const lease of leases) {
+        try {
+            const [envelope, checkpoint, parts] = await Promise.all([
+                state.getEnvelope(lease.fileId),
+                state.getCheckpoint(lease.fileId),
+                state.getParts(lease.fileId),
+            ]);
+            // Lease expiry GC: server-side the upload died at the metadata
+            // TTL; 7 days bounds even envelope-less crash leftovers. The
+            // discard runs under the upload's Web Lock — a busy lock means a
+            // live (long-running) holder, which is kept.
+            const expiryMs = Math.min(
+                envelope ? envelope.timeLimit * 1000 : Number.POSITIVE_INFINITY,
+                ENGINE_LEASE_MAX_AGE_MS,
+            );
+            if (now - lease.createdAt > expiryMs) {
+                try {
+                    await acquireUploadLock(lease.fileId, () => discardEngineUpload(lease.fileId));
+                } catch {
+                    live.add(lease.fileId); // live holder — not ours to reap
+                }
+                continue;
+            }
+            // Every surviving leased directory stays live — including the
+            // lease-only crash window before the envelope lands, which may be
+            // another tab's just-started upload.
+            live.add(lease.fileId);
+            if (!envelope) {
+                continue;
+            }
+            // Reconcile OPFS against the DB before planning [R4], under the
+            // upload's Web Lock so a live run in another tab is never walked
+            // over. A busy lock or an OPFS-less environment plans from the
+            // records as-is.
+            let planCheckpoint = checkpoint;
+            let planParts = parts;
+            try {
+                ({ checkpoint: planCheckpoint, parts: planParts } = await acquireUploadLock(
+                    lease.fileId,
+                    () =>
+                        reconcileEngineState(
+                            lease.fileId,
+                            envelope.encrypted,
+                            state,
+                            new OpfsPartStore(lease.fileId),
+                        ),
+                ));
+            } catch {
+                // best-effort — the plan below still runs
+            }
+            const plan = planResume(lease, envelope, planCheckpoint, planParts);
+            if (plan.action === 'unrecoverable') {
+                continue;
+            }
+            const action =
+                plan.action === 'need-source'
+                    ? plan.kind === 'multi'
+                        ? 'need-source-multi'
+                        : 'need-source-single'
+                    : 'finish';
+            // A handle is only useful (and only offered) when production needs
+            // its single source back AND the facts to verify it survived [R13].
+            const handle = action === 'need-source-single' ? lease.handles?.[0] : undefined;
+            const handleFacts =
+                action === 'need-source-single' ? lease.handleFacts?.[0] : undefined;
+            candidates.push({
+                fileId: lease.fileId,
+                fileName:
+                    envelope.manifest.length === 1
+                        ? envelope.manifest[0].name
+                        : (envelope.zipFilename ?? `${envelope.manifest.length} files`),
+                size: envelope.manifest.reduce((sum, entry) => sum + entry.size, 0),
+                encrypted: envelope.encrypted,
+                secretKeyB64: envelope.secretKeyB64,
+                timeLimit: envelope.timeLimit,
+                downloadLimit: envelope.downloadLimit,
+                createdAt: lease.createdAt,
+                action,
+                ...(handle && handleFacts && { handle, handleFacts }),
+            });
+        } catch {
+            // Unreadable records: keep the staged bytes, offer nothing.
+            live.add(lease.fileId);
+        }
+    }
+    await collectOrphanedStaging(live).catch(() => undefined);
+    return candidates;
+}
+
+/**
+ * Discard a persisted engine upload: best-effort server-side abort (the lease
+ * holds the only uploadId/uploadToken copy), then clear engine state and the
+ * OPFS staging directory. Never throws — the bucket lifecycle rule and the
+ * startup GC reap anything a failed step leaves behind.
+ */
+export async function discardEngineUpload(fileId: string): Promise<void> {
+    try {
+        const state = await openEngineState();
+        const lease = await state.getLease(fileId);
+        if (lease) {
+            await abortEngineUpload(fileId, lease.uploadId, lease.uploadToken).catch(
+                () => undefined,
+            );
+        }
+    } catch {
+        // best-effort — startup GC covers leftovers
+    }
+    await clearEngineUploadLocally(fileId);
+}
+
+// Minimal structural OPFS surface (directory iteration works on the main
+// thread; only sync access handles are worker-only).
+interface MaintenanceDirectoryHandle {
+    getDirectoryHandle(name: string): Promise<MaintenanceDirectoryHandle>;
+    keys(): AsyncIterableIterator<string>;
+}
+
+async function listStagedUploadIds(): Promise<string[]> {
+    const storage = globalThis.navigator?.storage;
+    if (!storage || typeof storage.getDirectory !== 'function') {
+        return [];
+    }
+    try {
+        const root = (await storage.getDirectory()) as unknown as MaintenanceDirectoryHandle;
+        const uploads = await root.getDirectoryHandle(UPLOADS_DIR);
+        const ids: string[] = [];
+        for await (const name of uploads.keys()) {
+            ids.push(name);
+        }
+        return ids;
+    } catch {
+        return []; // no uploads directory → nothing staged
+    }
+}
+
+/**
+ * Delete `uploads/<id>` dirs with no lease and no live lock holder [R12].
+ * Each deletion runs while holding the dir's `upload:<fileId>` Web Lock for
+ * the full delete — a busy lock (`UploadLockBusyError`) means a live upload
+ * in another tab or worker and the directory is skipped; holding the lock
+ * through the delete closes the probe-then-release TOCTOU window.
+ */
+async function collectOrphanedStaging(liveFileIds: Set<string>): Promise<void> {
+    const staged = await listStagedUploadIds();
+    for (const id of staged) {
+        if (liveFileIds.has(id)) {
+            continue;
+        }
+        try {
+            await acquireUploadLock(id, () => new OpfsPartStore(id).destroy());
+        } catch {
+            // Busy (live holder) or a failed delete — keep the bytes; the
+            // next startup pass retries.
+        }
+    }
+}

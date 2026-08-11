@@ -4,6 +4,7 @@
  */
 
 import { PART_SIZE_TIERS, UPLOAD_LIMITS } from '@bolter/shared';
+import { predictLength } from 'client-zip';
 import {
     arrayToB64,
     b64ToArray,
@@ -25,6 +26,19 @@ import {
     savedToDiskPlaceholder,
 } from './stream-saver';
 import {
+    getEngineLease,
+    hasEngineLease,
+    probeEligibility,
+    recordEngineFallback,
+    resumeEngineUploadInWorker,
+    runEngineInWorker,
+} from './upload-engine/client';
+import { createEngineProgressReporter } from './upload-engine/progress-reporter';
+import type { EngineJob, EngineSource } from './upload-engine/protocol';
+import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
+import { withUploadLifecycle } from './upload-lifecycle';
+import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
+import {
     computeContentFingerprint,
     deleteUploadState,
     discardUploadState,
@@ -33,6 +47,7 @@ import {
     updateCompletedPart,
 } from './upload-state';
 import {
+    createNameDeduplicator,
     createStreamingZip,
     createZipFromUploadFiles,
     createZipStreamFromConcatenated,
@@ -42,6 +57,10 @@ import {
 } from './zip';
 
 export { FileReadError } from './errors';
+// Re-exported for the persisted-handle one-click resume flow [R13]: callers
+// verify a handle-reacquired file with the same sampled fingerprint the
+// legacy resume uses (`verifyHandleFile` in upload-engine/resume.ts).
+export { computeContentFingerprint } from './upload-state';
 
 // Threshold for using streaming zip (500MB) - below this, buffered zip is fine
 const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
@@ -49,10 +68,8 @@ const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
 // API base URL - defaults to localhost for development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
-// Retry configuration
+// Retry configuration (backoff base/cap live in upload-shared.ts → retryDelayMs)
 const MAX_RETRIES = 10;
-const RETRY_DELAY_BASE = 2000; // 2 seconds
-const MAX_RETRY_DELAY = 60000; // 60 seconds
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
 // Download retry configuration
@@ -546,18 +563,6 @@ function getPreferredPartSize(speed: number): number | undefined {
     return PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize;
 }
 
-// Adaptive concurrency based on file size
-// R2 limits concurrent part uploads to ~2-3 per upload ID, so we cap at 3.
-// With backpressure, memory is bounded to ~(concurrency + 1) * partSize
-// e.g., concurrency 3 with 200MB parts = max ~800MB buffered
-function getConcurrentUploads(fileSize: number): number {
-    const GB = 1024 * 1024 * 1024;
-    if (fileSize > 50 * GB) {
-        return 2; // > 50GB: conservative for R2
-    }
-    return 3; // default: 3 concurrent uploads (R2 limit)
-}
-
 export interface UploadProgress {
     loaded: number;
     total: number;
@@ -623,6 +628,13 @@ export interface UploadOptions {
     onZipProgress?: (percent: number) => void;
     onSpeedTest?: (phase: 'started' | 'done', speedMbps?: number) => void;
     onError?: (error: UploadError) => void;
+    /**
+     * Positional (parallel to `files`): File System Access handles for entries
+     * that have one (Chromium top-level drag-drop / `showOpenFilePicker`).
+     * A single-file engine upload persists its handle with the lease so an
+     * interrupted upload can offer one-click resume after reload [R13].
+     */
+    handles?: ReadonlyArray<FileSystemFileHandle | undefined>;
 }
 
 export interface UploadError {
@@ -962,7 +974,22 @@ export async function getDownloadStatus(
  * Upload files with resilient multipart support
  * Multi-file uploads are zipped at upload time for efficient downloads
  */
-export async function uploadFiles(
+export function uploadFiles(
+    options: UploadOptions,
+    keychain: Keychain,
+    canceller: Canceller,
+): Promise<UploadResult> {
+    // Lifecycle extras (screen wake lock, one-shot storage.persist()) wrap the
+    // engine and legacy pipelines alike. The server fileId does not exist
+    // until allocation happens mid-pipeline, so the lifecycle is keyed by a
+    // per-attempt label instead.
+    const attemptLabel = `up_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    return withUploadLifecycle(attemptLabel, () =>
+        uploadFilesPipeline(options, keychain, canceller),
+    );
+}
+
+async function uploadFilesPipeline(
     options: UploadOptions,
     keychain: Keychain,
     canceller: Canceller,
@@ -977,6 +1004,35 @@ export async function uploadFiles(
         onSpeedTest,
         onError,
     } = options;
+
+    // Worker-engine delegation: multipart-sized uploads run through the
+    // worker+OPFS engine when the environment supports it; everything else
+    // falls through to the untouched legacy pipeline below. The gate mirrors
+    // the legacy multipart gate but is evaluated on the declared input size —
+    // this branch deliberately sits ahead of zip construction and
+    // encryption-stream creation [R8], so the exact zipped size is not known
+    // yet. It is a *pre-filter*: the engine re-applies the same gate on the
+    // real post-zip size before spending anything, and declines back to here.
+    const declaredInputSize = files.reduce((sum, f) => sum + f.size, 0);
+    const engineGateSize = encrypted
+        ? calculateEncryptedSize(declaredInputSize)
+        : declaredInputSize;
+    let engineHandoff: EngineDeclineHandoff | undefined;
+    if (engineGateSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+        const eligibility = await probeEligibility();
+        if (eligibility.eligible) {
+            const handoff: EngineDeclineHandoff = {};
+            const engineResult = await uploadFilesViaEngine(options, keychain, canceller, handoff);
+            if (engineResult) {
+                return engineResult;
+            }
+            engineHandoff = handoff;
+        } else {
+            console.log(
+                `[Upload] Engine ineligible (${eligibility.reason ?? 'unknown'}) — using legacy pipeline`,
+            );
+        }
+    }
 
     const startTime = Date.now();
     let lastProgressTime = startTime;
@@ -1018,6 +1074,14 @@ export async function uploadFiles(
             streamingZipStream = streamingZip.stream;
             zipFilename = streamingZip.filename;
             estimatedZipSize = streamingZip.estimatedSize;
+        } else if (engineHandoff?.zip) {
+            // A declined engine attempt already built this exact zip — same
+            // files, same deduplicated names, same DEFLATE settings. Reusing
+            // it skips a second compression pass over hundreds of megabytes,
+            // and keeps the zip progress the user just watched reach 100%
+            // from rewinding to 0.
+            uploadBlob = engineHandoff.zip.blob;
+            zipFilename = engineHandoff.zip.filename;
         } else {
             // Small files: use buffered zip for compression benefits and exact sizing
             const zipResult = await createZipFromUploadFiles(files, onZipProgress);
@@ -1568,6 +1632,255 @@ export async function uploadFiles(
 }
 
 /**
+ * Work a declined engine attempt hands back to the legacy pipeline so the
+ * fallback does not redo it. Only the buffered zip is worth carrying: it is
+ * the one expensive artefact the engine builds before it can know its own
+ * size, and it is byte-identical to the one the legacy path would build.
+ */
+interface EngineDeclineHandoff {
+    zip?: { blob: Blob; filename: string };
+}
+
+/**
+ * Upload through the worker+OPFS engine (`lib/upload-engine/`). Preflight and
+ * allocation mirror the legacy path exactly; the resulting `EngineJob` +
+ * `CompletionEnvelope` then cross into a dedicated worker that stages
+ * record-aligned parts in OPFS, uploads them, and finishes `/upload/complete`
+ * itself.
+ *
+ * Returns undefined to decline, and the caller falls through to the legacy
+ * pipeline: either the real (post-zip) size is not multipart-sized and the
+ * engine — which only runs multipart — never starts, or the backend declined
+ * multipart for an allocation that was made anyway (which is then released).
+ */
+async function uploadFilesViaEngine(
+    options: UploadOptions,
+    keychain: Keychain,
+    canceller: Canceller,
+    handoff: EngineDeclineHandoff,
+): Promise<UploadResult | undefined> {
+    const {
+        files,
+        encrypted = true,
+        timeLimit,
+        downloadLimit,
+        onProgress,
+        onZipProgress,
+        onSpeedTest,
+        handles,
+    } = options;
+    const startTime = Date.now();
+    const isMultiFile = files.length > 1;
+    const totalInputSize = files.reduce((sum, f) => sum + f.size, 0);
+
+    // Source selection mirrors the legacy strategy: buffered DEFLATE zip for
+    // small multi-file batches (exact compressed size known before
+    // allocation, ingested as a seekable blob), worker-side streaming zip for
+    // large ones (STORE — size fully determined by entry names and sizes),
+    // and the file itself for single files.
+    let source: EngineSource;
+    let plainSize: number;
+    let zipFilename: string | undefined;
+    if (isMultiFile) {
+        const streamingThreshold = isWebKit ? 100 * 1024 * 1024 : STREAMING_ZIP_THRESHOLD;
+        if (totalInputSize >= streamingThreshold) {
+            const nextEntryName = createNameDeduplicator();
+            const names = files.map((f) => nextEntryName(f.name));
+            source = { kind: 'zip', files, names };
+            // The same exact-size prediction createStreamingZip uses.
+            plainSize = Number(
+                predictLength(names.map((name, i) => ({ name, size: files[i].size }))),
+            );
+            zipFilename = generateZipFilename(
+                files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+            );
+        } else {
+            const zipResult = await createZipFromUploadFiles(files, onZipProgress);
+            source = { kind: 'blob', blob: zipResult.blob };
+            plainSize = zipResult.blob.size;
+            zipFilename = zipResult.filename;
+            handoff.zip = { blob: zipResult.blob, filename: zipResult.filename };
+            onZipProgress?.(100);
+        }
+    } else {
+        source = { kind: 'file', file: files[0] };
+        plainSize = files[0].size;
+    }
+    const totalSize = encrypted ? calculateEncryptedSize(plainSize) : plainSize;
+
+    // The delegation gate upstream could only see the declared input size.
+    // Now that the real one is known, apply the multipart gate the legacy
+    // path applies — DEFLATE routinely takes a multi-file batch under it, and
+    // the engine only runs multipart. Declining here, rather than after the
+    // preflight, is what keeps a compressible batch from paying a ~10s speed
+    // test and an allocation for a multipart the backend would decline on
+    // exactly this threshold (`useMultipart` in routes/upload.ts).
+    if (totalSize <= UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
+        console.log('[Upload] Zipped size is not multipart-sized — using legacy pipeline');
+        recordEngineFallback('below-threshold');
+        return undefined;
+    }
+
+    // Preflight speed test — identical to the legacy path.
+    onSpeedTest?.('started');
+    console.log('[Upload] Running preflight speed test...');
+    const measuredSpeed = await measureUploadSpeed(canceller);
+    const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
+    const preferredPartSize = getPreferredPartSize(measuredSpeed);
+    console.log(
+        `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
+    );
+    onSpeedTest?.('done', speedMbps);
+
+    // Cancelling during "Checking speed…" must stop here — nothing
+    // server-side exists yet.
+    if (canceller.cancelled) {
+        throw new Error('Upload cancelled');
+    }
+
+    // Allocation — the same /upload/url request the legacy path makes.
+    const uploadResponse = await fetch(`${API_BASE_URL}/upload/url`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            fileSize: totalSize,
+            encrypted,
+            timeLimit,
+            dlimit: downloadLimit,
+            preferredPartSize,
+        }),
+    });
+    if (!uploadResponse.ok) {
+        throw new Error(`HTTP ${uploadResponse.status}`);
+    }
+    const uploadInfo: UploadUrlResponse = await uploadResponse.json();
+    if (!uploadInfo.useSignedUrl) {
+        throw new Error('Pre-signed URLs not available');
+    }
+    if (!uploadInfo.multipart || !uploadInfo.parts || !uploadInfo.uploadId) {
+        // The backend sized this allocation below its multipart threshold and
+        // the engine only runs multipart. Release the allocation and fall
+        // through to the legacy pipeline (which allocates afresh) — and
+        // re-label the telemetry attempt, or the success event would credit
+        // the worker engine for a legacy-performed upload [R16].
+        console.log('[Upload] Backend declined multipart — using legacy pipeline');
+        recordEngineFallback('backend-declined-multipart');
+        await releaseUploadAllocation(uploadInfo.id, uploadInfo.owner);
+        return undefined;
+    }
+    if (canceller.cancelled) {
+        // The server-side multipart + metadata now exist — abort them.
+        await abortMultipartUpload(uploadInfo.id, uploadInfo.uploadId);
+        throw new Error('Upload cancelled');
+    }
+
+    console.log('[Upload] Using worker upload engine');
+
+    // Metadata and auth exactly as the legacy completion computes them.
+    const metadata: {
+        files: { name: string; size: number; type: string }[];
+        zipped?: boolean;
+        zipFilename?: string;
+        eceVersion?: number;
+    } = {
+        files: files.map((f) => ({
+            name: f.name,
+            size: f.size,
+            type: f.type || 'application/octet-stream',
+        })),
+        ...(encrypted && { eceVersion: ECE_VERSION }),
+    };
+    if (isMultiFile && zipFilename) {
+        metadata.zipped = true;
+        metadata.zipFilename = zipFilename;
+    }
+    const metadataString = encrypted
+        ? arrayToB64(await keychain.encryptMetadata(metadata))
+        : btoa(unescape(encodeURIComponent(JSON.stringify(metadata))));
+
+    const envelope: CompletionEnvelope = {
+        fileId: uploadInfo.id,
+        metadata: metadataString,
+        authKeyB64: await keychain.authKeyB64(),
+        manifest: files.map((f) => ({
+            name: f.name,
+            size: f.size,
+            type: f.type || 'application/octet-stream',
+        })),
+        zipFilename,
+        expectedSize: totalSize,
+        encrypted,
+        secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
+        timeLimit: timeLimit || 86400,
+        downloadLimit: downloadLimit || 1,
+    };
+    const job: EngineJob = {
+        fileId: uploadInfo.id,
+        uploadId: uploadInfo.uploadId,
+        uploadToken: uploadInfo.uploadToken,
+        ownerToken: uploadInfo.owner,
+        partUrls: uploadInfo.parts.map((p) => p.url),
+        partSize: getEffectivePartSize(uploadInfo.partSize || 0, encrypted),
+        encrypted,
+        secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
+        maxConcurrent: getConcurrentUploads(totalSize),
+        declaredTotalSize: totalSize,
+        source,
+    };
+
+    // Persisted-handle one-click resume [R13]: stash the single file's handle
+    // plus verification facts in the engine lease *before* the worker writes
+    // its own lease (the engine's lease write preserves these fields). Best
+    // effort — a Chromium-only progressive enhancement must never fail the
+    // upload. Multi-file resumes are start-fresh only, so only single-file
+    // uploads persist a handle.
+    const sourceHandle = isMultiFile ? undefined : handles?.[0];
+    if (sourceHandle) {
+        try {
+            const engineState = await openEngineState();
+            await engineState.putLease({
+                fileId: uploadInfo.id,
+                uploadId: uploadInfo.uploadId,
+                uploadToken: uploadInfo.uploadToken,
+                ownerToken: uploadInfo.owner,
+                createdAt: Date.now(),
+                engineVersion: 1,
+                handles: [sourceHandle],
+                handleFacts: [
+                    {
+                        name: files[0].name,
+                        size: files[0].size,
+                        lastModified: files[0].lastModified,
+                        fingerprint: await computeContentFingerprint(files[0]),
+                    },
+                ],
+            });
+        } catch (error) {
+            console.warn('[Upload] Could not persist file handle for one-click resume:', error);
+        }
+    }
+
+    const progress = createEngineProgressReporter(totalSize, onProgress);
+    try {
+        await runEngineInWorker(
+            job,
+            envelope,
+            { onProgress: progress.onProgress, onRetry: progress.onRetry },
+            canceller,
+        );
+    } finally {
+        progress.stop();
+    }
+
+    return {
+        id: uploadInfo.id,
+        url: `${window.location.origin}/download/${uploadInfo.id}`,
+        ownerToken: uploadInfo.owner,
+        duration: Date.now() - startTime,
+    };
+}
+
+/**
  * Resume an interrupted multipart upload using persisted state from IndexedDB
  */
 export async function resumeUpload(
@@ -1577,6 +1890,13 @@ export async function resumeUpload(
     onError?: (error: UploadError) => void,
     canceller?: Canceller,
 ): Promise<UploadResult> {
+    // Engine-lease routing: each pipeline resumes only its own uploads. A
+    // fileId with an engine lease belongs to the worker engine — the engine
+    // never writes the legacy bolter-uploads database, and vice versa.
+    if (await hasEngineLease(state.fileId)) {
+        return resumeEngineUpload(state.fileId, onProgress, canceller);
+    }
+
     const startTime = Date.now();
     const cancel = canceller || new Canceller();
 
@@ -1885,6 +2205,142 @@ export async function resumeUpload(
 }
 
 /**
+ * Resume a persisted worker-engine upload from its lease — the source-free
+ * paths ("Finish upload — no file selection needed"): the worker either
+ * replays `/upload/complete` from durable ETags or uploads the staged
+ * remainder, then completes. Rejects with `ResumeNeedsSourceError` (relayed
+ * as a worker error) when production was still incomplete.
+ */
+export async function resumeEngineUpload(
+    fileId: string,
+    onProgress?: (progress: UploadProgress) => void,
+    canceller?: Canceller,
+): Promise<UploadResult> {
+    const startTime = Date.now();
+    const lease = await getEngineLease(fileId);
+    if (!lease) {
+        throw new Error('This upload is no longer resumable. Please start a new upload.');
+    }
+    const cancel = canceller ?? new Canceller();
+    // Total is unknown until the worker's first progress event carries it.
+    const progress = createEngineProgressReporter(0, onProgress);
+    try {
+        await resumeEngineUploadInWorker(
+            fileId,
+            { onProgress: progress.onProgress, onRetry: progress.onRetry },
+            cancel,
+        );
+    } finally {
+        progress.stop();
+    }
+    return {
+        id: fileId,
+        url: `${window.location.origin}/download/${fileId}`,
+        ownerToken: lease.ownerToken,
+        duration: Date.now() - startTime,
+    };
+}
+
+/**
+ * One-click engine resume from a persisted File System Access handle [R13]:
+ * the caller has already re-acquired and *verified* the source file
+ * (`verifyHandleFile` against the lease's `handleFacts`), so this rebuilds
+ * the engine job around it — fresh part URLs from
+ * `/upload/multipart/:id/resume` (the originals died with the crashed run and
+ * are likely expired), the persisted producer checkpoint decides where
+ * production restarts — and re-enters the worker engine.
+ */
+export async function resumeEngineUploadWithFile(
+    fileId: string,
+    file: File,
+    onProgress?: (progress: UploadProgress) => void,
+    canceller?: Canceller,
+): Promise<UploadResult> {
+    const startTime = Date.now();
+    const state = await openEngineState();
+    const [lease, envelope, parts] = await Promise.all([
+        state.getLease(fileId),
+        state.getEnvelope(fileId),
+        state.getParts(fileId),
+    ]);
+    if (!lease || !envelope) {
+        throw new Error('This upload is no longer resumable. Please start a new upload.');
+    }
+
+    const completedPartNumbers = parts.filter((p) => p.uploaded).map((p) => p.partNumber);
+    const resumeResponse = await fetch(`${API_BASE_URL}/upload/multipart/${fileId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            uploadId: lease.uploadId,
+            completedPartNumbers,
+            ...(lease.uploadToken !== undefined && { uploadToken: lease.uploadToken }),
+        }),
+    });
+    if (!resumeResponse.ok) {
+        const status = resumeResponse.status;
+        // Engine state is deliberately left intact on the dead-session
+        // statuses too — the resume card's "Start fresh" owns the discard.
+        if (status === 400 || status === 404 || status === 410) {
+            throw new Error('Upload session expired. Please start a new upload.');
+        }
+        throw new Error(
+            `Resume temporarily unavailable (HTTP ${status}) — your progress is saved, please try again.`,
+        );
+    }
+    const resumeInfo: {
+        parts: Array<{ partNumber: number; url: string }>;
+        partSize: number;
+        numParts: number;
+    } = await resumeResponse.json();
+
+    // Full index-0-=-part-1 array; already-uploaded parts keep an empty slot
+    // the uploader never reads (same shape the worker's URL refresh builds).
+    const maxPart = Math.max(
+        resumeInfo.numParts ?? 0,
+        ...resumeInfo.parts.map((p) => p.partNumber),
+        0,
+    );
+    const partUrls = new Array<string>(maxPart).fill('');
+    for (const part of resumeInfo.parts) {
+        partUrls[part.partNumber - 1] = part.url;
+    }
+
+    const job: EngineJob = {
+        fileId,
+        uploadId: lease.uploadId,
+        uploadToken: lease.uploadToken,
+        ownerToken: lease.ownerToken,
+        partUrls,
+        partSize: getEffectivePartSize(resumeInfo.partSize || 0, envelope.encrypted),
+        encrypted: envelope.encrypted,
+        secretKeyB64: envelope.secretKeyB64,
+        maxConcurrent: getConcurrentUploads(envelope.expectedSize),
+        declaredTotalSize: envelope.expectedSize,
+        source: { kind: 'file', file },
+    };
+
+    const cancel = canceller ?? new Canceller();
+    const progress = createEngineProgressReporter(envelope.expectedSize, onProgress);
+    try {
+        await runEngineInWorker(
+            job,
+            envelope,
+            { onProgress: progress.onProgress, onRetry: progress.onRetry },
+            cancel,
+        );
+    } finally {
+        progress.stop();
+    }
+    return {
+        id: fileId,
+        url: `${window.location.origin}/download/${fileId}`,
+        ownerToken: lease.ownerToken,
+        duration: Date.now() - startTime,
+    };
+}
+
+/**
  * Create a readable stream from files
  */
 function createFileStream(
@@ -2129,10 +2585,7 @@ async function uploadSinglePartWithRetry(
                 throw new Error('Upload cancelled');
             }
 
-            const delay = Math.min(
-                RETRY_DELAY_BASE * 2 ** attempt + Math.random() * 1000,
-                MAX_RETRY_DELAY,
-            );
+            const delay = retryDelayMs(attempt);
             console.log(`[Upload] Retrying single-part upload in ${(delay / 1000).toFixed(1)}s...`);
             onRetry?.();
             await cancellableDelay(delay, canceller);
@@ -2776,10 +3229,7 @@ async function uploadPartWithRetry(
                 throw new Error('Upload cancelled');
             }
 
-            const delay = Math.min(
-                RETRY_DELAY_BASE * 2 ** retryCount + Math.random() * 1000,
-                MAX_RETRY_DELAY,
-            );
+            const delay = retryDelayMs(retryCount);
 
             console.log(`[Upload] Retrying part ${partNumber} in ${(delay / 1000).toFixed(1)}s...`);
 
@@ -2941,27 +3391,6 @@ function uploadPart(
         xhr.open('PUT', url);
         xhr.send(blob);
     });
-}
-
-/**
- * Check if an error is retryable
- * Includes browser abort errors (NS_BINDING_ABORTED in Firefox) which often happen
- * due to memory pressure or connection limits
- */
-function isRetryableError(error: Error): boolean {
-    const msg = (error.message || '').toLowerCase();
-    return (
-        msg.includes('network error') ||
-        msg.includes('network') ||
-        msg.includes('timeout') ||
-        msg.includes('abort') ||
-        msg.includes('stalled') ||
-        msg.includes('failed to fetch') ||
-        /http 5\d\d/.test(msg) ||
-        msg.includes('http 429') ||
-        msg.includes('http 408') ||
-        msg.includes('http 0') // Often indicates network failure
-    );
 }
 
 /**

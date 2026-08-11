@@ -17,7 +17,24 @@ import { useAppStore } from '@/stores/app';
 export interface DropTraversal {
     files: File[];
     skipped: number;
+    /**
+     * File System Access handles for **top-level dropped files only**
+     * (Chromium [R13]), keyed by the exact `File` object in `files`.
+     * Folder-traversal files are re-wrapped `File` objects and stay
+     * handleless by design.
+     */
+    handles: Map<File, FileSystemFileHandle>;
 }
+
+/** `getAsFileSystemHandle` is a Chromium extension absent from lib.dom. */
+type HandleCapableItem = DataTransferItem & {
+    getAsFileSystemHandle?: () => Promise<FileSystemHandle | null>;
+};
+
+/** `showOpenFilePicker` (File System Access API) is absent from lib.dom. */
+type FilePickerWindow = Window & {
+    showOpenFilePicker?: (options?: { multiple?: boolean }) => Promise<FileSystemFileHandle[]>;
+};
 
 // readEntries may not return all entries at once, so it must be called
 // repeatedly. Resolves with whatever was read; `failed` marks a partial read.
@@ -113,12 +130,15 @@ function getFileFromEntry(fileEntry: FileSystemFileEntry): Promise<File | null> 
 export async function processDataTransferItems(
     items: DataTransferItemList,
 ): Promise<DropTraversal> {
-    const acc: DropTraversal = { files: [], skipped: 0 };
-    const entries: FileSystemEntry[] = [];
+    const acc: DropTraversal = { files: [], skipped: 0, handles: new Map() };
+    const entries: {
+        entry: FileSystemEntry;
+        handle: Promise<FileSystemHandle | null> | null;
+    }[] = [];
 
     // Collect all entries first (must be done synchronously during the event)
     for (let i = 0; i < items.length; i++) {
-        const item = items[i];
+        const item = items[i] as HandleCapableItem;
         if (item.kind === 'file') {
             let entry: FileSystemEntry | null = null;
             try {
@@ -127,18 +147,34 @@ export async function processDataTransferItems(
                 entry = null;
             }
             if (entry) {
-                entries.push(entry);
+                // The File System Access handle must also be requested
+                // synchronously during the event. Only top-level *file*
+                // entries get one [R13] — folder-traversal files are
+                // re-wrapped `File` objects a handle cannot describe.
+                let handle: Promise<FileSystemHandle | null> | null = null;
+                if (entry.isFile && typeof item.getAsFileSystemHandle === 'function') {
+                    try {
+                        handle = item.getAsFileSystemHandle().catch(() => null);
+                    } catch {
+                        handle = null;
+                    }
+                }
+                entries.push({ entry, handle });
             }
         }
     }
 
     // Process entries asynchronously — one bad entry must not lose the rest
-    for (const entry of entries) {
+    for (const { entry, handle } of entries) {
         try {
             if (entry.isFile) {
                 const file = await getFileFromEntry(entry as FileSystemFileEntry);
                 if (file) {
                     acc.files.push(file);
+                    const resolved = handle ? await handle : null;
+                    if (resolved && resolved.kind === 'file') {
+                        acc.handles.set(file, resolved as FileSystemFileHandle);
+                    }
                 } else {
                     acc.skipped++;
                 }
@@ -209,12 +245,14 @@ export function DropZone() {
 
             let files: File[] = [];
             let skipped = 0;
+            let handles: Map<File, FileSystemFileHandle> | null = null;
 
             try {
                 if (fileItemCount > 0) {
                     const traversal = await processDataTransferItems(items);
                     files = traversal.files;
                     skipped = traversal.skipped;
+                    handles = traversal.handles;
                 }
                 if (files.length === 0 && droppedFiles.length > 0) {
                     // Nothing came back from the entry traversal — fall back to
@@ -230,7 +268,9 @@ export function DropZone() {
             }
 
             if (files.length > 0) {
-                addFiles(files);
+                // Snapshot-fallback files never appear in the traversal's
+                // handle map, so they stay handleless here automatically.
+                addFiles(files, handles ? files.map((f) => handles?.get(f)) : undefined);
             }
 
             if (files.length === 0) {
@@ -273,11 +313,47 @@ export function DropZone() {
         [addFiles],
     );
 
-    const handleFileClick = useCallback((e: React.MouseEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        fileInputRef.current?.click();
-    }, []);
+    const handleFileClick = useCallback(
+        (e: React.MouseEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const win = window as FilePickerWindow;
+            if (!('showOpenFilePicker' in window) || typeof win.showOpenFilePicker !== 'function') {
+                fileInputRef.current?.click();
+                return;
+            }
+            // File System Access picker (Chromium): picked files carry handles,
+            // enabling one-click resume of an interrupted upload [R13]. Called
+            // directly in the click handler — the picker needs user activation.
+            const picker = win.showOpenFilePicker.bind(win);
+            void (async () => {
+                let picked: { file: File; handle: FileSystemFileHandle }[];
+                try {
+                    const handles = await picker({ multiple: true });
+                    picked = await Promise.all(
+                        handles.map(async (handle) => ({ file: await handle.getFile(), handle })),
+                    );
+                } catch (error) {
+                    // AbortError = the user dismissed the picker: a no-op, not
+                    // a failed pick — re-opening the plain input would nag.
+                    if (error instanceof DOMException && error.name === 'AbortError') {
+                        return;
+                    }
+                    // Anything else (permissions policy, sandboxed frame, …):
+                    // fall back to the plain input.
+                    fileInputRef.current?.click();
+                    return;
+                }
+                if (picked.length > 0) {
+                    addFiles(
+                        picked.map((p) => p.file),
+                        picked.map((p) => p.handle),
+                    );
+                }
+            })();
+        },
+        [addFiles],
+    );
 
     const handleFolderClick = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
