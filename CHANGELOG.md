@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adaptive uploader concurrency in the worker upload engine (AIMD): the pool grows while
+  saturated and halves on HTTP 429/503, replacing the deleted speed test as the engine's
+  adaptive element. Shrinking is cooperative at part boundaries, so no in-flight bytes are
+  discarded
+- `concurrency` engine telemetry event carrying peak/final pool size and pushback count
 - Lefthook git hooks with Biome pre-commit checks and commitlint validation
 - Commitizen interactive commit helper (`bun run commit`)
 - Open-source governance files (LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT)
