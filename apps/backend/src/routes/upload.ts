@@ -4,7 +4,7 @@ import { Elysia, t } from 'elysia';
 import { config, deriveBaseUrl } from '../config';
 import { captureError } from '../lib/sentry';
 import { uploadLogger as logger } from '../logger';
-import { getReapRecord, scheduleObjectReap, unscheduleObjectReap } from '../reaper';
+import { scheduleObjectReap, unscheduleObjectReap } from '../reaper';
 import { type CompletedPart, storage } from '../storage';
 import { providerRegistry } from '../storage/provider-registry';
 
@@ -236,55 +236,6 @@ async function authorizeUploadMutation(
     return false;
 }
 
-// --- Speed-test rate limiting (#11) ---------------------------------------
-// `POST /upload/speedtest` is unauthenticated and each call mints 5 pre-signed
-// UploadPart URLs with no size constraint — an unbounded, repeatable write
-// amplification into billable incomplete-multipart storage.
-
-const SPEEDTEST_PREFIX = '__speedtest__';
-const SPEEDTEST_RATE_LIMIT = 5;
-const SPEEDTEST_RATE_WINDOW_MS = 5 * 60 * 1000;
-// A speed test that is never cleaned up by the client is swept by the reaper
-const SPEEDTEST_REAP_AFTER_MS = 15 * 60 * 1000;
-
-export class FixedWindowRateLimiter {
-    private readonly hits = new Map<string, number[]>();
-
-    constructor(
-        private readonly limit: number,
-        private readonly windowMs: number,
-    ) {}
-
-    take(key: string, now: number = Date.now()): boolean {
-        const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
-        if (recent.length >= this.limit) {
-            this.hits.set(key, recent);
-            return false;
-        }
-        recent.push(now);
-        this.hits.set(key, recent);
-
-        // Bound memory — drop buckets whose entries have all aged out
-        if (this.hits.size > 1000) {
-            for (const [k, times] of this.hits) {
-                if (times.every((t) => now - t >= this.windowMs)) {
-                    this.hits.delete(k);
-                }
-            }
-        }
-        return true;
-    }
-
-    reset(): void {
-        this.hits.clear();
-    }
-}
-
-export const speedTestRateLimiter = new FixedWindowRateLimiter(
-    SPEEDTEST_RATE_LIMIT,
-    SPEEDTEST_RATE_WINDOW_MS,
-);
-
 /**
  * Authoritative remaining lifetime of a file, read from the Redis TTL.
  *
@@ -307,25 +258,6 @@ async function readRemainingLifetime(id: string): Promise<{ expiresAt: number; t
         logger.warn({ id, error: e }, 'Failed to read remaining TTL');
     }
     return { expiresAt: Date.now() + ttlSeconds * 1000, ttl: ttlSeconds };
-}
-
-/**
- * Visitor IP for rate limiting. `cf-connecting-ip` first — Cloudflare sets it to
- * the real visitor and it survives edge rewrites of `x-forwarded-for`.
- */
-export function clientIp(request: Request): string {
-    const cf = request.headers.get('cf-connecting-ip');
-    if (cf) {
-        return cf.trim();
-    }
-    const forwarded = request.headers.get('x-forwarded-for');
-    if (forwarded) {
-        const first = forwarded.split(',')[0]?.trim();
-        if (first) {
-            return first;
-        }
-    }
-    return 'unknown';
 }
 
 export const uploadRoutes = new Elysia()
@@ -1393,167 +1325,6 @@ export const uploadRoutes = new Elysia()
                 400: t.Object({ error: t.String() }),
                 401: t.Object({ error: t.String() }),
                 404: t.Object({ error: t.String() }),
-            },
-        },
-    )
-
-    // Speed test — creates a multipart upload with 5 pre-signed part URLs.
-    // The client uploads 5x100MB parts concurrently to measure real throughput.
-    .post(
-        '/upload/speedtest',
-        async ({ request, set }) => {
-            const SPEEDTEST_NUM_PARTS = 5;
-            const testId = `${SPEEDTEST_PREFIX}${randomBytes(8).toString('hex')}`;
-
-            // Unauthenticated write amplification: each call mints 5 unbounded
-            // pre-signed UploadPart URLs, so an unthrottled loop can park
-            // terabytes of list-invisible incomplete-multipart data in the bucket
-            if (!speedTestRateLimiter.take(clientIp(request))) {
-                logger.warn({ testId }, 'Speed test rate limit exceeded');
-                set.status = 429;
-                return { error: 'Too many speed test requests' };
-            }
-
-            // Pin the provider for the whole test so cleanup can't abort against
-            // a different bucket after a concurrent provider activation
-            const providerId = storage.getActiveProviderId();
-
-            let uploadId: string | null = null;
-            try {
-                uploadId = await storage.createMultipartUpload(testId, undefined, providerId);
-                if (!uploadId) {
-                    return { error: 'Failed to create speed test upload' };
-                }
-
-                const parts = await Promise.all(
-                    Array.from({ length: SPEEDTEST_NUM_PARTS }, (_, i) =>
-                        storage
-                            .getSignedMultipartUploadUrl(
-                                testId,
-                                uploadId as string,
-                                i + 1,
-                                60,
-                                providerId,
-                            )
-                            .then((url) => ({ partNumber: i + 1, url })),
-                    ),
-                );
-
-                // Cleanup must not depend on the client coming back: register the
-                // test so the reaper aborts it if /speedtest/cleanup never arrives
-                await scheduleObjectReap({
-                    kind: 'speedtest',
-                    id: testId,
-                    providerId,
-                    uploadId,
-                    expiresAt: Date.now() + SPEEDTEST_REAP_AFTER_MS,
-                });
-
-                logger.info(
-                    { testId, uploadId, numParts: SPEEDTEST_NUM_PARTS, providerId },
-                    'Speed test URLs generated',
-                );
-                return { testId, uploadId, parts };
-            } catch (e) {
-                logger.warn({ testId, error: e }, 'Speed test setup failed');
-                if (uploadId) {
-                    await storage
-                        .abortMultipartUpload(testId, uploadId, providerId)
-                        .catch(() => undefined);
-                }
-                return { error: 'Speed test setup failed' };
-            }
-        },
-        {
-            detail: {
-                tags: ['Speed Test'],
-                summary: 'Start upload speed test',
-                description:
-                    'Creates a temporary multipart upload with 5 pre-signed part URLs for measuring upload throughput. Rate limited per client IP; abandoned tests are swept server-side.',
-            },
-            response: {
-                200: t.Object({
-                    testId: t.Optional(t.String()),
-                    uploadId: t.Optional(t.String()),
-                    parts: t.Optional(
-                        t.Array(
-                            t.Object({
-                                partNumber: t.Number(),
-                                url: t.String(),
-                            }),
-                        ),
-                    ),
-                    error: t.Optional(t.String()),
-                }),
-                429: t.Object({
-                    error: t.String(),
-                }),
-            },
-        },
-    )
-
-    // Clean up speed test object after the test completes
-    .post(
-        '/upload/speedtest/cleanup',
-        async ({ body, set }) => {
-            const { testId, uploadId } = body;
-
-            // This route aborts an arbitrary uploadId — restrict it to keys the
-            // speed test could actually have created
-            if (!testId.startsWith(SPEEDTEST_PREFIX)) {
-                logger.warn({ testId }, 'Speed test cleanup rejected — not a speed test id');
-                set.status = 400;
-                return { ok: false, error: 'Invalid speed test id' };
-            }
-
-            // Use the provider pinned at creation time; resolving "active" here
-            // would abort against the wrong bucket after a provider change and
-            // leak the real test parts behind a swallowed NoSuchUpload
-            const record = await getReapRecord(testId);
-
-            let cleaned = true;
-            try {
-                // Abort the multipart upload (cleans up parts from S3)
-                const effectiveUploadId = uploadId || record?.uploadId;
-                if (effectiveUploadId) {
-                    await storage.abortMultipartUpload(
-                        testId,
-                        effectiveUploadId,
-                        record?.providerId,
-                    );
-                }
-                logger.info({ testId }, 'Speed test cleaned up');
-            } catch (e) {
-                cleaned = false;
-                logger.warn({ testId, error: e }, 'Failed to clean up speed test');
-            }
-
-            // Drop the sweep record only if the abort actually succeeded —
-            // otherwise leave it so the reaper retries the cleanup
-            if (cleaned) {
-                await unscheduleObjectReap(testId);
-            }
-            return { ok: true };
-        },
-        {
-            detail: {
-                tags: ['Speed Test'],
-                summary: 'Clean up speed test',
-                description:
-                    'Aborts the temporary multipart upload created by the speed test, removing all test parts from S3.',
-            },
-            body: t.Object({
-                testId: t.String(),
-                uploadId: t.Optional(t.String()),
-            }),
-            response: {
-                200: t.Object({
-                    ok: t.Boolean(),
-                }),
-                400: t.Object({
-                    ok: t.Boolean(),
-                    error: t.String(),
-                }),
             },
         },
     );

@@ -52,8 +52,6 @@ import {
     calculateOptimalPartSize,
     clampDownloadLimit,
     clampExpireSeconds,
-    clientIp,
-    FixedWindowRateLimiter,
     uploadTokenEnforced,
     verifyUploadToken,
 } from '../routes/upload';
@@ -291,53 +289,5 @@ describe('uploadTokenEnforced', () => {
         expect(uploadTokenEnforced()).toBe(true);
         process.env.UPLOAD_TOKEN_ENFORCED = 'false';
         expect(uploadTokenEnforced()).toBe(false);
-    });
-});
-
-// ---------------------------------------------------------------------------
-// #11 — speed-test rate limiting
-// ---------------------------------------------------------------------------
-
-describe('FixedWindowRateLimiter', () => {
-    it('should allow up to the limit then refuse', () => {
-        const limiter = new FixedWindowRateLimiter(3, 1000);
-        expect(limiter.take('ip', 0)).toBe(true);
-        expect(limiter.take('ip', 1)).toBe(true);
-        expect(limiter.take('ip', 2)).toBe(true);
-        expect(limiter.take('ip', 3)).toBe(false);
-    });
-
-    it('should let the window slide', () => {
-        const limiter = new FixedWindowRateLimiter(1, 1000);
-        expect(limiter.take('ip', 0)).toBe(true);
-        expect(limiter.take('ip', 500)).toBe(false);
-        expect(limiter.take('ip', 1500)).toBe(true);
-    });
-
-    it('should track keys independently', () => {
-        const limiter = new FixedWindowRateLimiter(1, 1000);
-        expect(limiter.take('a', 0)).toBe(true);
-        expect(limiter.take('b', 0)).toBe(true);
-        expect(limiter.take('a', 0)).toBe(false);
-    });
-});
-
-describe('clientIp', () => {
-    function req(headers: Record<string, string>) {
-        return new Request('http://localhost/upload/speedtest', { method: 'POST', headers });
-    }
-
-    it('should prefer cf-connecting-ip', () => {
-        expect(
-            clientIp(req({ 'cf-connecting-ip': '203.0.113.9', 'x-forwarded-for': '10.0.0.1' })),
-        ).toBe('203.0.113.9');
-    });
-
-    it('should fall back to the leftmost x-forwarded-for entry', () => {
-        expect(clientIp(req({ 'x-forwarded-for': '203.0.113.9, 10.0.0.1' }))).toBe('203.0.113.9');
-    });
-
-    it('should return a stable bucket when no client IP is known', () => {
-        expect(clientIp(req({}))).toBe('unknown');
     });
 });
