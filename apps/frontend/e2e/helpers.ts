@@ -117,7 +117,9 @@ export async function installMockBackend(
 
     const fulfillPut = async (route: Route, partNumber: number): Promise<void> => {
         // Intercepted requests carry no Content-Length header, so the staged
-        // body itself is the size source of truth.
+        // body itself is the size source of truth. WebKit buffers no post data
+        // for intercepted requests and sends no Content-Length either, so this
+        // is `-1` for the whole WebKit project — see `PART_SIZES_OBSERVABLE`.
         const bodyBytes = route.request().postDataBuffer()?.byteLength ?? -1;
         await route.fulfill({
             status: 200,

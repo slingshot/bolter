@@ -114,6 +114,8 @@ export async function runEngine(
             message: error.message,
             retryable: isRetryableEngineError(error),
             stage: failureStageOf(error) ?? 'engine',
+            name: error.name,
+            stack: error.stack,
         });
         throw error;
     }

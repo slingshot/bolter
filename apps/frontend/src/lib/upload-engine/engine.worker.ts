@@ -109,6 +109,7 @@ async function runJob(
                 // a verdict on the upload — the caller may retry or fall back.
                 retryable: true,
                 stage: 'engine',
+                ...(err instanceof Error && { name: err.name, stack: err.stack }),
             });
             return;
         }

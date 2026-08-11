@@ -27,7 +27,18 @@ export default defineConfig({
         baseURL: PREVIEW_ORIGIN,
         trace: 'retain-on-failure',
     },
-    projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+    /**
+     * WebKit is not optional coverage here. `FileSystemHandle.move()` is
+     * specified by no standard, and WebKit requires both of its arguments
+     * where Chromium requires one — so the engine's part-commit rename threw
+     * `TypeError: Not enough arguments` on every Safari and iOS upload while
+     * a green Chromium-only suite reported the engine healthy. Any OPFS or
+     * worker API the engine leans on can diverge the same way.
+     */
+    projects: [
+        { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+        { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+    ],
     webServer: {
         command: `bunx vite build && bunx vite preview --port ${PREVIEW_PORT} --strictPort`,
         url: PREVIEW_ORIGIN,

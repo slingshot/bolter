@@ -186,7 +186,7 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `NODE_ENV` | `production` | One of `development`, `production`, `test`. Anything else — including unset — is treated as `production` |
 | `CORS_ORIGINS` | _(none)_ | Extra browser origins allowed by CORS, comma separated (`BASE_URL` is always allowed) |
 | `MAX_FILE_SIZE` | `1000000000000` (1 TB) | Maximum upload size in bytes |
-| `MAX_FILES_PER_ARCHIVE` | `64` | Max files per upload |
+| `MAX_FILES_PER_ARCHIVE` | `64` | Max files per upload. Advertised by `GET /config` and enforced in two places: the upload button is disabled client-side before any bytes move, and `POST /upload/complete` refuses an over-limit unencrypted archive. Encrypted uploads carry an opaque metadata blob, so only the client gate applies to them. Raising it server-side takes effect with no frontend release |
 | `MAX_EXPIRE_SECONDS` | `15552000` (6 months) | Maximum link expiration time |
 | `DEFAULT_EXPIRE_SECONDS` | `86400` (1 day) | Default expiration |
 | `MAX_DOWNLOADS` | `100` | Maximum download limit |

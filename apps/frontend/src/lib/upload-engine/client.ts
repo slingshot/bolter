@@ -22,6 +22,7 @@ import type { EngineResult } from './engine';
 import { OpfsPartStore, UPLOADS_DIR } from './part-store';
 import type {
     ClientToWorker,
+    EngineFailureStage,
     EngineJob,
     EngineProbeRequest,
     EngineProbeResult,
@@ -78,11 +79,29 @@ export interface EngineClientHooks {
  * engine's classification so callers can offer resume vs start-fresh. */
 export class EngineWorkerError extends Error {
     readonly retryable: boolean;
+    /** Pipeline leg the worker was in when it failed, when it reported one. */
+    readonly stage?: EngineFailureStage;
+    /** The worker-side error's own class name (`TypeError`, `QuotaExceededError`, …). */
+    readonly workerName?: string;
 
-    constructor(message: string, retryable: boolean) {
+    constructor(
+        message: string,
+        retryable: boolean,
+        detail?: { stage?: EngineFailureStage; name?: string; stack?: string },
+    ) {
         super(message);
         this.name = 'EngineWorkerError';
         this.retryable = retryable;
+        this.stage = detail?.stage;
+        this.workerName = detail?.name;
+        // Adopt the worker's stack when it sent one. Every worker failure is
+        // rethrown from the same three facade frames, and Sentry groups on
+        // the stack — keeping the facade's stack would file an OPFS rename
+        // fault and an HTTP 400 as the same issue, which is exactly what
+        // happened to BOLTER-FRONTEND-5F.
+        if (detail?.stack) {
+            this.stack = detail.stack;
+        }
     }
 }
 
@@ -406,7 +425,13 @@ function runWorkerJob(
                             'failure',
                             message.stage ? `${message.stage}:${severity}` : severity,
                         );
-                        reject(new EngineWorkerError(message.message, message.retryable));
+                        reject(
+                            new EngineWorkerError(message.message, message.retryable, {
+                                stage: message.stage,
+                                name: message.name,
+                                stack: message.stack,
+                            }),
+                        );
                     });
                     break;
                 case 'cancelled':

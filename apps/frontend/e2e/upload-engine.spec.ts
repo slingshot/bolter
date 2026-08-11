@@ -6,7 +6,7 @@
  * (`e2e/helpers.ts`); no backend runs.
  */
 
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 import {
     addGeneratedFile,
     analyticsEvents,
@@ -20,6 +20,19 @@ import {
 
 /** 150MB payload — above `MULTIPART_THRESHOLD`, so the engine gate opens. */
 const PAYLOAD_BYTES = 150 * 1024 * 1024;
+
+/**
+ * Per-part byte sizes come from Playwright's intercepted request body, and
+ * WebKit buffers none of it (no post data, no Content-Length) whatever the
+ * part size. Scoped off rather than deleted: the exact-size assertion guards
+ * the WebKit-specific empty-chunk and iOS-transcode faults, so it must stay
+ * strict where it *can* run. Everything the WebKit project does assert — the
+ * part sequence, the completion payload, OPFS teardown — is what catches a
+ * staging or commit-rename fault, which is the bug this project exists for.
+ */
+function partSizesObservable(): boolean {
+    return test.info().project.name !== 'webkit';
+}
 
 /** partSize 64MiB → parts of 64MiB, 64MiB and a 22MiB trailing remainder. */
 const EXPECTED_PART_SIZES = [PART_SIZE, PART_SIZE, PAYLOAD_BYTES - 2 * PART_SIZE];
@@ -52,9 +65,11 @@ test('engine path smoke: 150MB uploads through the worker with exact part sizes'
         [2, 1],
         [3, 1],
     ]);
-    expect(mock.putSizes.get(1)).toEqual([EXPECTED_PART_SIZES[0]]);
-    expect(mock.putSizes.get(2)).toEqual([EXPECTED_PART_SIZES[1]]);
-    expect(mock.putSizes.get(3)).toEqual([EXPECTED_PART_SIZES[2]]);
+    if (partSizesObservable()) {
+        expect(mock.putSizes.get(1)).toEqual([EXPECTED_PART_SIZES[0]]);
+        expect(mock.putSizes.get(2)).toEqual([EXPECTED_PART_SIZES[1]]);
+        expect(mock.putSizes.get(3)).toEqual([EXPECTED_PART_SIZES[2]]);
+    }
 
     // Completion carries the contiguous part list with the mocked ETags.
     expect(mock.completions).toHaveLength(1);

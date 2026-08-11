@@ -58,7 +58,22 @@ export type WorkerToClient =
     | { type: 'progress'; bytesSent: number; totalBytes: number; atMs?: number }
     | { type: 'retry' }
     | { type: 'cancelled' } // cancel ack — worker has aborted XHRs + called server abort
-    | { type: 'error'; message: string; retryable: boolean; stage?: EngineFailureStage }
+    /**
+     * `name`/`stack` are the worker-side error's own, carried across the
+     * boundary because structured clone does not preserve an Error's class
+     * and the facade rethrows every failure from one place. Sentry groups on
+     * the stack, so without them an OPFS rename fault, a transport timeout
+     * and a completion rejection all collapse into a single issue. Additive:
+     * consumers must tolerate their absence.
+     */
+    | {
+          type: 'error';
+          message: string;
+          retryable: boolean;
+          stage?: EngineFailureStage;
+          name?: string;
+          stack?: string;
+      }
     | { type: 'done'; actualSize: number };
 
 /**
