@@ -659,7 +659,6 @@ interface UploadUrlResponse {
     /** Bearer credential authorizing abort/resume of THIS upload (audit #52). */
     uploadToken?: string;
     uploadId?: string;
-    uploadToken?: string;
     parts?: PartInfo[];
     partSize?: number;
     url: string;
