@@ -23,7 +23,7 @@
  */
 
 import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
-import { getConcurrentUploads, isRetryableError } from '@/lib/upload-shared';
+import { isRetryableError } from '@/lib/upload-shared';
 import { finalizeUpload } from './completion';
 import { type EngineDeps, type EngineResult, runEngine } from './engine';
 import type { PartStore } from './part-store';
@@ -377,7 +377,6 @@ async function finishStaged(
         partSize: effectivePartSizeOf(parts),
         encrypted: envelope.encrypted,
         secretKeyB64: envelope.secretKeyB64,
-        maxConcurrent: getConcurrentUploads(envelope.expectedSize),
         declaredTotalSize: envelope.expectedSize,
         // Production already reached EOF, so the producer never runs — an
         // empty placeholder source satisfies the job shape without bytes.

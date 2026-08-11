@@ -8,7 +8,7 @@ import {
     ECE_VERSION,
     Keychain,
 } from '@/lib/crypto';
-import { type EngineDeps, runEngine } from '../engine';
+import { deriveConcurrency, type EngineDeps, runEngine } from '../engine';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type { EngineJob, WorkerToClient } from '../protocol';
 import type {
@@ -292,7 +292,6 @@ function makeJob(
         uploadToken: 'tok-1',
         ownerToken: 'owner-1',
         encrypted: false,
-        maxConcurrent: 2,
         ...over,
     };
 }
@@ -314,8 +313,12 @@ const urlsFor = (n: number) => Array.from({ length: n }, (_, i) => `https://s3/p
 
 const FAST = { maxAttemptsPerPart: 2, retryDelayMs: () => 0 };
 
-/** The stager's `windowSize` for a 3-uploader job: `maxConcurrent + WINDOW_SLACK`. */
-const WINDOW_AT_3 = 3 + 2;
+/**
+ * Window and pool for the tiny part sizes these tests use: both are derived
+ * from `partSize` against a 640 MiB staged-byte budget, so anything below
+ * 64 MiB lands on the MAX_WINDOW clamp.
+ */
+const { windowSize: TINY_WINDOW, maxConcurrent: TINY_POOL } = deriveConcurrency(4);
 
 describe('runEngine', () => {
     it('runs a single-file job end-to-end: stage, upload, complete, clear', async () => {
@@ -408,14 +411,13 @@ describe('runEngine', () => {
     });
 
     it('keeps a full window staged and ready, so a completion convoy starves no uploader', async () => {
-        // Window slots are freed at pickup, not at delete: with maxConcurrent
-        // 3 and WINDOW_SLACK 2, three parts go in flight and five more sit
-        // staged behind them. Counting in-flight parts against the window (the
-        // old accounting) would have stopped staging at five parts total —
-        // only two ready — and left the third uploader of every convoy waiting
-        // on the stager.
+        // Window slots are freed at pickup, not at delete: TINY_POOL parts go
+        // in flight and a further TINY_WINDOW sit staged behind them. Counting
+        // in-flight parts against the window (the old accounting) would have
+        // stopped staging at TINY_WINDOW parts in total — two ready — and left
+        // most uploaders of every convoy waiting on the stager.
         const partSize = 4;
-        const totalParts = 12;
+        const totalParts = 40; // > TINY_POOL + 2 * TINY_WINDOW, so the window binds throughout
         const data = makeData(partSize * totalParts);
         const urls = urlsFor(totalParts);
         const started: number[] = [];
@@ -437,7 +439,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize,
             declaredTotalSize: data.byteLength,
-            maxConcurrent: 3,
         });
         const canceller = new AbortController();
         const staged = () => h.log.filter((e) => e.startsWith('stagePart:')).length;
@@ -450,21 +451,22 @@ describe('runEngine', () => {
         );
         run.catch(() => undefined);
 
-        await waitFor(() => staged() === 3 + WINDOW_AT_3);
-        expect(started).toEqual([1, 2, 3]);
-        // …and the window holds there: part 9 waits for a pickup, not a delete.
-        await waitFor(() => gates.length === 3);
-        expect(staged()).toBe(3 + WINDOW_AT_3);
+        const firstWave = Array.from({ length: TINY_POOL }, (_, i) => i + 1);
+        await waitFor(() => staged() === TINY_POOL + TINY_WINDOW);
+        expect(started).toEqual(firstWave);
+        // …and the window holds there: the next part waits for a pickup, not a delete.
+        await waitFor(() => gates.length === TINY_POOL);
+        expect(staged()).toBe(TINY_POOL + TINY_WINDOW);
 
-        // The convoy: all three parts land at once. Every uploader finds the
-        // next part already staged.
+        // The convoy: every in-flight part lands at once. Each uploader finds
+        // the next part already staged.
         for (const release of gates.splice(0)) {
             release();
         }
-        await waitFor(() => started.length === 6);
-        expect(started.slice(3)).toEqual([4, 5, 6]);
-        // Three pickups freed three slots, so the stager ran three parts further.
-        await waitFor(() => staged() === 6 + WINDOW_AT_3);
+        await waitFor(() => started.length === 2 * TINY_POOL);
+        expect(started.slice(TINY_POOL)).toEqual(firstWave.map((n) => n + TINY_POOL));
+        // Those pickups freed as many slots, so the stager ran that much further.
+        await waitFor(() => staged() === 2 * TINY_POOL + TINY_WINDOW);
 
         canceller.abort();
         await expect(run).rejects.toThrow(/cancel/i);
@@ -480,7 +482,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize: 4,
             declaredTotalSize: 12,
-            maxConcurrent: 1,
         });
 
         await expect(
@@ -530,7 +531,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize: MIN,
             declaredTotalSize: total,
-            maxConcurrent: 1,
         });
         const envelope = makeEnvelope(job.fileId, total);
 
@@ -571,7 +571,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize: MIN,
             declaredTotalSize: total,
-            maxConcurrent: 1,
         });
         const envelope = makeEnvelope(job.fileId, total);
 
@@ -632,7 +631,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize: 4,
             declaredTotalSize: 12,
-            maxConcurrent: 1,
         });
 
         await expect(
@@ -662,7 +660,6 @@ describe('runEngine', () => {
             partUrls: urls,
             partSize: MIN,
             declaredTotalSize: total,
-            maxConcurrent: 1,
         });
         const envelope = makeEnvelope(job.fileId, total);
 

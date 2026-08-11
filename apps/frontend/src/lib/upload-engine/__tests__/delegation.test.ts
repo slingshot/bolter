@@ -25,7 +25,6 @@ vi.mock('@/lib/plausible', () => ({
 
 const { uploadFiles, resumeUpload, Canceller } = await import('@/lib/api');
 const { Keychain } = await import('@/lib/crypto');
-const { getConcurrentUploads } = await import('@/lib/upload-shared');
 
 const MB = 1024 * 1024;
 
@@ -213,7 +212,6 @@ describe('engine delegation in uploadFiles', () => {
         expect(start.job.partSize).toBe(10 * MB); // unencrypted: effective = raw
         expect(start.job.encrypted).toBe(false);
         expect(start.job.declaredTotalSize).toBe(declaredSize);
-        expect(start.job.maxConcurrent).toBe(getConcurrentUploads(declaredSize));
         expect(start.job.source).toEqual({ kind: 'file', file });
 
         // Envelope matches the metadata the legacy completion would send

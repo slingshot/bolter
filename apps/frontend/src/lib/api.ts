@@ -1652,7 +1652,6 @@ async function uploadFilesViaEngine(
         partSize: getEffectivePartSize(uploadInfo.partSize || 0, encrypted),
         encrypted,
         secretKeyB64: encrypted ? keychain.secretKeyB64 : undefined,
-        maxConcurrent: getConcurrentUploads(totalSize),
         declaredTotalSize: totalSize,
         source,
     };
@@ -2144,7 +2143,6 @@ export async function resumeEngineUploadWithFile(
         partSize: getEffectivePartSize(resumeInfo.partSize || 0, envelope.encrypted),
         encrypted: envelope.encrypted,
         secretKeyB64: envelope.secretKeyB64,
-        maxConcurrent: getConcurrentUploads(envelope.expectedSize),
         declaredTotalSize: envelope.expectedSize,
         source: { kind: 'file', file },
     };

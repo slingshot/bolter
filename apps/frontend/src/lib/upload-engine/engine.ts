@@ -68,6 +68,42 @@ export interface EngineTuning {
 /** Staged-and-ready parts the stager may run ahead of the uploaders. */
 const WINDOW_SLACK = 2;
 
+/**
+ * Total OPFS bytes one run may hold staged.
+ *
+ * The window used to be a *part count* (`maxConcurrent + WINDOW_SLACK`), which
+ * let the disk footprint track whatever part size the backend picked — ~1 GB
+ * at the old 200MB default. Budgeting bytes and deriving both knobs from the
+ * budget bounds the footprint regardless of allocation.
+ */
+const MAX_STAGED_BYTES = 640 * 1024 * 1024;
+const MIN_WINDOW = 3;
+const MAX_WINDOW = 10;
+
+/**
+ * Staging window and uploader-pool size for a given part size.
+ *
+ * `windowSize > maxConcurrent` always holds — at the MIN_WINDOW floor of 3 the
+ * pool floor of 2 still leaves a spare slot — so uploaders can never starve on
+ * a window too tight to stage ahead of them.
+ *
+ * MIN_WINDOW outranks the byte budget: above ~213 MiB parts three staged parts
+ * exceed 640 MiB. Allocation never gets there (`PART_SIZING.CEILING` is
+ * 128 MiB, and the trailing-part correction only nudges it a MiB or two), and
+ * a window that cannot stage ahead of the pool would be worse than the
+ * overshoot.
+ */
+export function deriveConcurrency(partSize: number): {
+    windowSize: number;
+    maxConcurrent: number;
+} {
+    const windowSize = Math.min(
+        MAX_WINDOW,
+        Math.max(MIN_WINDOW, Math.floor(MAX_STAGED_BYTES / Math.max(1, partSize))),
+    );
+    return { windowSize, maxConcurrent: Math.max(2, windowSize - WINDOW_SLACK) };
+}
+
 // ---------------------------------------------------------------------------
 // Failure-stage tagging [R16]: errors are tagged where the pipeline knows
 // which leg they came from, and the tag rides the error object to the single
@@ -138,6 +174,9 @@ async function runPipeline(
     if (job.encrypted && !secretKeyB64) {
         throw new Error('encrypted engine job is missing its secret key');
     }
+    // Both knobs come from the allocated part size, so the fresh-upload and
+    // both resume paths cannot disagree about them.
+    const { windowSize, maxConcurrent } = deriveConcurrency(job.partSize);
     throwIfCancelled(cancel);
 
     // Durable ordering: lease before any part-store write [R12], envelope as
@@ -281,7 +320,7 @@ async function runPipeline(
                       fileId: job.fileId,
                       partSize: job.partSize,
                       totalParts: totalParts - base,
-                      windowSize: Math.max(1, job.maxConcurrent) + WINDOW_SLACK,
+                      windowSize,
                       store: offsetPartStore(deps.store, base),
                       state: offsetPartState(deps.state, base),
                       encrypt: secretKeyB64
@@ -336,7 +375,7 @@ async function runPipeline(
 
     const uploaderRun = runUploaders(takeNextPart, {
         urls: job.partUrls,
-        maxConcurrent: job.maxConcurrent,
+        maxConcurrent,
         store: deps.store,
         state: deps.state,
         fileId: job.fileId,
