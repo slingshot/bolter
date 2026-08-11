@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { UPLOAD_LIMITS } from '@bolter/shared';
+import { PART_SIZING, UPLOAD_LIMITS } from '@bolter/shared';
 import { Elysia, t } from 'elysia';
 import { config, deriveBaseUrl } from '../config';
 import { captureError } from '../lib/sentry';
@@ -9,7 +9,6 @@ import { type CompletedPart, storage } from '../storage';
 import { providerRegistry } from '../storage/provider-registry';
 
 const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
-const DEFAULT_PART_SIZE = UPLOAD_LIMITS.DEFAULT_PART_SIZE;
 const MAX_PARTS = UPLOAD_LIMITS.MAX_PARTS;
 const MAX_PART_SIZE = UPLOAD_LIMITS.MAX_PART_SIZE;
 const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
@@ -23,6 +22,9 @@ const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
  */
 const MAX_TRAILING_PART_PASSES = 64;
 
+const MiB = 1024 * 1024;
+const ceilToMiB = (bytes: number) => Math.ceil(bytes / MiB) * MiB;
+
 interface PartInfo {
     partNumber: number;
     url: string;
@@ -30,18 +32,20 @@ interface PartInfo {
     maxSize: number;
 }
 
-export function calculateOptimalPartSize(
-    fileSize: number,
-    preferredPartSize?: number,
-): { partSize: number; numParts: number } {
-    let partSize = DEFAULT_PART_SIZE;
-
-    // Use client-preferred part size if provided and within valid bounds
-    if (preferredPartSize) {
-        if (preferredPartSize >= MIN_PART_SIZE && preferredPartSize <= MAX_PART_SIZE) {
-            partSize = preferredPartSize;
-        }
-    }
+/**
+ * Part size for a multipart upload, from file size alone.
+ *
+ * The client used to measure its own bandwidth with a 5x100MB/10s synthetic
+ * probe and send back a tier; that cost up to 500MB per upload to make a
+ * four-way choice, and R2's uniform-part requirement means the answer can
+ * never be revised mid-upload anyway. Deriving it here makes the decision
+ * reproducible from `fileSize` and keeps it in one place.
+ */
+export function calculateOptimalPartSize(fileSize: number): { partSize: number; numParts: number } {
+    let partSize = Math.min(
+        PART_SIZING.CEILING,
+        Math.max(PART_SIZING.FLOOR, ceilToMiB(fileSize / PART_SIZING.TARGET_PART_COUNT)),
+    );
 
     let numParts = Math.ceil(fileSize / partSize);
 
@@ -52,7 +56,7 @@ export function calculateOptimalPartSize(
             throw new Error('File too large: would require parts larger than 5GB limit');
         }
 
-        partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+        partSize = ceilToMiB(partSize);
         numParts = Math.ceil(fileSize / partSize);
     }
 
@@ -77,9 +81,8 @@ export function calculateOptimalPartSize(
             );
         }
         numParts = numParts - 1;
-        partSize = Math.ceil(fileSize / numParts);
         // Align to MB boundary
-        partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+        partSize = ceilToMiB(Math.ceil(fileSize / numParts));
         numParts = Math.ceil(fileSize / partSize);
     }
 
@@ -446,10 +449,7 @@ export const uploadRoutes = new Elysia()
             );
 
             if (useMultipart) {
-                const { partSize, numParts } = calculateOptimalPartSize(
-                    fileSize,
-                    preferredPartSize,
-                );
+                const { partSize, numParts } = calculateOptimalPartSize(fileSize);
 
                 logger.info(
                     {
@@ -1314,7 +1314,8 @@ export const uploadRoutes = new Elysia()
             }
 
             const numParts = fileInfo.numParts || 0;
-            const partSize = Number(fileInfo.partSize || DEFAULT_PART_SIZE);
+            // Defensive only: `partSize` is always written at allocation.
+            const partSize = Number(fileInfo.partSize || PART_SIZING.FLOOR);
             const completedSet = new Set(completedPartNumbers);
 
             // Generate pre-signed URLs for parts NOT in completedPartNumbers

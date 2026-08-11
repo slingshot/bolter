@@ -47,7 +47,7 @@ mock.module('../lib/sentry', () => ({
 }));
 
 // Import after mocking
-import { DOWNLOAD_LIMITS, TIME_LIMITS } from '@bolter/shared';
+import { DOWNLOAD_LIMITS, PART_SIZING, TIME_LIMITS } from '@bolter/shared';
 import {
     calculateOptimalPartSize,
     clampDownloadLimit,
@@ -58,175 +58,57 @@ import {
     verifyUploadToken,
 } from '../routes/upload';
 
-const { MIN_PART_SIZE, MAX_PART_SIZE, DEFAULT_PART_SIZE, MAX_PARTS } = UPLOAD_LIMITS;
+const { MIN_PART_SIZE, MAX_PART_SIZE, MAX_PARTS } = UPLOAD_LIMITS;
 const MB = 1024 * 1024; // binary MB for alignment checks
 
 describe('calculateOptimalPartSize', () => {
-    it('should use default part size (200MB) for a 500MB file', () => {
-        const fileSize = 500_000_000; // 500MB
-        const result = calculateOptimalPartSize(fileSize);
-
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-        expect(result.numParts).toBe(Math.ceil(fileSize / DEFAULT_PART_SIZE));
-        expect(result.numParts).toBe(3);
-    });
-
-    it('should use preferred part size when within valid bounds', () => {
-        const fileSize = 500_000_000;
-        const preferred = 100_000_000; // 100MB
-
-        const result = calculateOptimalPartSize(fileSize, preferred);
-
-        expect(result.partSize).toBe(preferred);
-        expect(result.numParts).toBe(Math.ceil(fileSize / preferred));
-    });
-
-    it('should ignore preferred part size below MIN_PART_SIZE', () => {
-        const fileSize = 500_000_000;
-        const tooSmall = 1_000_000; // 1MB, below 5MB minimum
-
-        const result = calculateOptimalPartSize(fileSize, tooSmall);
-
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-    });
-
-    it('should ignore preferred part size above MAX_PART_SIZE', () => {
-        const fileSize = 500_000_000;
-        const tooLarge = 10_000_000_000; // 10GB, above 5GB max
-
-        const result = calculateOptimalPartSize(fileSize, tooLarge);
-
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-    });
-
-    it('should ignore preferred part size of 0', () => {
-        const fileSize = 500_000_000;
-
-        const result = calculateOptimalPartSize(fileSize, 0);
-
-        // preferredPartSize of 0 is falsy, so it should use default
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-    });
-
-    it('should auto-adjust when number of parts exceeds MAX_PARTS', () => {
-        // Use a very large file with a small preferred part size to force >10000 parts
-        // 100GB file with 5MiB parts = ~19000 parts > MAX_PARTS
-        const fileSize = 100_000_000_000; // 100GB
-        const preferred = MIN_PART_SIZE;
-
-        const result = calculateOptimalPartSize(fileSize, preferred);
-
-        expect(result.numParts).toBeLessThanOrEqual(MAX_PARTS);
-        expect(result.partSize).toBeGreaterThan(preferred);
-        // Part size should be MB-aligned
-        expect(result.partSize % MB).toBe(0);
-    });
-
-    it('should recalculate when last part would be smaller than MIN_PART_SIZE', () => {
-        // Create a scenario where the last part is tiny
-        // 205MB file with 200MB default = 2 parts: 200MB + 5MB
-        // 5MB = MIN_PART_SIZE, so it's exactly at the boundary
-        // Let's use a file where the last part is just under MIN_PART_SIZE
-        // 201MB with 200MB parts = 2 parts: 200MB + 1MB (1MB < 5MB MIN)
-        const fileSize = 201 * 1_000_000; // 201MB
-        const preferred = 200 * 1_000_000; // 200MB
-
-        const result = calculateOptimalPartSize(fileSize, preferred);
-
-        // Should have recalculated: the function reduces numParts by 1 and recalculates
-        // The last part should now be >= MIN_PART_SIZE, or there's only 1 part
-        if (result.numParts > 1) {
-            const lastPartSize = fileSize - (result.numParts - 1) * result.partSize;
-            expect(lastPartSize).toBeGreaterThanOrEqual(0);
-        }
-        // numParts * partSize should cover the entire file
-        expect(result.numParts * result.partSize).toBeGreaterThanOrEqual(fileSize);
-    });
-
-    // The single-pass adjustment is not always enough: its recomputed,
-    // MiB-aligned partSize can itself leave a trailing part under the minimum.
-    // R2 rejects those as EntityTooSmall *after* every byte has transferred.
-    // Both cases below are reachable today, and only on the 25MB/50MB tiers —
-    // the ones the speed test hands to slow connections.
+    // Verified curve. Part size is derived from file size alone: R2 requires
+    // uniform non-trailing parts, so it is decided once at allocation and can
+    // never adapt mid-upload. 10GB and 50GB are load-bearing rows — they are
+    // where the trailing-part correction fires and 64 MiB becomes 65 MiB.
     it.each([
-        ['25MB tier', 529_000_001, 25 * 1_000_000],
-        ['50MB tier', 616_000_000_000, 50 * 1_000_000],
-    ])('should never leave a sub-MIN_PART_SIZE trailing part (%s)', (_label, fileSize, preferred) => {
-        const result = calculateOptimalPartSize(fileSize, preferred);
-
-        expect(result.numParts).toBeGreaterThan(1);
-        const trailing = fileSize - (result.numParts - 1) * result.partSize;
-        expect(trailing).toBeGreaterThanOrEqual(MIN_PART_SIZE);
-        expect(result.numParts).toBeLessThanOrEqual(MAX_PARTS);
-        expect(result.numParts * result.partSize).toBeGreaterThanOrEqual(fileSize);
+        ['100 MB', 100_000_000, 64 * MB, 2],
+        ['500 MB', 500_000_000, 64 * MB, 8],
+        ['1 GB', 1_000_000_000, 64 * MB, 15],
+        ['5 GB', 5_000_000_000, 64 * MB, 75],
+        ['10 GB', 10_000_000_000, 65 * MB, 147],
+        ['50 GB', 50_000_000_000, 65 * MB, 734],
+        ['100 GB', 100_000_000_000, 96 * MB, 994],
+        ['500 GB', 500_000_000_000, 128 * MB, 3726],
+        ['1 TB', 1_000_000_000_000, 128 * MB, 7451],
+    ])('should size %s as %d-byte parts', (_label, fileSize, expectedPartSize, expectedParts) => {
+        const result = calculateOptimalPartSize(fileSize);
+        expect(result.partSize).toBe(expectedPartSize);
+        expect(result.numParts).toBe(expectedParts);
     });
 
-    it('should handle a 1TB file', () => {
-        const fileSize = 1_000_000_000_000; // 1TB
-
-        const result = calculateOptimalPartSize(fileSize);
-
-        expect(result.numParts).toBeLessThanOrEqual(MAX_PARTS);
-        expect(result.partSize).toBeGreaterThanOrEqual(MIN_PART_SIZE);
-        expect(result.partSize).toBeLessThanOrEqual(MAX_PART_SIZE);
-        expect(result.numParts * result.partSize).toBeGreaterThanOrEqual(fileSize);
+    it('should clamp small multipart uploads up to the floor', () => {
+        // Just over MULTIPART_THRESHOLD: size/1000 is far below the floor.
+        const result = calculateOptimalPartSize(UPLOAD_LIMITS.MULTIPART_THRESHOLD + 1);
+        expect(result.partSize).toBe(PART_SIZING.FLOOR);
     });
 
-    it('should return 1 part for a file smaller than part size', () => {
-        const fileSize = 50_000_000; // 50MB
+    it('should clamp very large uploads down to the ceiling', () => {
+        // 1TB/1000 is 1GB — the ceiling is what keeps parts sane.
+        const result = calculateOptimalPartSize(1_000_000_000_000);
+        expect(result.partSize).toBe(PART_SIZING.CEILING);
+    });
 
-        const result = calculateOptimalPartSize(fileSize);
+    it('should take no client input', () => {
+        // One argument only: the sizing decision lives in exactly one place.
+        expect(calculateOptimalPartSize.length).toBe(1);
+    });
 
+    it('should produce consistent results for the same input', () => {
+        const a = calculateOptimalPartSize(750_000_000);
+        const b = calculateOptimalPartSize(750_000_000);
+        expect(a).toEqual(b);
+    });
+
+    it('should return a single part below the floor', () => {
+        const result = calculateOptimalPartSize(50_000_000);
         expect(result.numParts).toBe(1);
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-    });
-
-    it('should use exact MIN_PART_SIZE as preferred without issues', () => {
-        // Exact multiple of MIN_PART_SIZE so the last-part adjustment stays out of play
-        const fileSize = MIN_PART_SIZE * 10;
-
-        const result = calculateOptimalPartSize(fileSize, MIN_PART_SIZE);
-
-        expect(result.partSize).toBe(MIN_PART_SIZE);
-        expect(result.numParts).toBe(10);
-    });
-
-    it('should use exact MAX_PART_SIZE as preferred without issues', () => {
-        const fileSize = 10_000_000_000; // 10GB
-
-        const result = calculateOptimalPartSize(fileSize, MAX_PART_SIZE);
-
-        expect(result.partSize).toBe(MAX_PART_SIZE);
-        expect(result.numParts).toBe(Math.ceil(fileSize / MAX_PART_SIZE));
-    });
-
-    it('should align part size to MB boundary when auto-adjusting', () => {
-        // Force auto-adjustment by exceeding MAX_PARTS
-        const fileSize = 500_000_000_000; // 500GB
-        const preferred = MIN_PART_SIZE; // Will cause >10000 parts
-
-        const result = calculateOptimalPartSize(fileSize, preferred);
-
-        expect(result.partSize % MB).toBe(0);
-    });
-
-    it('should handle a very small file', () => {
-        const fileSize = 1000; // 1KB
-
-        const result = calculateOptimalPartSize(fileSize);
-
-        expect(result.numParts).toBe(1);
-        expect(result.partSize).toBe(DEFAULT_PART_SIZE);
-    });
-
-    it('should produce consistent results for the same inputs', () => {
-        const fileSize = 750_000_000; // 750MB
-
-        const result1 = calculateOptimalPartSize(fileSize);
-        const result2 = calculateOptimalPartSize(fileSize);
-
-        expect(result1.partSize).toBe(result2.partSize);
-        expect(result1.numParts).toBe(result2.numParts);
+        expect(result.partSize).toBe(PART_SIZING.FLOOR);
     });
 });
 
