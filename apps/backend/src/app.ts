@@ -86,10 +86,6 @@ export const app = new Elysia({
                             'File upload orchestration — pre-signed URLs, multipart management, completion',
                     },
                     {
-                        name: 'Speed Test',
-                        description: 'Upload speed measurement for adaptive part sizing',
-                    },
-                    {
                         name: 'Download',
                         description: 'File download, streaming, and metadata retrieval',
                     },
