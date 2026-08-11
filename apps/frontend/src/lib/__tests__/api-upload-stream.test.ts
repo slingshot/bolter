@@ -28,8 +28,8 @@ function makeFile(bytes: number, declaredSize?: number): File {
 
 describe('stream-based multipart upload', () => {
     let fetchCalls: string[];
+    let fetchBodies: Array<{ url: string; body: Record<string, unknown> }>;
     let uploadUrlResponse: Record<string, unknown>;
-    let speedtestParts: number;
 
     beforeEach(async () => {
         await new Promise<void>((resolve) => {
@@ -45,32 +45,19 @@ describe('stream-based multipart upload', () => {
         vi.stubGlobal('XMLHttpRequest', FakeXhr);
 
         uploadUrlResponse = multipartUploadInfo(20, PART_SIZE);
-        speedtestParts = 5;
         fetchCalls = [];
+        fetchBodies = [];
         vi.stubGlobal(
             'fetch',
-            vi.fn((url: string) => {
+            vi.fn((url: string, init?: RequestInit) => {
                 const u = String(url);
                 fetchCalls.push(u);
-                if (u.includes('/upload/speedtest/cleanup')) {
-                    return Promise.resolve(
-                        new Response(JSON.stringify({ success: true }), { status: 200 }),
-                    );
-                }
-                if (u.includes('/upload/speedtest')) {
-                    return Promise.resolve(
-                        new Response(
-                            JSON.stringify({
-                                testId: 'speedtest-id',
-                                uploadId: 'speedtest-upload',
-                                parts: Array.from({ length: speedtestParts }, (_, i) => ({
-                                    partNumber: i + 1,
-                                    url: `https://s3.example.com/speedtest${i + 1}`,
-                                })),
-                            }),
-                            { status: 200 },
-                        ),
-                    );
+                if (typeof init?.body === 'string') {
+                    try {
+                        fetchBodies.push({ url: u, body: JSON.parse(init.body) });
+                    } catch {
+                        /* non-JSON body — not interesting to these tests */
+                    }
                 }
                 if (u.includes('/upload/url')) {
                     return Promise.resolve(
@@ -202,33 +189,31 @@ describe('stream-based multipart upload', () => {
         await expect(promise).rejects.toThrow('Upload cancelled');
     });
 
-    // -----------------------------------------------------------------------
-    // Finding 31 — the preflight speed-test XHRs must be registered with the
-    // Canceller, and cancelling during "Checking speed…" must stop before the
-    // server-side multipart + metadata are created.
-    // -----------------------------------------------------------------------
-    it('aborts the speed test on cancel and never requests upload URLs', async () => {
-        const canceller = new Canceller();
+    // Finding 31's test ("aborts the speed test on cancel and never requests
+    // upload URLs") is gone with its subject: there is no preflight window left
+    // to cancel inside. The guard it protected — no allocation for an
+    // already-cancelled upload — is still covered by 'does not open a request
+    // for an already-cancelled upload' below.
+    it('should never request a speed test', async () => {
+        // The preflight probe is gone: up to 500MB and 10s per upload, spent
+        // to pick between four constants the server now derives itself.
+        const bigPartSize = 10 * 1024 * 1024;
+        uploadUrlResponse = multipartUploadInfo(20, bigPartSize);
 
-        FakeXhr.onSend = () => {
-            // Never completes on its own — only cancellation can end the test
-            if (FakeXhr.sends.length === speedtestParts) {
-                queueMicrotask(() => canceller.cancel());
-            }
-        };
+        const result = await uploadFiles(
+            {
+                // Above MULTIPART_THRESHOLD, so the preflight used to fire here.
+                files: [chunkedFile('archive.bin', 150 * 1024 * 1024, bigPartSize)],
+                encrypted: false,
+            },
+            new Keychain(),
+            new Canceller(),
+        );
 
-        // Declared size above MULTIPART_THRESHOLD so the preflight test runs,
-        // with tiny real content so the test stays cheap.
-        const file = makeFile(1024, 200 * 1024 * 1024);
-
-        await expect(
-            uploadFiles({ files: [file], encrypted: false }, new Keychain(), canceller),
-        ).rejects.toThrow('Upload cancelled');
-
-        expect(FakeXhr.sends.length).toBe(speedtestParts);
-        expect(FakeXhr.instances.every((x) => x.aborted)).toBe(true);
-        // Pre-fix the test ran its full 10s window and then created the upload
-        expect(fetchCalls.some((u) => u.includes('/upload/url'))).toBe(false);
+        expect(result.id).toBe('file-id');
+        expect(fetchCalls.filter((u) => u.includes('/upload/speedtest'))).toEqual([]);
+        const urlCall = fetchBodies.find((b) => b.url.includes('/upload/url'));
+        expect(urlCall?.body).not.toHaveProperty('preferredPartSize');
     });
 
     // -----------------------------------------------------------------------

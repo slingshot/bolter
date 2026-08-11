@@ -150,10 +150,6 @@ describe('engine delegation in uploadFiles', () => {
             vi.fn((url: string, init?: RequestInit) => {
                 const u = String(url);
                 fetchCalls.push(u);
-                // Speed test declined → measureUploadSpeed returns 0 quickly
-                if (u.includes('/upload/speedtest')) {
-                    return Promise.resolve(new Response('nope', { status: 500 }));
-                }
                 if (u.includes('/upload/url')) {
                     uploadUrlBodies.push(JSON.parse(String(init?.body)));
                     return Promise.resolve(
@@ -343,7 +339,7 @@ describe('engine delegation in uploadFiles', () => {
         );
 
         expect(result.id).toBe('file-id');
-        // Neither preflight cost was paid by the abandoned engine attempt…
+        // The preflight probe is gone — a request here means it came back…
         expect(fetchCalls.filter((u) => u.includes('/upload/speedtest'))).toEqual([]);
         // …and the only allocation is the legacy pipeline's own, sized by the
         // zipped bytes, so nothing had to be released.

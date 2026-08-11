@@ -3,7 +3,7 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { PART_SIZE_TIERS, UPLOAD_LIMITS } from '@bolter/shared';
+import { UPLOAD_LIMITS } from '@bolter/shared';
 import { predictLength } from 'client-zip';
 import {
     arrayToB64,
@@ -77,10 +77,6 @@ const DOWNLOAD_MAX_RETRIES = 5;
 const DOWNLOAD_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const DOWNLOAD_STALL_TIMEOUT = 60_000; // Abort download attempt if no bytes for 60 seconds
 
-// Preflight speed test configuration
-const SPEEDTEST_PART_SIZE = 100 * 1024 * 1024; // 100MB per part
-const SPEEDTEST_TIMEOUT = 10_000; // Run for up to 10 seconds
-
 /**
  * Wait until the browser reports connectivity again.
  *
@@ -134,130 +130,6 @@ function cancellableDelay(ms: number, canceller?: Canceller): Promise<void> {
         const timer = setTimeout(finish, ms);
         unsubscribe = canceller?.onCancel(finish);
     });
-}
-
-/**
- * Measure upload speed with a multipart preflight test.
- * Uploads 5x100MB parts concurrently to S3 for up to 10 seconds,
- * measuring aggregate throughput. This mirrors the actual upload
- * path and concurrency to give a realistic speed reading.
- * Returns measured speed in bytes/second, or 0 on failure.
- */
-async function measureUploadSpeed(canceller?: Canceller): Promise<number> {
-    let testId: string | null = null;
-    let uploadId: string | null = null;
-    if (canceller?.cancelled) {
-        return 0;
-    }
-    try {
-        // Get pre-signed S3 URLs for a multipart speed test
-        const res = await fetch(`${API_BASE_URL}/upload/speedtest`, { method: 'POST' });
-        if (!res.ok) {
-            console.warn(`[Upload] Speed test setup failed: HTTP ${res.status}`);
-            return 0;
-        }
-        const data = await res.json();
-        testId = data.testId;
-        uploadId = data.uploadId;
-        if (!data.parts || data.parts.length === 0) {
-            console.warn('[Upload] Speed test: no part URLs returned');
-            return 0;
-        }
-
-        const blob = new Blob([new ArrayBuffer(SPEEDTEST_PART_SIZE)]);
-        const partBytes: number[] = new Array(data.parts.length).fill(0);
-        const xhrs: XMLHttpRequest[] = [];
-        const startTime = Date.now();
-        let settled = false;
-
-        const speed = await new Promise<number>((resolve) => {
-            let unsubscribeCancel: (() => void) | undefined;
-            const finish = () => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                unsubscribeCancel?.();
-                const totalBytes = partBytes.reduce((a, b) => a + b, 0);
-                const elapsed = (Date.now() - startTime) / 1000;
-                resolve(elapsed > 0 ? totalBytes / elapsed : 0);
-            };
-
-            const abortAll = () => {
-                for (const xhr of xhrs) {
-                    if (xhr.readyState !== XMLHttpRequest.DONE) {
-                        xhr.abort();
-                    }
-                }
-            };
-
-            // Abort all XHRs after timeout
-            const timeout = setTimeout(() => {
-                abortAll();
-                finish();
-            }, SPEEDTEST_TIMEOUT);
-
-            let completedCount = 0;
-
-            for (let i = 0; i < data.parts.length; i++) {
-                const xhr = new XMLHttpRequest();
-                xhrs.push(xhr);
-                // Registered so Cancel during "Checking speed…" actually stops
-                // the test instead of pushing up to 500MB of throwaway data
-                canceller?.addXhr(xhr);
-
-                xhr.upload.addEventListener('progress', (e) => {
-                    if (e.lengthComputable) {
-                        partBytes[i] = e.loaded;
-                    }
-                });
-
-                // loadend fires after load, error, AND abort — it is the single
-                // terminal event. Counting 'error' separately would double-count
-                // failed parts and finish() early while other parts are still
-                // in flight (leaving them running unmeasured and unaborted).
-                xhr.addEventListener('loadend', () => {
-                    canceller?.removeXhr(xhr);
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        partBytes[i] = SPEEDTEST_PART_SIZE;
-                    }
-                    completedCount++;
-                    // All parts done before timeout
-                    if (completedCount === data.parts.length) {
-                        clearTimeout(timeout);
-                        finish();
-                    }
-                });
-
-                xhr.open('PUT', data.parts[i].url);
-                xhr.send(blob);
-            }
-
-            // Cancel may land after the XHRs were registered but before any of
-            // them reaches a terminal state — stop waiting immediately.
-            unsubscribeCancel = canceller?.onCancel(() => {
-                clearTimeout(timeout);
-                abortAll();
-                finish();
-            });
-        });
-
-        return speed;
-    } catch (e) {
-        console.warn('[Upload] Speed test exception:', e);
-        return 0;
-    } finally {
-        // Clean up the test multipart upload from S3
-        if (testId) {
-            fetch(`${API_BASE_URL}/upload/speedtest/cleanup`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ testId, uploadId }),
-            }).catch(() => {
-                // Best-effort cleanup
-            });
-        }
-    }
 }
 
 // WebKit/Safari detection — used for iOS HEIC/HEVC transcoding workaround
@@ -550,19 +422,6 @@ export function getEffectivePartSize(partSize: number, encrypted: boolean): numb
     return Math.floor(partSize / ECE_ENCRYPTED_RECORD_SIZE) * ECE_ENCRYPTED_RECORD_SIZE;
 }
 
-function getPreferredPartSize(speed: number): number | undefined {
-    if (speed === 0) {
-        return undefined;
-    }
-
-    for (const tier of PART_SIZE_TIERS) {
-        if (speed >= tier.minSpeed) {
-            return tier.partSize;
-        }
-    }
-    return PART_SIZE_TIERS[PART_SIZE_TIERS.length - 1].partSize;
-}
-
 export interface UploadProgress {
     loaded: number;
     total: number;
@@ -626,7 +485,6 @@ export interface UploadOptions {
     downloadLimit?: number;
     onProgress?: (progress: UploadProgress) => void;
     onZipProgress?: (percent: number) => void;
-    onSpeedTest?: (phase: 'started' | 'done', speedMbps?: number) => void;
     onError?: (error: UploadError) => void;
     /**
      * Positional (parallel to `files`): File System Access handles for entries
@@ -1001,7 +859,6 @@ async function uploadFilesPipeline(
         downloadLimit,
         onProgress,
         onZipProgress,
-        onSpeedTest,
         onError,
     } = options;
 
@@ -1147,27 +1004,13 @@ async function uploadFilesPipeline(
 
     // Everything below the zip construction must release the zip's per-file
     // source streams on failure. The main upload has a finally block for that;
-    // this window (preflight + URL request) sits ahead of it, and `stream` is
-    // already being pumped by then, so it needs its own guard.
+    // this window (the URL request) sits ahead of it, and `stream` is already
+    // being pumped by then, so it needs its own guard.
     let uploadInfo: UploadUrlResponse;
     try {
-        // Run preflight speed test for multipart uploads to determine optimal part size.
-        // Single-part uploads (<100MB) don't need this since there's no part sizing decision.
-        let preferredPartSize: number | undefined;
-        if (totalSize > UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
-            onSpeedTest?.('started');
-            console.log('[Upload] Running preflight speed test...');
-            const measuredSpeed = await measureUploadSpeed(canceller);
-            const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
-            preferredPartSize = getPreferredPartSize(measuredSpeed);
-            console.log(
-                `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
-            );
-            onSpeedTest?.('done', speedMbps);
-        }
-
-        // Cancelling during "Checking speed…" must stop here — otherwise the
-        // server-side multipart + metadata get created for an upload nobody wants
+        // An upload can still be cancelled between zip construction and
+        // allocation — otherwise the server-side multipart + metadata get
+        // created for an upload nobody wants.
         if (canceller.cancelled) {
             throw new Error('Upload cancelled');
         }
@@ -1181,7 +1024,6 @@ async function uploadFilesPipeline(
                 encrypted,
                 timeLimit,
                 dlimit: downloadLimit,
-                preferredPartSize,
             }),
         });
 
@@ -1642,8 +1484,8 @@ interface EngineDeclineHandoff {
 }
 
 /**
- * Upload through the worker+OPFS engine (`lib/upload-engine/`). Preflight and
- * allocation mirror the legacy path exactly; the resulting `EngineJob` +
+ * Upload through the worker+OPFS engine (`lib/upload-engine/`). Allocation
+ * mirrors the legacy path exactly; the resulting `EngineJob` +
  * `CompletionEnvelope` then cross into a dedicated worker that stages
  * record-aligned parts in OPFS, uploads them, and finishes `/upload/complete`
  * itself.
@@ -1666,7 +1508,6 @@ async function uploadFilesViaEngine(
         downloadLimit,
         onProgress,
         onZipProgress,
-        onSpeedTest,
         handles,
     } = options;
     const startTime = Date.now();
@@ -1711,29 +1552,18 @@ async function uploadFilesViaEngine(
     // The delegation gate upstream could only see the declared input size.
     // Now that the real one is known, apply the multipart gate the legacy
     // path applies — DEFLATE routinely takes a multi-file batch under it, and
-    // the engine only runs multipart. Declining here, rather than after the
-    // preflight, is what keeps a compressible batch from paying a ~10s speed
-    // test and an allocation for a multipart the backend would decline on
-    // exactly this threshold (`useMultipart` in routes/upload.ts).
+    // the engine only runs multipart. Declining here, before allocating, is
+    // what keeps a compressible batch from paying for a multipart the backend
+    // would decline on exactly this threshold (`useMultipart` in
+    // routes/upload.ts).
     if (totalSize <= UPLOAD_LIMITS.MULTIPART_THRESHOLD) {
         console.log('[Upload] Zipped size is not multipart-sized — using legacy pipeline');
         recordEngineFallback('below-threshold');
         return undefined;
     }
 
-    // Preflight speed test — identical to the legacy path.
-    onSpeedTest?.('started');
-    console.log('[Upload] Running preflight speed test...');
-    const measuredSpeed = await measureUploadSpeed(canceller);
-    const speedMbps = Math.round((measuredSpeed / (1024 * 1024)) * 10) / 10;
-    const preferredPartSize = getPreferredPartSize(measuredSpeed);
-    console.log(
-        `[Upload] Preflight result: ${speedMbps} MB/s → ${preferredPartSize ? `${preferredPartSize / (1024 * 1024)}MB` : 'default'} parts`,
-    );
-    onSpeedTest?.('done', speedMbps);
-
-    // Cancelling during "Checking speed…" must stop here — nothing
-    // server-side exists yet.
+    // A cancel landing between zip construction and allocation must stop here
+    // — nothing server-side exists yet.
     if (canceller.cancelled) {
         throw new Error('Upload cancelled');
     }
@@ -1747,7 +1577,6 @@ async function uploadFilesViaEngine(
             encrypted,
             timeLimit,
             dlimit: downloadLimit,
-            preferredPartSize,
         }),
     });
     if (!uploadResponse.ok) {
