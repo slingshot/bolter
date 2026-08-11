@@ -87,6 +87,28 @@ export function clampDownloadLimit(requested?: number): number {
 }
 
 /**
+ * Number of files declared in an unencrypted metadata blob, or `null` when the
+ * count is not inspectable (audit #5, `MAX_FILES_PER_ARCHIVE`).
+ *
+ * Archives are assembled client-side, so the file count only ever reaches the
+ * server inside the metadata blob. For unencrypted shares that blob is
+ * base64-encoded UTF-8 JSON carrying a `files[]` array — the same list the zip
+ * entry names come from — so it can be counted. Encrypted metadata is E2E
+ * ciphertext and always yields `null`: counting it would require breaking the
+ * encryption or trusting a separate client-asserted field, neither of which is
+ * worth doing.
+ */
+export function countDeclaredFiles(metadataB64: string): number | null {
+    try {
+        const json = Buffer.from(metadataB64, 'base64').toString('utf8');
+        const files = (JSON.parse(json) as { files?: unknown })?.files;
+        return Array.isArray(files) ? files.length : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Clamp the client-declared expiry into a value that is safe to hand to
  * `EXPIRE`. A negative `timeLimit` reached `redis.expire(id, -1)`, which DELETES
  * the key — after which the finalization writes resurrected a TTL-less,
@@ -764,6 +786,28 @@ export const uploadRoutes = new Elysia()
                 logger.warn({ requestId, id }, 'Missing or invalid auth key for encrypted file');
                 set.status = 400;
                 return { error: 'Missing or invalid auth key for encrypted file' };
+            }
+
+            // MAX_FILES_PER_ARCHIVE (audit #5) is advertised via GET /config but
+            // was never enforced. The count only reaches the server inside the
+            // metadata blob, and only an unencrypted blob is inspectable — so
+            // gate here, before any S3 completion, so a rejected upload is never
+            // finalized. The multipart stays abortable and the reaper (#42)
+            // sweeps it. A client can evade by sending unparseable metadata or
+            // by claiming to be encrypted, but both break its own download page,
+            // so the gate holds for every share that actually works.
+            if (!fileInfo.encrypted && typeof metadata === 'string' && metadata.length > 0) {
+                const declaredFiles = countDeclaredFiles(metadata);
+                if (declaredFiles !== null && declaredFiles > config.maxFilesPerArchive) {
+                    logger.warn(
+                        { requestId, id, declaredFiles, max: config.maxFilesPerArchive },
+                        'Rejected completion exceeding MAX_FILES_PER_ARCHIVE',
+                    );
+                    set.status = 400;
+                    return {
+                        error: `Too many files: ${declaredFiles} exceeds the limit of ${config.maxFilesPerArchive}`,
+                    };
+                }
             }
 
             const isMultipart = fileInfo.multipart;

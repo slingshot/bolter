@@ -25,7 +25,11 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
  *
  * @returns true when the server confirmed the abort.
  */
-export async function abortServerMultipart(fileId: string, uploadId: string): Promise<boolean> {
+export async function abortServerMultipart(
+    fileId: string,
+    uploadId: string,
+    uploadToken?: string,
+): Promise<boolean> {
     if (!fileId || !uploadId) {
         return false;
     }
@@ -33,7 +37,9 @@ export async function abortServerMultipart(fileId: string, uploadId: string): Pr
         const response = await fetch(`${API_BASE_URL}/upload/abort/${fileId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ uploadId }),
+            // uploadToken authorizes the abort (audit #52). Omitted for records
+            // persisted before it existed; the backend accepts those.
+            body: JSON.stringify(uploadToken ? { uploadId, uploadToken } : { uploadId }),
         });
         if (!response.ok) {
             return false;

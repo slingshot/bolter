@@ -234,6 +234,14 @@ export const downloadRoutes = new Elysia()
             // Increment counter before redirect
             const newDl = await storage.incrementDownloadCount(id);
 
+            // null means the metadata was deleted between the read above and
+            // the increment. The increment is EXISTS-guarded (audit #7) so the
+            // key was not resurrected; the file really is gone.
+            if (newDl === null) {
+                set.status = 410;
+                return { error: 'File is no longer available' };
+            }
+
             // Check if limit exceeded after increment (concurrent downloads)
             if (newDl > metadata.dlimit) {
                 set.status = 410;
@@ -458,6 +466,15 @@ export const downloadRoutes = new Elysia()
 
             // Increment download counter
             const newDl = await storage.incrementDownloadCount(id);
+
+            // null means the metadata was deleted between the read above and
+            // the increment. The increment is EXISTS-guarded (audit #7) so the
+            // key was not resurrected; report gone rather than deciding
+            // deletion against a counter that no longer exists.
+            if (newDl === null) {
+                set.status = 410;
+                return { error: 'File is no longer available' };
+            }
 
             // Re-read the limit before destroying anything: the owner may have
             // raised dlimit via /params since the snapshot above, and deleting
