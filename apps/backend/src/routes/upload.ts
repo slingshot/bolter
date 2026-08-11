@@ -796,6 +796,25 @@ export const uploadRoutes = new Elysia()
             // sweeps it. A client can evade by sending unparseable metadata or
             // by claiming to be encrypted, but both break its own download page,
             // so the gate holds for every share that actually works.
+            // Byte cap on the stored blob, checked before the file-count gate
+            // and before any S3 completion. This is the bound the archive
+            // limit was only ever a proxy for: the blob lands in Redis and is
+            // re-served by /metadata/:id on every download-page load, the
+            // route schema is an unbounded `t.String()`, and — unlike
+            // MAX_FILES_PER_ARCHIVE — it applies to encrypted shares too,
+            // whose ciphertext metadata cannot be counted without breaking
+            // E2E. Base64 is ASCII, so string length is byte length.
+            if (typeof metadata === 'string' && metadata.length > config.maxMetadataBytes) {
+                logger.warn(
+                    { requestId, id, metadataBytes: metadata.length, max: config.maxMetadataBytes },
+                    'Rejected completion exceeding MAX_METADATA_BYTES',
+                );
+                set.status = 400;
+                return {
+                    error: `Metadata too large: ${metadata.length} bytes exceeds the limit of ${config.maxMetadataBytes}`,
+                };
+            }
+
             if (!fileInfo.encrypted && typeof metadata === 'string' && metadata.length > 0) {
                 const declaredFiles = countDeclaredFiles(metadata);
                 if (declaredFiles !== null && declaredFiles > config.maxFilesPerArchive) {

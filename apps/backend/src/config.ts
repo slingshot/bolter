@@ -26,6 +26,10 @@ export interface Config {
     // Limits
     maxFileSize: number;
     maxFilesPerArchive: number;
+    /** Byte ceiling on the base64 metadata blob stored per file. */
+    maxMetadataBytes: number;
+    /** Global request-body ceiling handed to Bun via Elysia's `serve`. */
+    maxRequestBodyBytes: number;
     maxExpireSeconds: number;
     maxDownloads: number;
 
@@ -250,6 +254,20 @@ export function buildConfig(env: Record<string, string | undefined>): ConfigLoad
             'MAX_FILES_PER_ARCHIVE',
             env.MAX_FILES_PER_ARCHIVE,
             UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE,
+            errors,
+            { min: 1 },
+        ),
+        maxMetadataBytes: parseNumericEnv(
+            'MAX_METADATA_BYTES',
+            env.MAX_METADATA_BYTES,
+            UPLOAD_LIMITS.MAX_METADATA_BYTES,
+            errors,
+            { min: 1 },
+        ),
+        maxRequestBodyBytes: parseNumericEnv(
+            'MAX_REQUEST_BODY_BYTES',
+            env.MAX_REQUEST_BODY_BYTES,
+            UPLOAD_LIMITS.MAX_REQUEST_BODY_BYTES,
             errors,
             { min: 1 },
         ),

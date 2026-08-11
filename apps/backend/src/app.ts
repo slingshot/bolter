@@ -18,7 +18,13 @@ import { uploadRoutes } from './routes/upload';
 // unrecognised NODE_ENV resolves to production (see `config.isDevelopment`).
 const allowedOrigins = [config.baseUrl, ...config.corsOrigins];
 
-export const app = new Elysia()
+export const app = new Elysia({
+    // File bytes go directly to S3, so this API only ever receives JSON. Bun
+    // defaults `maxRequestBodySize` to 128MB, which any unauthenticated caller
+    // could send at any route; the largest legitimate body here is an
+    // `/upload/complete` carrying MAX_PARTS ETags plus a capped metadata blob.
+    serve: { maxRequestBodySize: config.maxRequestBodyBytes },
+})
     // Request logging
     .onRequest(({ request }) => {
         const url = new URL(request.url);
