@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createConcurrencyController } from '../concurrency';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type {
     CompletionEnvelope,
@@ -32,6 +33,49 @@ async function stage(store: PartStore, partNumber: number, bytes: Uint8Array): P
 function makeQueue(parts: { partNumber: number; size: number }[]) {
     const queue = [...parts];
     return () => Promise.resolve(queue.shift() ?? null);
+}
+
+/**
+ * Parts `1..n` staged with matching pre-signed URLs — the fixture the
+ * pool-sizing tests share, since every attempt re-reads the store.
+ */
+async function pool(
+    n: number,
+    size = 4,
+): Promise<{
+    store: MemoryPartStore;
+    urls: string[];
+    parts: { partNumber: number; size: number }[];
+    queue: () => Promise<{ partNumber: number; size: number } | null>;
+}> {
+    const store = new MemoryPartStore();
+    const parts: { partNumber: number; size: number }[] = [];
+    for (let partNumber = 1; partNumber <= n; partNumber++) {
+        await stage(store, partNumber, makeData(size));
+        parts.push({ partNumber, size });
+    }
+    return {
+        store,
+        parts,
+        urls: parts.map((p) => `https://s3.example.com/part${p.partNumber}`),
+        queue: makeQueue(parts),
+    };
+}
+
+/**
+ * Pull queue that parks for `delayMs` of wall clock before yielding. Slow
+ * staging must read as the pool idling, not as the pool being the bottleneck.
+ */
+function slowQueue(
+    parts: { partNumber: number; size: number }[],
+    clock: ReturnType<typeof fakeClock>,
+    delayMs: number,
+): () => Promise<{ partNumber: number; size: number } | null> {
+    const queue = [...parts];
+    return () => {
+        clock.advance(delayMs);
+        return Promise.resolve(queue.shift() ?? null);
+    };
 }
 
 /** Let pending promise chains settle (real zero-delay timers). */
@@ -901,5 +945,189 @@ describe('runUploaders', () => {
         );
 
         expect(emitted).toEqual([4, 8, 10]);
+    });
+
+    it('halves the pool when the bucket returns 429', async () => {
+        const { store, urls, queue } = await pool(12);
+        const controller = createConcurrencyController({ initial: 8, min: 2, max: 8 });
+        let served = 0;
+
+        const etags = await runUploaders(
+            queue,
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 8,
+                concurrency: controller,
+                setTimeoutFn: (fn: () => void, ms: number) => setTimeout(fn, ms),
+                uploadPart: (_url, body, hooks) => {
+                    served += 1;
+                    if (served === 3) {
+                        return Promise.reject(new Error('HTTP 429 Too Many Requests'));
+                    }
+                    hooks.onProgress(body.size);
+                    return Promise.resolve({ etag: `etag-${served}` });
+                },
+            }),
+        );
+
+        expect(controller.pushbacks()).toBe(1);
+        expect(controller.target()).toBe(4);
+        expect(etags.size).toBe(12);
+    });
+
+    it('does not shrink on an offline-shaped failure', async () => {
+        // A dead link is not congestion — it has its own park-and-poll path.
+        const { store, urls, queue } = await pool(6);
+        const controller = createConcurrencyController({ initial: 8, min: 2, max: 8 });
+        let served = 0;
+
+        const etags = await runUploaders(
+            queue,
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 8,
+                concurrency: controller,
+                setTimeoutFn: (fn: () => void, ms: number) => setTimeout(fn, ms),
+                uploadPart: (_url, body, hooks) => {
+                    served += 1;
+                    if (served === 2) {
+                        return Promise.reject(new Error('HTTP 0'));
+                    }
+                    hooks.onProgress(body.size);
+                    return Promise.resolve({ etag: `etag-${served}` });
+                },
+            }),
+        );
+
+        expect(controller.pushbacks()).toBe(0);
+        expect(controller.target()).toBe(8);
+        expect(etags.size).toBe(6);
+    });
+
+    it('finishes an in-flight part rather than aborting it when shrinking', async () => {
+        // Aborting mid-part to shrink would waste exactly the bytes the pool
+        // exists to conserve.
+        const { store, urls, queue } = await pool(8);
+        const controller = createConcurrencyController({ initial: 4, min: 2, max: 4 });
+        const aborted: number[] = [];
+        const completed: number[] = [];
+        let served = 0;
+
+        const etags = await runUploaders(
+            queue,
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 4,
+                concurrency: controller,
+                uploadPart: (_url, body, hooks) => {
+                    served += 1;
+                    const mine = served;
+                    if (mine === 1) {
+                        controller.onPushback(Date.now());
+                    }
+                    hooks.signal.addEventListener('abort', () => aborted.push(mine));
+                    hooks.onProgress(body.size);
+                    completed.push(mine);
+                    return Promise.resolve({ etag: `etag-${mine}` });
+                },
+            }),
+        );
+
+        expect(controller.target()).toBe(2);
+        expect(aborted).toEqual([]);
+        expect(completed).toHaveLength(8);
+        expect(etags.size).toBe(8);
+    });
+
+    it('reports a worker idling on an empty queue', async () => {
+        // Slow staging must not read as "the pool is the bottleneck".
+        const clock = fakeClock();
+        const { store, urls, parts } = await pool(3);
+        const controller = createConcurrencyController({ initial: 2, min: 2, max: 8 });
+        const onIdle = vi.spyOn(controller, 'onIdle');
+
+        await runUploaders(
+            slowQueue(parts, clock, 500),
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 2,
+                concurrency: controller,
+                now: clock.now,
+                setTimeoutFn: clock.setTimeoutFn,
+                uploadPart: (_url, body, hooks) => {
+                    hooks.onProgress(body.size);
+                    return Promise.resolve({ etag: 'etag-1' });
+                },
+            }),
+        );
+
+        expect(onIdle).toHaveBeenCalled();
+    });
+
+    it('grows the pool while saturated and keeps uploading through the resize', async () => {
+        // Growth rides the progress cadence: each part costs a full probe
+        // window of wall clock, so the controller sees a clean window per part.
+        const clock = fakeClock();
+        const { store, urls, queue } = await pool(12);
+        const controller = createConcurrencyController({
+            initial: 2,
+            min: 2,
+            max: 4,
+            probeIntervalMs: 10_000,
+        });
+        let inFlight = 0;
+        let peakInFlight = 0;
+
+        const etags = await runUploaders(
+            queue,
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 2,
+                concurrency: controller,
+                now: clock.now,
+                setTimeoutFn: (fn: () => void, ms: number) => setTimeout(fn, ms),
+                uploadPart: async (_url, body, hooks) => {
+                    inFlight += 1;
+                    peakInFlight = Math.max(peakInFlight, inFlight);
+                    clock.advance(10_000);
+                    hooks.onProgress(body.size);
+                    // Park on a real macrotask so overlapping workers are
+                    // observable rather than serialised by the microtask queue.
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    inFlight -= 1;
+                    return { etag: `etag-${body.size}` };
+                },
+            }),
+        );
+
+        expect(controller.target()).toBe(4);
+        expect(peakInFlight).toBeGreaterThan(2);
+        expect(etags.size).toBe(12);
+    });
+
+    it('uploads every part regardless of pool resizing', async () => {
+        const { store, urls, queue } = await pool(20);
+        const controller = createConcurrencyController({ initial: 2, min: 2, max: 8 });
+
+        const etags = await runUploaders(
+            queue,
+            baseOpts({
+                store,
+                urls,
+                maxConcurrent: 2,
+                concurrency: controller,
+                uploadPart: () => Promise.resolve({ etag: 'etag' }),
+            }),
+        );
+
+        expect(etags.size).toBe(20);
+        expect([...etags.keys()].sort((a, b) => a - b)).toEqual(
+            Array.from({ length: 20 }, (_, i) => i + 1),
+        );
     });
 });

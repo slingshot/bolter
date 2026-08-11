@@ -318,7 +318,14 @@ const FAST = { maxAttemptsPerPart: 2, retryDelayMs: () => 0 };
  * from `partSize` against a 640 MiB staged-byte budget, so anything below
  * 64 MiB lands on the MAX_WINDOW clamp.
  */
-const { windowSize: TINY_WINDOW, maxConcurrent: TINY_POOL } = deriveConcurrency(4);
+const { windowSize: TINY_WINDOW, maxConcurrent: TINY_CAP } = deriveConcurrency(4);
+
+/**
+ * Workers the engine actually starts with: the AIMD pool opens at
+ * `min(4, cap)` and grows a step per quiet 10s window, which is far longer
+ * than any of these runs, so the pool stays at its opening size throughout.
+ */
+const TINY_POOL = Math.min(4, TINY_CAP);
 
 describe('runEngine', () => {
     it('runs a single-file job end-to-end: stage, upload, complete, clear', async () => {
