@@ -119,6 +119,28 @@ describe('config default values', () => {
         }
     });
 
+    it('should default maxMetadataBytes to UPLOAD_LIMITS.MAX_METADATA_BYTES', () => {
+        if (!process.env.MAX_METADATA_BYTES) {
+            expect(config.maxMetadataBytes).toBe(UPLOAD_LIMITS.MAX_METADATA_BYTES);
+        }
+    });
+
+    it('should default maxRequestBodyBytes to UPLOAD_LIMITS.MAX_REQUEST_BODY_BYTES', () => {
+        if (!process.env.MAX_REQUEST_BODY_BYTES) {
+            expect(config.maxRequestBodyBytes).toBe(UPLOAD_LIMITS.MAX_REQUEST_BODY_BYTES);
+        }
+    });
+
+    it('leaves room for a MAX_FILES_PER_ARCHIVE archive inside MAX_METADATA_BYTES', () => {
+        // The two limits are independent knobs but must stay consistent: a
+        // selection the file gate accepts has to fit under the byte cap, or
+        // uploads fail at completion with a confusing second error. ~420
+        // base64 bytes covers a 255-char name plus its size/type fields.
+        expect(UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE * 420).toBeLessThanOrEqual(
+            UPLOAD_LIMITS.MAX_METADATA_BYTES,
+        );
+    });
+
     it('should default maxExpireSeconds to TIME_LIMITS.MAX_EXPIRE_SECONDS', () => {
         if (!process.env.MAX_EXPIRE_SECONDS) {
             expect(config.maxExpireSeconds).toBe(TIME_LIMITS.MAX_EXPIRE_SECONDS);

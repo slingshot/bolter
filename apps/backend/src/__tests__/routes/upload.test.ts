@@ -666,6 +666,53 @@ describe('POST /upload/complete', () => {
         expect(finalizedFields().auth).toBe('unencrypted');
     });
 
+    it('rejects metadata past the byte cap before completing the upload', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ multipart: true, uploadId: 'mp-upload-id', numParts: 1 }),
+        );
+
+        // Base64 is ASCII, so length is byte length. The stored blob is
+        // re-served by /metadata/:id on every download-page load, and neither
+        // the route schema (`t.String()`) nor Bun's 128MB body default bounded
+        // it — a single POST could park megabytes in Redis behind one file id.
+        const oversized = 'A'.repeat(2 * 1024 * 1024);
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', {
+                id: 'abc123',
+                metadata: oversized,
+                parts: [{ PartNumber: 1, ETag: '"etag1"' }],
+            }),
+        );
+
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/metadata/i);
+        // Refused before the S3 completion, like the file-count gate: a
+        // rejected upload must never be finalized.
+        expect(mockStorage.completeMultipartUpload.mock.calls.length).toBe(0);
+    });
+
+    it('caps encrypted metadata too, which the file-count gate cannot inspect', async () => {
+        mockStorage.getMetadata.mockResolvedValue(
+            makeMetadata({ encrypted: true, multipart: false }),
+        );
+
+        const app = createApp();
+        const res = await app.handle(
+            jsonPost('/upload/complete', {
+                id: 'abc123',
+                metadata: 'A'.repeat(2 * 1024 * 1024),
+                authKey: 'a'.repeat(43),
+            }),
+        );
+
+        // MAX_FILES_PER_ARCHIVE is unenforceable on ciphertext by design. A
+        // byte cap is not — it is the one bound that covers both share types.
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/metadata/i);
+    });
+
     it('should complete a multipart upload with sorted parts', async () => {
         mockStorage.getMetadata.mockResolvedValue(
             makeMetadata({

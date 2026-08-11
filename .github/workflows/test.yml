@@ -105,11 +105,52 @@ jobs:
           path: apps/frontend/coverage/
           retention-days: 7
 
+  e2e:
+    # The engine suite drives a real browser against the production build:
+    # OPFS sync access handles, module-worker chunk loading and structured
+    # clone across the worker boundary have no unit-test equivalent. WebKit is
+    # not optional here — `FileSystemHandle.move()` takes two mandatory
+    # arguments there and one in Chromium, and that split broke every Safari
+    # and iOS upload while a chromium-only matrix stayed green.
+    name: Browser E2E (chromium + webkit)
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build shared package
+        run: cd packages/shared && bun run build
+
+      - name: Install Playwright browsers
+        run: cd apps/frontend && bunx playwright install --with-deps chromium webkit
+
+      - name: Run Playwright suite
+        run: cd apps/frontend && bun run e2e
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            apps/frontend/playwright-report/
+            apps/frontend/test-results/
+          retention-days: 7
+
   pr-comment:
     name: PR Status Comment
     runs-on: namespace-profile-default
     if: always() && github.event_name == 'pull_request'
-    needs: [test, build, docker, test-frontend-coverage]
+    needs: [test, build, docker, test-frontend-coverage, e2e]
     permissions:
       pull-requests: write
 

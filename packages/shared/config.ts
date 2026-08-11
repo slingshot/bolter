@@ -16,7 +16,25 @@ export const UPLOAD_LIMITS = {
     MAX_PART_SIZE: 5 * BYTES.GB, // 5GB per part (R2/S3 limit)
     MIN_PART_SIZE: 5 * 1024 * 1024, // 5 MiB (5,242,880) — S3/R2 enforce MiB for non-trailing parts, not decimal MB
     MAX_PARTS: 10000, // Cloudflare R2 limit
-    MAX_FILES_PER_ARCHIVE: 64,
+    MAX_FILES_PER_ARCHIVE: 1000,
+    /**
+     * Cap on the base64 metadata blob a client may attach at
+     * `/upload/complete`. This — not the file count — is the resource the
+     * archive limit was standing in for: the blob is stored in Redis and
+     * re-served by `/metadata/:id` on every download-page load, and it is the
+     * only bound that also applies to encrypted shares, whose ciphertext
+     * metadata `MAX_FILES_PER_ARCHIVE` cannot inspect. 1,000 entries with
+     * 255-char names encode to roughly 420KB, so 512KiB clears the file limit
+     * above with room to spare.
+     */
+    MAX_METADATA_BYTES: 512 * 1024,
+    /**
+     * Global request-body ceiling. File bytes go straight to S3, so the API
+     * only ever receives JSON; the largest legitimate body is an
+     * `/upload/complete` carrying MAX_PARTS ETags (~600KB) plus metadata.
+     * Bun defaults to 128MB, which any unauthenticated caller could send.
+     */
+    MAX_REQUEST_BODY_BYTES: 4 * 1024 * 1024,
 } as const;
 
 // Time limits in seconds

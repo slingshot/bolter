@@ -58,8 +58,8 @@ describe('UPLOAD_LIMITS', () => {
         expect(UPLOAD_LIMITS.MAX_PARTS).toBe(10000);
     });
 
-    it('should set MAX_FILES_PER_ARCHIVE to 64', () => {
-        expect(UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE).toBe(64);
+    it('should set MAX_FILES_PER_ARCHIVE to 1000', () => {
+        expect(UPLOAD_LIMITS.MAX_FILES_PER_ARCHIVE).toBe(1000);
     });
 
     it('should allow MAX_FILE_SIZE to be divided into at most MAX_PARTS with MAX_PART_SIZE', () => {
