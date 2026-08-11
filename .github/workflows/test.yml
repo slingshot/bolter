@@ -154,7 +154,7 @@ jobs:
     # while testing none of the engine. macOS is also the platform Safari
     # users actually run.
     name: Browser E2E (webkit, macOS)
-    runs-on: nscloud-macos-tahoe-arm64-6x14
+    runs-on: namespace-profile-mac
 
     steps:
       - name: Checkout
