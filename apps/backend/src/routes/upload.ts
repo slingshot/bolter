@@ -14,6 +14,15 @@ const MAX_PARTS = UPLOAD_LIMITS.MAX_PARTS;
 const MAX_PART_SIZE = UPLOAD_LIMITS.MAX_PART_SIZE;
 const MIN_PART_SIZE = UPLOAD_LIMITS.MIN_PART_SIZE;
 
+/**
+ * Bound on trailing-part correction passes. `partSize` only grows across
+ * iterations, so `numParts` is monotonically non-increasing and the loop
+ * converges — a full sweep of every 1 MB from the multipart threshold to 2 GB
+ * and every 1 GB to 1 TB needs at most 3. This exists so a future change to the
+ * sizing constants surfaces as a loud failure rather than a hang.
+ */
+const MAX_TRAILING_PART_PASSES = 64;
+
 interface PartInfo {
     partNumber: number;
     url: string;
@@ -47,18 +56,31 @@ export function calculateOptimalPartSize(
         numParts = Math.ceil(fileSize / partSize);
     }
 
-    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MiB)
-    // This prevents R2 EntityTooSmall errors when compressed/encrypted size
-    // lands just above a multiple of partSize
-    if (numParts > 1) {
+    // Ensure the last part won't be smaller than MIN_PART_SIZE (5MiB).
+    // R2 rejects a sub-5MiB non-trailing part as EntityTooSmall *after* the
+    // client has transferred every byte, so this must hold on every input.
+    //
+    // This is a loop, not a single pass. The recomputed, MiB-aligned partSize
+    // can itself leave a trailing part under the minimum: 529,000,001 bytes on
+    // 25MB parts and 616GB on 50MB parts both allocated illegally under the
+    // one-pass version. `numParts = ceil(fileSize / partSize)` guarantees the
+    // trailing part is > 0 on entry, so only the lower bound needs testing.
+    let trailingPasses = 0;
+    while (numParts > 1) {
         const lastPartSize = fileSize - (numParts - 1) * partSize;
-        if (lastPartSize > 0 && lastPartSize < MIN_PART_SIZE) {
-            numParts = numParts - 1;
-            partSize = Math.ceil(fileSize / numParts);
-            // Align to MB boundary
-            partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
-            numParts = Math.ceil(fileSize / partSize);
+        if (lastPartSize >= MIN_PART_SIZE) {
+            break;
         }
+        if (++trailingPasses > MAX_TRAILING_PART_PASSES) {
+            throw new Error(
+                `Part sizing failed to converge: fileSize=${fileSize} partSize=${partSize} numParts=${numParts}`,
+            );
+        }
+        numParts = numParts - 1;
+        partSize = Math.ceil(fileSize / numParts);
+        // Align to MB boundary
+        partSize = Math.ceil(partSize / (1024 * 1024)) * (1024 * 1024);
+        numParts = Math.ceil(fileSize / partSize);
     }
 
     return { partSize, numParts };

@@ -143,6 +143,24 @@ describe('calculateOptimalPartSize', () => {
         expect(result.numParts * result.partSize).toBeGreaterThanOrEqual(fileSize);
     });
 
+    // The single-pass adjustment is not always enough: its recomputed,
+    // MiB-aligned partSize can itself leave a trailing part under the minimum.
+    // R2 rejects those as EntityTooSmall *after* every byte has transferred.
+    // Both cases below are reachable today, and only on the 25MB/50MB tiers —
+    // the ones the speed test hands to slow connections.
+    it.each([
+        ['25MB tier', 529_000_001, 25 * 1_000_000],
+        ['50MB tier', 616_000_000_000, 50 * 1_000_000],
+    ])('should never leave a sub-MIN_PART_SIZE trailing part (%s)', (_label, fileSize, preferred) => {
+        const result = calculateOptimalPartSize(fileSize, preferred);
+
+        expect(result.numParts).toBeGreaterThan(1);
+        const trailing = fileSize - (result.numParts - 1) * result.partSize;
+        expect(trailing).toBeGreaterThanOrEqual(MIN_PART_SIZE);
+        expect(result.numParts).toBeLessThanOrEqual(MAX_PARTS);
+        expect(result.numParts * result.partSize).toBeGreaterThanOrEqual(fileSize);
+    });
+
     it('should handle a 1TB file', () => {
         const fileSize = 1_000_000_000_000; // 1TB
 
@@ -209,6 +227,57 @@ describe('calculateOptimalPartSize', () => {
 
         expect(result1.partSize).toBe(result2.partSize);
         expect(result1.numParts).toBe(result2.numParts);
+    });
+});
+
+// The invariant that actually matters: no allocation may produce a
+// non-trailing part below MIN_PART_SIZE, on any input. Sampled sizes miss it —
+// this sweep is what found the single-pass bug.
+describe('calculateOptimalPartSize invariants (sweep)', () => {
+    const MULTIPART_THRESHOLD = UPLOAD_LIMITS.MULTIPART_THRESHOLD;
+    const MAX_FILE_SIZE = UPLOAD_LIMITS.MAX_FILE_SIZE;
+
+    function assertLegal(fileSize: number) {
+        const { partSize, numParts } = calculateOptimalPartSize(fileSize);
+        const trailing = numParts > 1 ? fileSize - (numParts - 1) * partSize : fileSize;
+
+        // MiB alignment is deliberately outside this sweep: it describes how a
+        // part size is derived, not whether an allocation is legal, and R2
+        // enforces no such rule. The `align part size to MB boundary when
+        // auto-adjusting` case above covers the paths that recompute it.
+        //
+        // Messages carry fileSize so a sweep failure is reproducible from the output.
+        expect(numParts, `numParts for ${fileSize}`).toBeLessThanOrEqual(MAX_PARTS);
+        expect(numParts, `numParts for ${fileSize}`).toBeGreaterThanOrEqual(1);
+        expect(partSize, `partSize for ${fileSize}`).toBeLessThanOrEqual(MAX_PART_SIZE);
+        expect(numParts * partSize, `coverage for ${fileSize}`).toBeGreaterThanOrEqual(fileSize);
+        if (numParts > 1) {
+            expect(trailing, `trailing part for ${fileSize}`).toBeGreaterThanOrEqual(MIN_PART_SIZE);
+        }
+    }
+
+    it('should hold every 1MB from the multipart threshold to 2GB', () => {
+        for (let size = MULTIPART_THRESHOLD + 1; size < 2_000_000_000; size += 1_000_000) {
+            assertLegal(size);
+        }
+    });
+
+    it('should hold every 1GB from 2GB to MAX_FILE_SIZE', () => {
+        for (let size = 2_000_000_000; size <= MAX_FILE_SIZE; size += 1_000_000_000) {
+            assertLegal(size);
+        }
+    });
+
+    it('should hold at boundary values', () => {
+        for (const size of [
+            MULTIPART_THRESHOLD + 1,
+            MAX_FILE_SIZE,
+            MAX_FILE_SIZE - 1,
+            115_000_000_000, // failed under the single-pass adjustment
+            779_000_000_000, // failed under the single-pass adjustment
+        ]) {
+            assertLegal(size);
+        }
     });
 });
 
