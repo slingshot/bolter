@@ -15,6 +15,7 @@ import {
     listOpfsUploadDirs,
     PART_SIZE,
     readEngineCheckpoint,
+    recordRequestUrls,
     workerSpawns,
 } from './helpers';
 
@@ -48,11 +49,15 @@ test('engine path smoke: 150MB uploads through the worker with exact part sizes'
 }) => {
     await installWorkerSpy(page);
     const mock = await installMockBackend(page);
+    const requests = recordRequestUrls(page);
 
     await startUpload(page);
     await expect(page.getByText('Upload complete!', { exact: true })).toBeVisible({
         timeout: 150_000,
     });
+
+    // The preflight probe is gone; a request here means it came back.
+    expect(requests.filter((u) => u.includes('/upload/speedtest'))).toEqual([]);
 
     // Asserted FIRST, because an engine that declines still finishes the
     // upload through the legacy pipeline — every assertion below would pass
@@ -128,12 +133,16 @@ test('reload mid-upload: resume finishes remaining parts without re-uploading pa
 test('kill switch: upload runs the legacy pipeline with no engine worker', async ({ page }) => {
     await installWorkerSpy(page);
     const mock = await installMockBackend(page);
+    const requests = recordRequestUrls(page);
     await page.addInitScript(() => localStorage.setItem('bolter:upload-engine', 'off'));
 
     await startUpload(page);
     await expect(page.getByText('Upload complete!', { exact: true })).toBeVisible({
         timeout: 150_000,
     });
+
+    // The legacy pipeline lost its preflight too, not just the engine.
+    expect(requests.filter((u) => u.includes('/upload/speedtest'))).toEqual([]);
 
     // No engine worker was ever spawned, and nothing was staged to OPFS.
     const spawns = await workerSpawns(page);

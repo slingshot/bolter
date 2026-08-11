@@ -137,17 +137,9 @@ export async function installMockBackend(
     await page.route('**/api/**', (route) => route.fulfill(json({ error: 'unmocked' }, 404)));
     await page.route('**/api/config', (route) => route.fulfill(json(CONFIG_RESPONSE)));
     await page.route('**/api/pl/api/event', (route) => route.fulfill({ status: 202, body: '' }));
-    // No speed-test part URLs → `measureUploadSpeed` reports 0 immediately
-    // and the pipeline falls back to the allocation's part size (which this
-    // mock dictates anyway) instead of pushing 500MB of throwaway bytes.
-    await page.route('**/api/upload/speedtest', (route) =>
-        route.fulfill(
-            json({ testId: 'e2e-speedtest', uploadId: 'e2e-speedtest-upload', parts: [] }),
-        ),
-    );
-    await page.route('**/api/upload/speedtest/cleanup', (route) =>
-        route.fulfill(json({ ok: true })),
-    );
+    // No `/upload/speedtest` handler: the preflight probe is gone, so a
+    // request to it would fall through to the `**/api/**` catch-all 404 —
+    // and `upload-engine.spec.ts` asserts none is ever made.
     await page.route('**/api/upload/url', (route) => {
         const body = JSON.parse(route.request().postData() ?? '{}') as { fileSize?: number };
         const fileSize = body.fileSize ?? 0;
@@ -219,6 +211,16 @@ export async function addGeneratedFile(page: Page, name: string, sizeBytes: numb
         },
         { name, sizeBytes },
     );
+}
+
+/**
+ * Record every request URL the page issues (install before navigating). Used
+ * to assert absences — a request the pipeline must never make.
+ */
+export function recordRequestUrls(page: Page): string[] {
+    const urls: string[] = [];
+    page.on('request', (request) => urls.push(request.url()));
+    return urls;
 }
 
 /**
