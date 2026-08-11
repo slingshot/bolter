@@ -55,6 +55,11 @@ export interface EngineDeps {
 
 export interface EngineResult {
     actualSize: number;
+    /**
+     * How the AIMD pool ended up sizing itself, for telemetry only. Absent on
+     * paths that ran no uploaders (a completion replay uploads nothing).
+     */
+    concurrency?: { peak: number; final: number; pushbacks: number };
 }
 
 /** Optional knobs for deterministic tests; production callers omit this. */
@@ -176,7 +181,11 @@ export async function runEngine(
         });
         throw error;
     }
-    deps.onEvent({ type: 'done', actualSize: result.actualSize });
+    deps.onEvent({
+        type: 'done',
+        actualSize: result.actualSize,
+        ...(result.concurrency !== undefined && { concurrency: result.concurrency }),
+    });
     return result;
 }
 
@@ -467,7 +476,14 @@ async function runPipeline(
     for (const size of sizes.values()) {
         actualSize += size;
     }
-    return { actualSize };
+    return {
+        actualSize,
+        concurrency: {
+            peak: concurrency.peak(),
+            final: concurrency.target(),
+            pushbacks: concurrency.pushbacks(),
+        },
+    };
 }
 
 interface ProductionPlan {

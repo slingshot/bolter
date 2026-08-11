@@ -108,8 +108,18 @@ export const trackUploadAttempt = (props: {
  */
 export const trackEngineEvent = (props: {
     attemptId: string;
-    event: 'failure' | 'resume' | 'cancel' | 'replay' | 'persist-result';
+    event: 'failure' | 'resume' | 'cancel' | 'replay' | 'persist-result' | 'concurrency';
     detail?: string;
+    /** 'concurrency' only: highest pool size reached this run. */
+    peak?: number;
+    /** 'concurrency' only: pool size at completion. */
+    final?: number;
+    /**
+     * 'concurrency' only: 429/503 responses seen. R2 documents a 1
+     * write/sec/key limit without saying whether UploadPart is exempt; this
+     * is the field that answers it from production rather than inference.
+     */
+    pushbacks?: number;
 }) => {
     safeTrack('Engine Event', { props: toStringProps(props) });
     safeVercelTrack('Engine Event', props);

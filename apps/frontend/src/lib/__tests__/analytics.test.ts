@@ -114,6 +114,35 @@ describe('trackEngineEvent', () => {
         });
     });
 
+    it('emits concurrency telemetry with peak, final and pushback counts', () => {
+        // `pushbacks` is the field that settles whether R2's documented
+        // 1 write/sec/key limit covers UploadPart — the docs do not say.
+        trackEngineEvent({
+            attemptId: 'ua_abc123def4567',
+            event: 'concurrency',
+            peak: 8,
+            final: 4,
+            pushbacks: 2,
+        });
+
+        expect(plausibleTrack).toHaveBeenCalledWith('Engine Event', {
+            props: {
+                attemptId: 'ua_abc123def4567',
+                event: 'concurrency',
+                peak: '8',
+                final: '4',
+                pushbacks: '2',
+            },
+        });
+        expect(vercelTrack).toHaveBeenCalledWith('Engine Event', {
+            attemptId: 'ua_abc123def4567',
+            event: 'concurrency',
+            peak: 8,
+            final: 4,
+            pushbacks: 2,
+        });
+    });
+
     it('omits an absent detail from both payloads', () => {
         trackEngineEvent({ attemptId: 'ua_abc123def4567', event: 'replay' });
 
