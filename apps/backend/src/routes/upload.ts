@@ -333,7 +333,7 @@ export const uploadRoutes = new Elysia()
     .post(
         '/upload/url',
         async ({ body, request, set }) => {
-            const { fileSize, encrypted, timeLimit, dlimit, preferredPartSize } = body;
+            const { fileSize, encrypted, timeLimit, dlimit } = body;
             const requestId = randomBytes(4).toString('hex');
 
             logger.info(
@@ -704,6 +704,12 @@ export const uploadRoutes = new Elysia()
                 // value on the parseInt round-trip
                 timeLimit: t.Optional(t.Integer({ minimum: 1 })),
                 dlimit: t.Optional(t.Integer({ minimum: 1 })),
+                /**
+                 * Accepted and ignored. Browsers cache the old bundle, which
+                 * still sends a speed-test-derived tier; removing the field
+                 * risks a 400 for those clients depending on how Elysia treats
+                 * unknown properties. Delete one release after this ships.
+                 */
                 preferredPartSize: t.Optional(t.Number()),
             }),
             response: {

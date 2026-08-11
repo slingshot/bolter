@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { PART_SIZING } from '@bolter/shared';
 import type { FileMetadata } from '../../storage';
 
 // ---------------------------------------------------------------------------
@@ -355,20 +356,21 @@ describe('POST /upload/url', () => {
         expect(usedExpire).toBeLessThanOrEqual(maxExpireSeconds);
     });
 
-    it('should pass preferredPartSize to calculateOptimalPartSize for multipart uploads', async () => {
-        const app = createApp();
-        const preferredPartSize = 100_000_000; // 100MB
-        const res = await app.handle(
-            jsonPost('/upload/url', { fileSize: 500_000_000, preferredPartSize }),
+    it('should ignore a client-supplied preferredPartSize', async () => {
+        // Old bundles cached in browsers still send this. It must be accepted
+        // (not 400) and have no effect — the server owns sizing now.
+        const fileSize = 1_000_000_000;
+        const withHint = await createApp().handle(
+            jsonPost('/upload/url', { fileSize, preferredPartSize: 25 * 1_000_000 }),
         );
+        expect(withHint.status).toBe(200);
+        const hinted = await withHint.json();
 
-        expect(res.status).toBe(200);
-        const body = await res.json();
+        const withoutHint = await createApp().handle(jsonPost('/upload/url', { fileSize }));
+        const plain = await withoutHint.json();
 
-        expect(body.multipart).toBe(true);
-        // With a preferred part size of 100MB and 500MB file, we should get 5 parts
-        expect(body.partSize).toBe(preferredPartSize);
-        expect(body.parts.length).toBe(5);
+        expect(hinted.partSize).toBe(plain.partSize);
+        expect(hinted.partSize).toBe(PART_SIZING.FLOOR);
     });
 
     it('should return useSignedUrl=false when multipart upload creation fails', async () => {
