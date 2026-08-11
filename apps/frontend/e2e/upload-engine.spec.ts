@@ -54,7 +54,15 @@ test('engine path smoke: 150MB uploads through the worker with exact part sizes'
         timeout: 150_000,
     });
 
-    // The engine really ran in a dedicated worker built by Vite.
+    // Asserted FIRST, because an engine that declines still finishes the
+    // upload through the legacy pipeline — every assertion below would pass
+    // while testing none of the engine. A worker spawn alone does not prove
+    // it ran: the eligibility probe spawns one of its own before declining,
+    // which is how a WebKit run with no OPFS looked healthy until this line.
+    const attempt = (await analyticsEvents(page)).find((e) => e.name === 'Upload Attempt');
+    expect(attempt?.data).toMatchObject({ engine: 'worker' });
+
+    // …and it really ran in a dedicated worker built by Vite.
     const spawns = await workerSpawns(page);
     expect(spawns.filter((url) => url.includes('engine.worker'))).not.toEqual([]);
 
@@ -78,10 +86,6 @@ test('engine path smoke: 150MB uploads through the worker with exact part sizes'
     expect(completion.actualSize).toBe(PAYLOAD_BYTES);
     expect(completion.parts?.map((p) => p.PartNumber)).toEqual([1, 2, 3]);
     expect(completion.parts?.map((p) => p.ETag)).toEqual(['"etag-1"', '"etag-2"', '"etag-3"']);
-
-    // The delegation decision was recorded as a worker attempt.
-    const attempt = (await analyticsEvents(page)).find((e) => e.name === 'Upload Attempt');
-    expect(attempt?.data?.engine).toBe('worker');
 });
 
 test('reload mid-upload: resume finishes remaining parts without re-uploading part 1', async ({
