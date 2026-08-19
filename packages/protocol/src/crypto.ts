@@ -3,7 +3,7 @@
  * Uses Web Crypto API for AES-GCM encryption and HKDF key derivation
  */
 
-import { captureError } from './sentry';
+import { reportError } from './telemetry';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -438,7 +438,7 @@ export function createDecryptionStream(
                     }
                 } catch (e) {
                     console.error('Failed to decrypt final record:', e);
-                    captureError(e, {
+                    reportError(e, {
                         operation: 'crypto.decryptRecord',
                         extra: { recordCount, bufferLength: buffer.length },
                     });
@@ -465,7 +465,7 @@ export function createDecryptionStream(
                     recordCount,
                     eceVersion,
                 });
-                captureError(err, {
+                reportError(err, {
                     operation: 'crypto.missingFinalRecord',
                     extra: { recordCount, eceVersion },
                 });
@@ -476,7 +476,7 @@ export function createDecryptionStream(
             // Pre-versioning uploads with exact-record-multiple plaintexts have
             // no final-flagged record, so this is not an error for them — but
             // track occurrences for telemetry.
-            captureError(new Error('Encrypted stream ended without final record'), {
+            reportError(new Error('Encrypted stream ended without final record'), {
                 operation: 'crypto.missingFinalRecord',
                 level: 'warning',
                 extra: { recordCount, eceVersion },

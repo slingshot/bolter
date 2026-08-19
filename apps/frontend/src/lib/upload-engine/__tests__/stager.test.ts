@@ -1,4 +1,3 @@
-import { describe, expect, it } from 'vitest';
 import {
     calculateEncryptedSize,
     createDecryptionStream,
@@ -7,8 +6,9 @@ import {
     ECE_RECORD_SIZE,
     ECE_VERSION,
     Keychain,
-} from '@/lib/crypto';
-import { isRetryableError } from '@/lib/upload-shared';
+} from '@bolter/protocol/crypto';
+import { isRetryableError } from '@bolter/protocol/retry';
+import { describe, expect, it } from 'vitest';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import { createSliceProducer } from '../producer';
 import { runStager } from '../stager';

@@ -1,17 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { getConcurrentUploads, isRetryableError, retryDelayMs } from '../upload-shared';
+import { describe, expect, it } from 'bun:test';
+import { getConcurrentUploads, isRetryableError, retryDelayMs } from '../src/retry';
 
-describe('upload-shared', () => {
-    it('is importable without DOM globals', async () => {
-        // happy-dom rewrites import.meta.url to an http: URL, so resolve the
-        // source path from the vitest cwd (apps/frontend) instead.
-        const [fs, path] = await Promise.all([import('node:fs'), import('node:path')]);
-        const src = fs.readFileSync(
-            path.resolve(process.cwd(), 'src/lib/upload-shared.ts'),
-            'utf8',
-        );
-        expect(src).not.toMatch(/\bwindow\b|\bdocument\b|navigator\.onLine/);
-    });
+describe('retry', () => {
     it('returns bounded concurrency for every file size', () => {
         // Concurrency deliberately drops above 50GB (conservative for R2), so
         // assert sane bounds rather than monotonic growth.

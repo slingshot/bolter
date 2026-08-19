@@ -22,7 +22,7 @@
  * the part store — the encryption transform runs before any staging write.
  */
 
-import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
+import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@bolter/protocol/crypto';
 import type { PartStore } from './part-store';
 import type { ProducerChunk } from './producer';
 import type { EngineStateStore, ProducerCheckpoint } from './state';

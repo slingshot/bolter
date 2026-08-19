@@ -13,7 +13,7 @@
  * multi-file archives are fed from slice-backed streams.
  */
 
-import { ECE_RECORD_SIZE } from '@/lib/crypto';
+import { ECE_RECORD_SIZE } from '@bolter/protocol/crypto';
 import { createStreamingZip } from '@/lib/zip';
 
 export const PRODUCER_CHUNK_RECORDS = 64; // 64 × 65,536 = 4 MiB plaintext per read

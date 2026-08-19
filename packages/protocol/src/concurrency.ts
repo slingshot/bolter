@@ -1,5 +1,5 @@
 /**
- * AIMD concurrency control for the worker upload engine.
+ * AIMD concurrency control for Bolter upload clients.
  *
  * Replaces the preflight speed test's role as the adaptive element: instead of
  * spending up to 500MB measuring the link before uploading, the pool observes
@@ -14,7 +14,8 @@
  * tick throttled or suspended by the browser still measures one elapsed window
  * rather than none or many.
  *
- * Pure state machine — no timers, no I/O, no DOM. Worker-safe.
+ * Pure state machine — no timers, no I/O, no host globals. Runs unchanged in
+ * the browser, a Web Worker and a compiled binary.
  */
 
 export interface ConcurrencyControllerOpts {

@@ -1,5 +1,3 @@
-import { UPLOAD_LIMITS } from '@bolter/shared';
-import { describe, expect, it } from 'vitest';
 import {
     calculateEncryptedSize,
     createDecryptionStream,
@@ -7,7 +5,9 @@ import {
     ECE_RECORD_SIZE,
     ECE_VERSION,
     Keychain,
-} from '@/lib/crypto';
+} from '@bolter/protocol/crypto';
+import { UPLOAD_LIMITS } from '@bolter/shared';
+import { describe, expect, it } from 'vitest';
 import { deriveConcurrency, type EngineDeps, runEngine } from '../engine';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type { EngineJob, WorkerToClient } from '../protocol';

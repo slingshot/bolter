@@ -3,8 +3,6 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { UPLOAD_LIMITS } from '@bolter/shared';
-import { predictLength } from 'client-zip';
 import {
     arrayToB64,
     b64ToArray,
@@ -16,7 +14,10 @@ import {
     ECE_VERSION,
     Keychain,
     readEceVersion,
-} from './crypto';
+} from '@bolter/protocol/crypto';
+import { getConcurrentUploads, isRetryableError, retryDelayMs } from '@bolter/protocol/retry';
+import { UPLOAD_LIMITS } from '@bolter/shared';
+import { predictLength } from 'client-zip';
 import { FileReadError, LimitReachedError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
 import {
@@ -37,7 +38,6 @@ import { createEngineProgressReporter } from './upload-engine/progress-reporter'
 import type { EngineJob, EngineSource } from './upload-engine/protocol';
 import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
 import { withUploadLifecycle } from './upload-lifecycle';
-import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
 import {
     computeContentFingerprint,
     deleteUploadState,
@@ -68,7 +68,7 @@ const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
 // API base URL - defaults to localhost for development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
-// Retry configuration (backoff base/cap live in upload-shared.ts → retryDelayMs)
+// Retry configuration (backoff base/cap live in @bolter/protocol/retry → retryDelayMs)
 const MAX_RETRIES = 10;
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 

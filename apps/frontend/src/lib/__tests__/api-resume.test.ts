@@ -258,7 +258,7 @@ describe('resumeUpload', () => {
         // Same path, encrypted: the object is the full ECE ciphertext, which is
         // larger than file.size by the per-record tag+delimiter overhead.
         const { calculateEncryptedSize, ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE, Keychain } =
-            await import('@/lib/crypto');
+            await import('@bolter/protocol/crypto');
         // 10 whole ECE records per part, so getEffectivePartSize() is exact
         const partSize = 10 * ECE_ENCRYPTED_RECORD_SIZE;
         const plaintextPartSize = 10 * ECE_RECORD_SIZE;

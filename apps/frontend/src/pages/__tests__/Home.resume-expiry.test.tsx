@@ -39,8 +39,8 @@ vi.mock('@/lib/api', () => {
 // Partial mock: the upload-engine modules Home now pulls in need the real ECE
 // constants; only Keychain is stubbed (accepts and ignores an optional
 // secretKeyB64, the encrypted-resume path).
-vi.mock('@/lib/crypto', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('@/lib/crypto')>()),
+vi.mock('@bolter/protocol/crypto', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@bolter/protocol/crypto')>()),
     Keychain: class {
         secretKeyB64 = 'secret-key-b64';
     },

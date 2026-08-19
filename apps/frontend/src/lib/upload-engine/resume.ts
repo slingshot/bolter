@@ -22,8 +22,8 @@
  * Worker-safe: no DOM globals.
  */
 
-import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
-import { isRetryableError } from '@/lib/upload-shared';
+import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@bolter/protocol/crypto';
+import { isRetryableError } from '@bolter/protocol/retry';
 import { finalizeUpload } from './completion';
 import { type EngineDeps, type EngineResult, runEngine } from './engine';
 import type { PartStore } from './part-store';

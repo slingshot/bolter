@@ -1,0 +1,44 @@
+{
+    "name": "@bolter/protocol",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "main": "src/index.ts",
+    "exports": {
+        ".": {
+            "bun": "./src/index.ts",
+            "import": "./dist/index.js",
+            "default": "./src/index.ts"
+        },
+        "./concurrency": {
+            "bun": "./src/concurrency.ts",
+            "import": "./dist/concurrency.js",
+            "default": "./src/concurrency.ts"
+        },
+        "./retry": {
+            "bun": "./src/retry.ts",
+            "import": "./dist/retry.js",
+            "default": "./src/retry.ts"
+        },
+        "./crypto": {
+            "bun": "./src/crypto.ts",
+            "import": "./dist/crypto.js",
+            "default": "./src/crypto.ts"
+        },
+        "./telemetry": {
+            "bun": "./src/telemetry.ts",
+            "import": "./dist/telemetry.js",
+            "default": "./src/telemetry.ts"
+        }
+    },
+    "scripts": {
+        "postinstall": "bun run build",
+        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts --outdir dist --format esm --splitting",
+        "typecheck": "tsc --noEmit",
+        "test": "bun test"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.9.3"
+    }
+}

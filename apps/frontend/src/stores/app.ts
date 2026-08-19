@@ -1,6 +1,6 @@
+import type { Keychain } from '@bolter/protocol/crypto';
 import { create } from 'zustand';
 import { type Canceller, deleteFile, getDownloadStatus, type UploadProgress } from '@/lib/api';
-import type { Keychain } from '@/lib/crypto';
 import { captureError } from '@/lib/sentry';
 import type { PersistedUpload } from '@/lib/upload-state';
 
