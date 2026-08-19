@@ -1,0 +1,20 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "types": ["bun"],
+        // No explicit `lib`: the default for this target includes DOM, which is
+        // where BufferSource, RequestInfo and the stream types come from. Bun
+        // implements all of them; restricting the lib only hides them from the
+        // compiler while @bolter/protocol still uses them.
+        "strict": true,
+        "skipLibCheck": true,
+        "noEmit": true,
+        "isolatedModules": true,
+        "resolveJsonModule": true,
+        "jsx": "react-jsx",
+        "verbatimModuleSyntax": true
+    },
+    "include": ["src", "__tests__", "bunli.config.ts"]
+}

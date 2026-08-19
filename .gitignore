@@ -292,3 +292,7 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
+
+### Bunli
+# Generated command types, rebuilt by `bunli build` / `bunli generate`.
+.bunli/

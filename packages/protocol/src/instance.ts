@@ -131,6 +131,23 @@ function looksLikeInstance(value: unknown): value is InstanceDocument {
     );
 }
 
+export class InstanceNotFoundError extends Error {
+    constructor(
+        readonly origin: string,
+        /** True when a probe answered 200 with something other than JSON. */
+        readonly servedNonJson: boolean,
+    ) {
+        super(
+            servedNonJson
+                ? `${origin} answered, but with a web page rather than a Bolter API. ` +
+                      'Its API is probably on another origin, and this instance does not publish ' +
+                      '/instance.json yet — point at the API directly.'
+                : `No Bolter instance at ${origin}: neither /instance.json nor /config answered.`,
+        );
+        this.name = 'InstanceNotFoundError';
+    }
+}
+
 export interface DiscoverOptions {
     fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
     /** Milliseconds per probe. Discovery must not hang a CLI startup. */
@@ -166,6 +183,16 @@ export async function discoverInstance(
         options.fetch ? options.fetch(input, init) : globalThis.fetch(input, init);
     const timeoutMs = options.timeoutMs ?? 5000;
 
+    /**
+     * A single-page app answers *every* path with its own HTML and a 200, so
+     * "the request succeeded" says nothing. Tracking whether a probe came back
+     * as non-JSON is what lets the failure message distinguish "nothing is
+     * there" from "something is there, but it is a web app, and the API lives
+     * somewhere else" — which is the overwhelmingly common case and needs a
+     * completely different fix.
+     */
+    let sawNonJson = false;
+
     const get = async (path: string): Promise<unknown | null> => {
         try {
             const response = await doFetch(`${base}${path}`, {
@@ -174,7 +201,16 @@ export async function discoverInstance(
             if (!response.ok) {
                 return null;
             }
-            return await response.json();
+            // Parse rather than trust `content-type`: a correctly configured
+            // instance may omit it, and HTML will not parse as JSON anyway. So
+            // this both accepts more real servers and still catches the SPA.
+            const body = await response.text();
+            try {
+                return JSON.parse(body) as unknown;
+            } catch {
+                sawNonJson = true;
+                return null;
+            }
         } catch {
             return null;
         }
@@ -198,10 +234,7 @@ export async function discoverInstance(
         return { instance: fromLegacyConfig(base, config), source: 'legacy-config' };
     }
 
-    throw new Error(
-        `no Bolter instance at ${base}: neither /instance.json nor /config answered in a ` +
-            'recognisable shape',
-    );
+    throw new InstanceNotFoundError(base, sawNonJson);
 }
 
 interface LegacyConfig {

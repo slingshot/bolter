@@ -116,7 +116,7 @@ describe('discoverInstance', () => {
     it('ignores a 200 that is not a discovery document', async () => {
         const { impl } = routes({ '/instance.json': { hello: 'world' } });
         await expect(discoverInstance('https://not.bolter', { fetch: impl })).rejects.toThrow(
-            /no Bolter instance/,
+            /No Bolter instance/,
         );
     });
 
@@ -129,7 +129,7 @@ describe('discoverInstance', () => {
     it('reports a clear failure when nothing answers', async () => {
         const impl = () => Promise.reject(new Error('ECONNREFUSED'));
         await expect(discoverInstance('https://down.example', { fetch: impl })).rejects.toThrow(
-            /no Bolter instance at https:\/\/down.example/,
+            /No Bolter instance at https:\/\/down.example/,
         );
     });
 });
