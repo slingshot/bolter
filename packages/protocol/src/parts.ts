@@ -72,6 +72,28 @@ export function planParts(opts: {
     if (numParts < 1) {
         throw new Error(`part plan invalid: numParts must be >= 1, got ${numParts}`);
     }
+    // A single part is always the trailing one, so it takes everything and no
+    // alignment applies. Without this, encrypting anything smaller than one
+    // ECE record would fail the check below for a constraint that does not
+    // exist in that case.
+    if (numParts === 1) {
+        return {
+            partSize,
+            effectivePartSize: totalSize,
+            totalSize,
+            encrypted,
+            parts: [
+                {
+                    partNumber: 1,
+                    start: 0,
+                    end: totalSize,
+                    size: totalSize,
+                    isTrailing: true,
+                },
+            ],
+        };
+    }
+
     const effectivePartSize = getEffectivePartSize(partSize, encrypted);
     if (effectivePartSize < 1) {
         throw new Error(

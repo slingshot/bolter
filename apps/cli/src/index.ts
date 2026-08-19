@@ -14,6 +14,7 @@ import pkg from '../package.json' with { type: 'json' };
 import config from './commands/config';
 import doctor from './commands/doctor';
 import info from './commands/info';
+import up from './commands/up';
 
 const cli = await createCLI({
     name: 'sendfm',
@@ -29,6 +30,7 @@ const cli = await createCLI({
     ] as const,
 });
 
+cli.command(up);
 cli.command(info);
 cli.command(doctor);
 cli.command(config);

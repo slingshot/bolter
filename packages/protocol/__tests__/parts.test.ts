@@ -138,10 +138,23 @@ describe('planParts', () => {
         expect(plan.parts[plan.parts.length - 1]?.end).toBe(300_000);
     });
 
-    it('rejects a part size below one encrypted record', () => {
+    it('rejects a multipart plan whose part size is below one encrypted record', () => {
         expect(() =>
-            planParts({ totalSize: 1000, partSize: 1000, numParts: 1, encrypted: true }),
+            planParts({ totalSize: 200_000, partSize: 1000, numParts: 2, encrypted: true }),
         ).toThrow(/smaller than one ECE record/);
+    });
+
+    it('treats a single part as trailing, whatever the part size says', () => {
+        // A lone part takes everything, so record alignment constrains
+        // nothing — and a small encrypted file is smaller than one record.
+        const plan = planParts({
+            totalSize: 1000,
+            partSize: 1000,
+            numParts: 1,
+            encrypted: true,
+        });
+        expect(plan.parts).toHaveLength(1);
+        expect(plan.parts[0]).toMatchObject({ start: 0, end: 1000, isTrailing: true });
     });
 });
 
