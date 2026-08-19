@@ -188,10 +188,16 @@ Use workspace names when the change is scoped to one workspace:
 ```
 feat(frontend): add drag-and-drop upload zone
 fix(backend): handle expired pre-signed URLs gracefully
+feat(cli): add resumable directory uploads
+refactor(protocol): move record-alignment math out of the frontend
 refactor(shared): normalize byte constants
 docs: update README with deployment instructions
 chore(deps): bump elysia to v1.2
 ```
+
+The allowed scopes are enforced by `commitlint.config.ts`: `frontend`,
+`backend`, `cli`, `protocol`, `shared`, `deps`, `ci`, `docker`, `release`.
+Adding a workspace means adding its scope there too.
 
 ### Interactive Helper
 

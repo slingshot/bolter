@@ -6,7 +6,7 @@ const config: UserConfig = {
         'scope-enum': [
             2,
             'always',
-            ['frontend', 'backend', 'shared', 'deps', 'ci', 'docker', 'release'],
+            ['frontend', 'backend', 'cli', 'protocol', 'shared', 'deps', 'ci', 'docker', 'release'],
         ],
         'scope-empty': [1, 'never'],
     },
