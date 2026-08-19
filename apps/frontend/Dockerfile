@@ -23,6 +23,9 @@ COPY apps/frontend/ ./apps/frontend/
 WORKDIR /app/apps/frontend
 ARG VITE_APP_TITLE
 ARG VITE_APP_DESCRIPTION
+# Required: the build emits instance.json, which tells non-browser clients
+# where this deployment's API lives. Without it they are handed localhost.
+ARG VITE_API_URL
 RUN bun run build
 
 # Production stage

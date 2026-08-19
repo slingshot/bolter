@@ -24,12 +24,100 @@ const FORBIDDEN = [
 ];
 
 /**
- * Comments are prose and may legitimately discuss the browser; only code is
- * constrained. Stripping them first is what keeps this guard from punishing
- * the explanatory comments the rest of this codebase depends on.
+ * Blank out everything that is prose rather than code: comments, and the
+ * contents of string and template literals. Only code is constrained — this
+ * package's comments legitimately discuss the browser, and its error messages
+ * legitimately contain words like "document".
+ *
+ * Interpolations inside template literals are kept, because `${window.x}` is
+ * code and would otherwise slip through.
  */
-function stripComments(src: string): string {
-    return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+export function stripNonCode(src: string): string {
+    let out = '';
+    let i = 0;
+    // Depth of `${ }` nesting we are currently inside, per open template.
+    const templateStack: number[] = [];
+
+    const isEscaped = () => {
+        let backslashes = 0;
+        for (let j = i - 1; j >= 0 && src[j] === '\\'; j--) {
+            backslashes++;
+        }
+        return backslashes % 2 === 1;
+    };
+
+    while (i < src.length) {
+        const two = src.slice(i, i + 2);
+
+        if (two === '//') {
+            while (i < src.length && src[i] !== '\n') {
+                out += ' ';
+                i++;
+            }
+            continue;
+        }
+        if (two === '/*') {
+            while (i < src.length && src.slice(i, i + 2) !== '*/') {
+                out += src[i] === '\n' ? '\n' : ' ';
+                i++;
+            }
+            out += '  ';
+            i += 2;
+            continue;
+        }
+        if (src[i] === "'" || src[i] === '"') {
+            const quote = src[i];
+            out += ' ';
+            i++;
+            while (i < src.length && !(src[i] === quote && !isEscaped())) {
+                out += src[i] === '\n' ? '\n' : ' ';
+                i++;
+            }
+            out += ' ';
+            i++;
+            continue;
+        }
+        if (src[i] === '`') {
+            out += ' ';
+            i++;
+            templateStack.push(0);
+            while (i < src.length && templateStack.length > 0) {
+                if (src.slice(i, i + 2) === '${') {
+                    // Interpolation: emit it as code.
+                    out += '  ';
+                    i += 2;
+                    let depth = 1;
+                    while (i < src.length && depth > 0) {
+                        if (src[i] === '{') {
+                            depth++;
+                        } else if (src[i] === '}') {
+                            depth--;
+                            if (depth === 0) {
+                                break;
+                            }
+                        }
+                        out += src[i];
+                        i++;
+                    }
+                    out += ' ';
+                    i++;
+                    continue;
+                }
+                if (src[i] === '`' && !isEscaped()) {
+                    templateStack.pop();
+                    out += ' ';
+                    i++;
+                    continue;
+                }
+                out += src[i] === '\n' ? '\n' : ' ';
+                i++;
+            }
+            continue;
+        }
+        out += src[i];
+        i++;
+    }
+    return out;
 }
 
 const srcDir = join(import.meta.dir, '..', 'src');
@@ -53,14 +141,21 @@ describe('no host-specific globals', () => {
     it.each(
         files.map((f) => [f.slice(srcDir.length + 1), f] as const),
     )('%s uses no browser-only global', (_name, file) => {
-        const code = stripComments(readFileSync(file, 'utf8'));
+        const code = stripNonCode(readFileSync(file, 'utf8'));
         for (const pattern of FORBIDDEN) {
             expect(code).not.toMatch(pattern);
         }
     });
 
-    it('would catch a real violation', () => {
-        expect(stripComments('const a = window.location;')).toMatch(/\bwindow\b/);
-        expect(stripComments('// a comment about window\nconst a = 1;')).not.toMatch(/\bwindow\b/);
+    it('catches a real violation and ignores prose', () => {
+        expect(stripNonCode('const a = window.location;')).toMatch(/\bwindow\b/);
+        expect(stripNonCode('// a comment about window\nconst a = 1;')).not.toMatch(/\bwindow\b/);
+        expect(stripNonCode('/* window */ const a = 1;')).not.toMatch(/\bwindow\b/);
+        expect(stripNonCode("throw new Error('no document here');")).not.toMatch(/\bdocument\b/);
+        expect(stripNonCode('const s = `a document v1`;')).not.toMatch(/\bdocument\b/);
+        // An interpolation is code, not prose, and must still be scanned. Written as an
+        // escaped template literal so the `${` is data here rather than a real one.
+        expect(stripNonCode(`const s = \`x \${window.name} y\`;`)).toMatch(/\bwindow\b/);
+        expect(stripNonCode("const s = 'it\\'s fine window';")).not.toMatch(/\bwindow\b/);
     });
 });

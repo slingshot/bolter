@@ -58,6 +58,7 @@ function read(relativePath: string): string {
 const backendDockerfile = read('apps/backend/Dockerfile');
 const composeFile = read('docker-compose.yml');
 const nginxConf = read('apps/frontend/nginx.conf');
+const frontendDockerfile = read('apps/frontend/Dockerfile');
 
 /** Every `http://localhost:3001/...` URL referenced by a container healthcheck. */
 function healthcheckPaths(source: string): string[] {
@@ -158,5 +159,45 @@ describe('health probe cache vs shipped probe interval (finding #29)', () => {
         // Pre-fix the TTL was a hardcoded 5s against a 30s interval, so every
         // scheduled probe missed the cache and re-ran the provider fan-out.
         expect(getHealthTiming().cacheTtlMs).toBeGreaterThanOrEqual(intervalMs);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Instance discovery is served from the web origin as a static file, so it is
+// subject to the frontend's caching rules and its build arguments — both of
+// which are easy to get wrong in a way nothing else notices.
+// ---------------------------------------------------------------------------
+
+describe('instance.json serving', () => {
+    it('is matched before the immutable static-asset rule', () => {
+        const exact = nginxConf.indexOf('location = /instance.json');
+        const assets = nginxConf.indexOf('location ~*');
+        expect(exact).toBeGreaterThan(-1);
+        // nginx prefers an exact `=` match regardless of order, but keeping the
+        // declaration first is what makes the intent legible to the next
+        // person editing the asset regex.
+        expect(exact).toBeLessThan(assets);
+    });
+
+    it('is not served immutable', () => {
+        // The asset rule sets `expires 1y; Cache-Control: immutable`. Applied
+        // to this document it would pin a stale API URL and stale limits on
+        // every client that ever fetched it, with no way to correct them.
+        const block = nginxConf.slice(
+            nginxConf.indexOf('location = /instance.json'),
+            nginxConf.indexOf('location ~*'),
+        );
+        expect(block).toContain('max-age=300');
+        expect(block).not.toContain('immutable');
+    });
+
+    it('has the API URL available at frontend build time', () => {
+        // The document is generated during `vite build`, so without this ARG
+        // every containerised deployment advertises localhost as its API.
+        expect(frontendDockerfile).toContain('ARG VITE_API_URL');
+    });
+
+    it('is passed that URL by compose', () => {
+        expect(composeFile).toContain('VITE_API_URL=');
     });
 });

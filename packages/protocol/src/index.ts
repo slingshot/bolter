@@ -11,6 +11,7 @@
 export * from './client';
 export * from './concurrency';
 export * from './crypto';
+export * from './instance';
 export * from './metadata';
 export * from './parts';
 export * from './retry';

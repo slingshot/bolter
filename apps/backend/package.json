@@ -9,12 +9,13 @@
         "build": "bun build src/index.ts --outdir ./dist --target bun --sourcemap=external",
         "build:prod": "bun run build && sentry-cli --url https://glitch.slingshot.fm sourcemaps inject ./dist && sentry-cli --url https://glitch.slingshot.fm sourcemaps upload ./dist",
         "typecheck": "tsc --noEmit",
-        "test": "bun test src/__tests__ && bun test src/__isolated_tests__",
+        "test": "bun test src/__tests__ && for f in src/__isolated_tests__/*.test.ts; do bun test \"$f\" || exit 1; done",
         "test:watch": "bun test --watch"
     },
     "dependencies": {
         "@aws-sdk/client-s3": "^3.500.0",
         "@aws-sdk/s3-request-presigner": "^3.500.0",
+        "@bolter/protocol": "workspace:*",
         "@bolter/shared": "workspace:*",
         "@elysiajs/cors": "^1.0.0",
         "@elysiajs/openapi": "^1.4.14",

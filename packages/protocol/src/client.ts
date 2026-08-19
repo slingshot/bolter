@@ -123,6 +123,11 @@ export interface RawMetadataResponse {
     metadata: string;
     ttl: number;
     encrypted: boolean;
+    /** Downloads used and allowed. Absent on instances predating this field. */
+    dl?: number;
+    dlimit?: number;
+    /** Stored object size in bytes — ciphertext size for an encrypted share. */
+    size?: number;
 }
 
 export type DownloadStatus =

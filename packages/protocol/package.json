@@ -49,11 +49,16 @@
             "bun": "./src/share.ts",
             "import": "./dist/share.js",
             "default": "./src/share.ts"
+        },
+        "./instance": {
+            "bun": "./src/instance.ts",
+            "import": "./dist/instance.js",
+            "default": "./src/instance.ts"
         }
     },
     "scripts": {
         "postinstall": "bun run build",
-        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts src/client.ts src/metadata.ts src/share.ts --root src --outdir dist --format esm --splitting --external @bolter/shared",
+        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts src/client.ts src/metadata.ts src/share.ts src/instance.ts --root src --outdir dist --format esm --splitting --external @bolter/shared",
         "typecheck": "tsc --noEmit",
         "test": "bun test"
     },
