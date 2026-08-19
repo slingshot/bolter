@@ -34,11 +34,26 @@
             "bun": "./src/parts.ts",
             "import": "./dist/parts.js",
             "default": "./src/parts.ts"
+        },
+        "./client": {
+            "bun": "./src/client.ts",
+            "import": "./dist/client.js",
+            "default": "./src/client.ts"
+        },
+        "./metadata": {
+            "bun": "./src/metadata.ts",
+            "import": "./dist/metadata.js",
+            "default": "./src/metadata.ts"
+        },
+        "./share": {
+            "bun": "./src/share.ts",
+            "import": "./dist/share.js",
+            "default": "./src/share.ts"
         }
     },
     "scripts": {
         "postinstall": "bun run build",
-        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts --outdir dist --format esm --splitting --external @bolter/shared",
+        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts src/client.ts src/metadata.ts src/share.ts --root src --outdir dist --format esm --splitting --external @bolter/shared",
         "typecheck": "tsc --noEmit",
         "test": "bun test"
     },

@@ -8,8 +8,11 @@
  * counters produces files no other client can read.
  */
 
+export * from './client';
 export * from './concurrency';
 export * from './crypto';
+export * from './metadata';
 export * from './parts';
 export * from './retry';
+export * from './share';
 export * from './telemetry';
