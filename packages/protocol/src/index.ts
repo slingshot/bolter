@@ -10,5 +10,6 @@
 
 export * from './concurrency';
 export * from './crypto';
+export * from './parts';
 export * from './retry';
 export * from './telemetry';

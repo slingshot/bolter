@@ -15,7 +15,11 @@ import {
     Keychain,
     readEceVersion,
 } from '@bolter/protocol/crypto';
+import { getEffectivePartSize } from '@bolter/protocol/parts';
 import { getConcurrentUploads, isRetryableError, retryDelayMs } from '@bolter/protocol/retry';
+
+export { getEffectivePartSize };
+
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { predictLength } from 'client-zip';
 import { FileReadError, LimitReachedError } from './errors';
@@ -405,21 +409,6 @@ async function uploadMultipartSliced(
         parts: completedParts.sort((a, b) => a.PartNumber - b.PartNumber),
         actualSize: file.size,
     };
-}
-
-/**
- * Part size actually used when cutting the stream into parts.
- * Encrypted parts are cut on ECE record boundaries so every non-trailing part
- * holds a whole number of records — required for resume to re-encrypt the
- * remainder with a consistent record counter. The backend allocates parts
- * based on the raw partSize; since the effective size is <= partSize the last
- * allocated part absorbs the residual bytes.
- */
-export function getEffectivePartSize(partSize: number, encrypted: boolean): number {
-    if (!encrypted) {
-        return partSize;
-    }
-    return Math.floor(partSize / ECE_ENCRYPTED_RECORD_SIZE) * ECE_ENCRYPTED_RECORD_SIZE;
 }
 
 export interface UploadProgress {

@@ -96,6 +96,9 @@
     "packages/protocol": {
       "name": "@bolter/protocol",
       "version": "1.0.0",
+      "dependencies": {
+        "@bolter/shared": "workspace:*",
+      },
       "devDependencies": {
         "@types/bun": "latest",
         "typescript": "^5.9.3",

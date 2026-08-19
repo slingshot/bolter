@@ -29,16 +29,24 @@
             "bun": "./src/telemetry.ts",
             "import": "./dist/telemetry.js",
             "default": "./src/telemetry.ts"
+        },
+        "./parts": {
+            "bun": "./src/parts.ts",
+            "import": "./dist/parts.js",
+            "default": "./src/parts.ts"
         }
     },
     "scripts": {
         "postinstall": "bun run build",
-        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts --outdir dist --format esm --splitting",
+        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts --outdir dist --format esm --splitting --external @bolter/shared",
         "typecheck": "tsc --noEmit",
         "test": "bun test"
     },
     "devDependencies": {
         "@types/bun": "latest",
         "typescript": "^5.9.3"
+    },
+    "dependencies": {
+        "@bolter/shared": "workspace:*"
     }
 }
