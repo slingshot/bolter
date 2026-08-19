@@ -404,6 +404,25 @@ async function encryptRecord(
 
 export interface DecryptionStreamOptions {
     /**
+     * Record counter this stream starts at.
+     *
+     * Non-zero when decrypting a *range* of a file rather than the whole of
+     * it, which is what lets a client fetch ranges in parallel and decrypt
+     * each one as it lands. Exactly mirrors the encryptor: a record's nonce is
+     * derived from its index, so a range that starts on a record boundary is
+     * self-sufficient given the right starting count.
+     */
+    initialCounter?: number;
+    /**
+     * Whether the absence of a final-flagged record is an error.
+     *
+     * False for a range that is not the end of the file, where there is no
+     * final record to find. The whole-file guarantee is then reasserted by the
+     * caller, which knows how many plaintext bytes it should have ended up
+     * with.
+     */
+    expectFinalRecord?: boolean;
+    /**
      * ECE format version taken from the file's authenticated metadata via
      * `readEceVersion(metadata)`. `>= ECE_MIN_VERSION_WITH_FINAL_RECORD` means
      * the ciphertext was written by a client that always emits a final-flagged
@@ -427,8 +446,9 @@ export function createDecryptionStream(
     options: DecryptionStreamOptions,
 ): TransformStream<Uint8Array, Uint8Array> {
     const eceVersion = options.eceVersion;
-    const requireFinalRecord = eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
-    let recordCount = 0;
+    const requireFinalRecord =
+        (options.expectFinalRecord ?? true) && eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
+    let recordCount = options.initialCounter ?? 0;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
     let sawFinal = false;

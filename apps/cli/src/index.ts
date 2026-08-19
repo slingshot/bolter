@@ -13,6 +13,7 @@ import { completionsPlugin } from '@bunli/plugin-completions';
 import pkg from '../package.json' with { type: 'json' };
 import config from './commands/config';
 import doctor from './commands/doctor';
+import get from './commands/get';
 import info from './commands/info';
 import up from './commands/up';
 
@@ -31,6 +32,7 @@ const cli = await createCLI({
 });
 
 cli.command(up);
+cli.command(get);
 cli.command(info);
 cli.command(doctor);
 cli.command(config);
