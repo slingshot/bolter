@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand, type Session } from '../core/session';
+import { openState } from '../state/db';
 import { ArchiveSource, FileSource, type Source } from '../transfer/source';
 import { uploadSource } from '../transfer/upload';
 import { formatBytes, formatDuration, formatExpiry } from '../ui/format';
@@ -231,6 +232,12 @@ export async function performUpload(
 
     const keychain = encrypt ? new Keychain() : null;
     const reporter = createProgressReporter(session.output, source.displayName);
+    const state = openState(session.env);
+    /** Set by onAllocated, which always runs before any part completes. */
+    let fileId = '';
+    // Secrets are stored so `ls` can reprint a working link and a resume needs
+    // no key re-supplied. Opt out with `storeSecrets: false`.
+    const storeSecrets = session.config.storeSecrets !== false;
 
     try {
         const outcome = await uploadSource({
@@ -242,6 +249,39 @@ export async function performUpload(
             maxConcurrency: (flags.concurrency as number | undefined) ?? defaults.concurrency,
             signal: session.signal,
             onProgress: (progress) => reporter.update(progress),
+            onAllocated: (allocation) => {
+                fileId = allocation.id;
+                // Written before a byte moves: this is the first moment a
+                // crash has something worth recovering.
+                state.recordPending({
+                    id: allocation.id,
+                    instance: session.instanceOrigin,
+                    url: '',
+                    secret: keychain && storeSecrets ? keychain.secretKeyB64 : null,
+                    ownerToken: allocation.ownerToken,
+                    name: source.displayName,
+                    size: allocation.uploadSize,
+                    encrypted: encrypt ? 1 : 0,
+                    archive: source.archiveFilename ? 1 : 0,
+                    createdAt: Date.now(),
+                    expiresAt: null,
+                    downloadLimit,
+                    uploadId: allocation.uploadId ?? null,
+                    uploadToken: allocation.uploadToken ?? null,
+                    partSize: allocation.partSize ?? null,
+                    totalParts: allocation.totalParts ?? null,
+                    sourcePaths: JSON.stringify(paths.map((p) => resolve(p))),
+                });
+            },
+            onPartComplete: (part) => {
+                state.recordPart({ fileId, ...part });
+            },
+        });
+
+        state.markComplete(outcome.id, {
+            url: outcome.url,
+            size: outcome.size,
+            expiresAt: outcome.expiresAt,
         });
 
         return {

@@ -33,6 +33,14 @@ export interface GlobalFlags {
 
 export interface Session {
     readonly output: Output;
+    /**
+     * The environment this invocation resolved against.
+     *
+     * Threaded rather than read from `process.env` at each use, so state and
+     * config directories can be redirected per invocation — which tests need
+     * and `SENDFM_STATE_DIR` users get for free.
+     */
+    readonly env: NodeJS.ProcessEnv;
     readonly config: SendfmConfig;
     readonly configSources: string[];
     readonly instanceOrigin: string;
@@ -94,6 +102,7 @@ export function createSession(options: RunOptions): Session {
 
     const session: Session = {
         output,
+        env,
         config: values,
         configSources: sources,
         instanceOrigin,

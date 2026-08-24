@@ -15,6 +15,8 @@ import config from './commands/config';
 import doctor from './commands/doctor';
 import get from './commands/get';
 import info from './commands/info';
+import { lsCommand, passwordCommand, rmCommand, setCommand } from './commands/manage';
+import resume from './commands/resume';
 import up from './commands/up';
 
 const cli = await createCLI({
@@ -35,6 +37,11 @@ cli.command(up);
 cli.command(get);
 cli.command(info);
 cli.command(doctor);
+cli.command(lsCommand);
+cli.command(resume);
+cli.command(rmCommand);
+cli.command(setCommand);
+cli.command(passwordCommand);
 cli.command(config);
 
 await cli.run();

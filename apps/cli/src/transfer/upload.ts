@@ -33,6 +33,7 @@ import {
     plaintextRangeForPart,
     planParts,
     retryDelayMs,
+    type UploadUrlResponse,
     validatePartSequence,
 } from '@bolter/protocol';
 import { UPLOAD_LIMITS } from '@bolter/shared';
@@ -72,6 +73,47 @@ export interface UploadOptions {
     maxConcurrency?: number;
     signal?: AbortSignal;
     onProgress?: (progress: UploadProgress) => void;
+    /**
+     * Called once the server has issued an upload, before a byte moves.
+     *
+     * This is the moment a crash first has something worth recovering: the id,
+     * the tokens and the part plan exist, and nothing else can reconstruct
+     * them.
+     */
+    onAllocated?: (allocation: AllocationInfo) => void;
+    /** Called after each part is durably stored, with its ETag. */
+    onPartComplete?: (part: { partNumber: number; etag: string; size: number }) => void;
+    /** Parts already uploaded by an earlier attempt, keyed by part number. */
+    resumeFrom?: Map<number, { etag: string; size: number }>;
+    /**
+     * An allocation from a previous run, for a resume.
+     *
+     * When present, `/upload/url` is not called again — doing so would mint a
+     * second file id and orphan everything already stored. Fresh pre-signed
+     * URLs for the outstanding parts come from `/upload/multipart/:id/resume`
+     * instead, which is exactly what that route is for.
+     */
+    existing?: AllocationInfo;
+}
+
+/**
+ * An allocation, from either `/upload/url` or a resume.
+ *
+ * `totalParts` is separate from `parts.length` because a resume's response
+ * lists only the parts the server is still missing, while the part *plan* has
+ * to span the whole object.
+ */
+type ResolvedAllocation = UploadUrlResponse & { totalParts?: number };
+
+export interface AllocationInfo {
+    id: string;
+    ownerToken: string;
+    uploadToken?: string;
+    uploadId?: string;
+    partSize?: number;
+    totalParts?: number;
+    /** Size of the bytes to be PUT — ciphertext size when encrypted. */
+    uploadSize: number;
 }
 
 export interface UploadOutcome {
@@ -358,12 +400,65 @@ export async function uploadSource(options: UploadOptions): Promise<UploadOutcom
     const plaintextSize = source.plaintextSize;
     const uploadSize = keychain ? calculateEncryptedSize(plaintextSize) : plaintextSize;
 
-    const allocation = await client.requestUploadUrl({
-        fileSize: uploadSize,
-        encrypted: Boolean(keychain),
-        timeLimit: options.timeLimit,
-        dlimit: options.downloadLimit,
-    });
+    const allocation = await allocate();
+
+    async function allocate(): Promise<ResolvedAllocation> {
+        const previous = options.existing;
+        if (!previous) {
+            const fresh = await client.requestUploadUrl({
+                fileSize: uploadSize,
+                encrypted: Boolean(keychain),
+                timeLimit: options.timeLimit,
+                dlimit: options.downloadLimit,
+            });
+            if (!fresh.useSignedUrl || !fresh.id || !fresh.owner) {
+                throw new SendfmError(
+                    'UPLOAD_FAILED',
+                    'The instance would not issue an upload URL',
+                    { details: { error: fresh.error }, retryable: true },
+                );
+            }
+            return fresh;
+        }
+
+        if (!previous.uploadId) {
+            // A single-part upload has no server-side state to resume; the
+            // whole object is one PUT, so it is simply redone.
+            const fresh = await client.requestUploadUrl({
+                fileSize: uploadSize,
+                encrypted: Boolean(keychain),
+                timeLimit: options.timeLimit,
+                dlimit: options.downloadLimit,
+            });
+            if (!fresh.useSignedUrl || !fresh.id || !fresh.owner) {
+                throw new SendfmError('UPLOAD_FAILED', 'Could not restart that upload', {
+                    retryable: true,
+                });
+            }
+            return fresh;
+        }
+
+        const done = [...(options.resumeFrom?.keys() ?? [])];
+        const refreshed = await client.resumeMultipart(
+            previous.id,
+            previous.uploadId,
+            done,
+            previous.uploadToken,
+        );
+        return {
+            useSignedUrl: true,
+            multipart: true,
+            id: previous.id,
+            owner: previous.ownerToken,
+            uploadToken: previous.uploadToken,
+            uploadId: previous.uploadId,
+            partSize: refreshed.partSize,
+            // The server returns URLs only for parts it has not got, so the
+            // count here is the *remaining* work, not the total.
+            parts: refreshed.parts,
+            totalParts: refreshed.numParts,
+        };
+    }
 
     if (!allocation.useSignedUrl || !allocation.id || !allocation.owner) {
         throw new SendfmError('UPLOAD_FAILED', 'The instance would not issue an upload URL', {
@@ -374,6 +469,15 @@ export async function uploadSource(options: UploadOptions): Promise<UploadOutcom
 
     const id = allocation.id;
     const ownerToken = allocation.owner;
+    options.onAllocated?.({
+        id,
+        ownerToken,
+        uploadToken: allocation.uploadToken,
+        uploadId: allocation.uploadId,
+        partSize: allocation.partSize,
+        totalParts: allocation.parts?.length,
+        uploadSize,
+    });
     let uploaded = 0;
     let retries = 0;
     const started = Date.now();
@@ -406,7 +510,10 @@ export async function uploadSource(options: UploadOptions): Promise<UploadOutcom
         const plan = planParts({
             totalSize: uploadSize,
             partSize: allocation.partSize,
-            numParts: allocation.parts.length,
+            // The whole object, not just what is outstanding: a resume's
+            // allocation lists only the parts the server is missing, and a plan
+            // built from that count would put every boundary in the wrong place.
+            numParts: (allocation as { totalParts?: number }).totalParts ?? allocation.parts.length,
             encrypted: Boolean(keychain),
         });
         // Record alignment shrinks the usable part size, and S3/R2 reject a
@@ -431,9 +538,21 @@ export async function uploadSource(options: UploadOptions): Promise<UploadOutcom
             max: cap,
         });
 
-        let done = 0;
+        // Parts an earlier attempt already stored. Their bytes are on the
+        // server; re-sending them would be correct but wasteful, and for a
+        // large upload that waste is the entire point of resuming.
+        const already = options.resumeFrom ?? new Map();
+        const remaining = {
+            ...plan,
+            parts: plan.parts.filter((part) => !already.has(part.partNumber)),
+        };
+        for (const part of already.values()) {
+            uploaded += part.size;
+        }
+
+        let done = already.size;
         const outcomes = await runPool({
-            plan,
+            plan: remaining,
             urls,
             controller,
             signal,
@@ -474,14 +593,23 @@ export async function uploadSource(options: UploadOptions): Promise<UploadOutcom
                 );
                 done++;
                 report(done, 0, controller.target());
-                return { partNumber: part.partNumber, etag, size: part.size };
+                const outcome = { partNumber: part.partNumber, etag, size: part.size };
+                options.onPartComplete?.(outcome);
+                return outcome;
             },
         });
 
         peakConcurrency = controller.peak();
         pushbacks = controller.pushbacks();
 
-        const sorted = outcomes.sort((a, b) => a.partNumber - b.partNumber);
+        const sorted = [
+            ...outcomes,
+            ...[...already.entries()].map(([partNumber, part]) => ({
+                partNumber,
+                etag: part.etag,
+                size: part.size,
+            })),
+        ].sort((a, b) => a.partNumber - b.partNumber);
         // Validate before completing: S3 assembles a silently corrupt object
         // from a gapped or mis-sized sequence, and R2 rejects an undersized
         // non-trailing part only after every byte has transferred.
