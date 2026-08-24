@@ -9,12 +9,21 @@ COPY apps/frontend/package.json ./apps/frontend/
 COPY apps/backend/package.json ./apps/backend/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/shared/config.ts ./packages/shared/
+# @bolter/protocol is a workspace both apps depend on, so a pruned checkout has
+# to keep it — bun refuses to install otherwise. Its source is copied whole
+# because its postinstall builds it.
+COPY packages/protocol/package.json ./packages/protocol/
+COPY packages/protocol/src ./packages/protocol/src
+COPY packages/protocol/tsconfig.json ./packages/protocol/
+COPY apps/cli/package.json ./apps/cli/
 
 # Install dependencies
 RUN bun install --frozen-lockfile
 
-# Build shared package (needed for Node.js/Vite import resolution)
+# Build the workspace packages: Vite resolves them through their `import`
+# condition, which points at dist rather than source.
 RUN cd packages/shared && bun run build
+RUN cd packages/protocol && bun run build
 
 # Copy frontend source
 COPY apps/frontend/ ./apps/frontend/

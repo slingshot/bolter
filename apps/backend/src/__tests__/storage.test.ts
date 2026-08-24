@@ -63,7 +63,20 @@ mock.module('../lib/sentry', () => ({
 // The real registry class, backed by the mocked redis/s3 modules above, so the
 // provider bookkeeping half of storage.del is exercised as real code rather
 // than re-implemented here.
-import { ProviderNotFoundError, ProviderRegistry } from '../storage/provider-registry';
+//
+// Loaded through a query-suffixed specifier (see __isolated_tests__/README.md):
+// `mock.module` is process-global and never reset, and five siblings —
+// deployment, health, reaper, routes/upload, routes/providers — stub
+// '../storage/provider-registry'. A plain import here therefore resolves to
+// whichever of those bun happened to load first, which is readdir order and
+// differs between macOS and Linux. That is exactly how this file passed
+// locally while failing in CI, where `deployment.test.ts` loads first and this
+// one tenth. The query form is a different registry key, so it always yields
+// the real module.
+const REAL_REGISTRY = '../storage/provider-registry.ts?unmocked' as string;
+const { ProviderNotFoundError, ProviderRegistry } = (await import(
+    REAL_REGISTRY
+)) as typeof import('../storage/provider-registry');
 
 const registry = new ProviderRegistry();
 

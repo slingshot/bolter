@@ -9,6 +9,13 @@ COPY apps/frontend/package.json ./apps/frontend/
 COPY apps/backend/package.json ./apps/backend/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/shared/config.ts ./packages/shared/
+# @bolter/protocol is a workspace both apps depend on, so a pruned checkout has
+# to keep it — bun refuses to install otherwise. Its source is copied whole
+# because its postinstall builds it.
+COPY packages/protocol/package.json ./packages/protocol/
+COPY packages/protocol/src ./packages/protocol/src
+COPY packages/protocol/tsconfig.json ./packages/protocol/
+COPY apps/cli/package.json ./apps/cli/
 
 # Install dependencies
 RUN bun install --frozen-lockfile --production
@@ -25,6 +32,7 @@ WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/apps/backend ./apps/backend
 COPY --from=builder /app/packages/shared ./packages/shared
+COPY --from=builder /app/packages/protocol ./packages/protocol
 COPY --from=builder /app/package.json ./
 
 # Set working directory to backend
