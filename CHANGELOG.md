@@ -41,9 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- CI never ran: `test.yml` triggered on `main` while the default branch is
-  `master`. Turning it on required fixing two `upload-state` tests that hung on
-  an unstubbed network call
+- Two `upload-state` tests depended on nothing listening on port 3001: they
+  reach the network through `cleanupExpiredUploads`, which aborts an abandoned
+  multipart before forgetting its uploadId. With a backend dev server running
+  they hung until the test timed out; CI never saw it because there the
+  connection is refused immediately
 - `@sentry/react` was bundled into the upload worker to reach `captureError`
   calls that were inert there (the worker has no Sentry client)
 - The backend's isolated test suite ran its whole directory in one process, so

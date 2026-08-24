@@ -39,8 +39,9 @@ describe('upload-state (IndexedDB)', () => {
     beforeEach(async () => {
         // cleanupExpiredUploads aborts the abandoned server-side multipart
         // before forgetting the only record of its uploadId, so it reaches the
-        // network. Unstubbed, that request hangs against a nonexistent dev
-        // server until the test times out — which is what these tests did.
+        // network. Unstubbed, the result depends on whether anything happens to
+        // be listening on the dev port: refused instantly on CI, but hanging
+        // until the test times out on a machine with the backend running.
         realFetch = globalThis.fetch;
         globalThis.fetch = (() =>
             Promise.resolve(
