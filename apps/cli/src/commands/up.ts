@@ -17,6 +17,7 @@ import { type CommandResult, runCommand, type Session } from '../core/session';
 import { openState } from '../state/db';
 import { ArchiveSource, FileSource, type Source } from '../transfer/source';
 import { uploadSource } from '../transfer/upload';
+import { shouldPromote } from '../ui/dashboard';
 import { formatBytes, formatDuration, formatExpiry } from '../ui/format';
 import type { Output } from '../ui/output';
 import { createProgressReporter } from '../ui/progress';
@@ -165,6 +166,10 @@ export default defineCommand({
         name: option(z.string().optional(), {
             description: 'Name for the archive when sending several files',
         }),
+        tui: option(z.coerce.boolean().optional(), {
+            description: 'Force the full-screen dashboard on or off (--no-tui to disable)',
+            argumentKind: 'flag',
+        }),
     },
     handler: async ({ flags, positional }) => {
         const code = await runCommand(
@@ -231,7 +236,23 @@ export async function performUpload(
     }
 
     const keychain = encrypt ? new Keychain() : null;
-    const reporter = createProgressReporter(session.output, source.displayName);
+    // Decided before the first byte: a renderer that redraws cannot be swapped
+    // in after something has already been printed.
+    const promote = shouldPromote({
+        stdoutIsTTY: Boolean(process.stdout.isTTY),
+        stderrIsTTY: Boolean(process.stderr.isTTY),
+        columns: process.stdout.columns ?? 0,
+        rows: process.stdout.rows ?? 0,
+        json: session.output.mode === 'json',
+        force: tuiPreference(session, flags),
+        env: session.env,
+        totalBytes: source.plaintextSize,
+        threshold: instance.limits.multipartThreshold,
+    });
+    const reporter = createProgressReporter(session.output, source.displayName, {
+        promote,
+        encrypted: encrypt,
+    });
     const state = openState(session.env);
     /** Set by onAllocated, which always runs before any part completes. */
     let fileId = '';
@@ -304,4 +325,19 @@ export async function performUpload(
         reporter.done();
         await source.close();
     }
+}
+
+/** `--tui` / `--no-tui`, then config, then "let the size decide". */
+function tuiPreference(session: Session, flags: Record<string, unknown>): boolean | undefined {
+    if (typeof flags.tui === 'boolean') {
+        return flags.tui;
+    }
+    const configured = session.config.ui?.tui;
+    if (configured === 'always') {
+        return true;
+    }
+    if (configured === 'never') {
+        return false;
+    }
+    return undefined;
 }

@@ -8,13 +8,22 @@
  */
 
 import type { UploadProgress } from '../transfer/upload';
+import { type DashboardHandle, type DashboardModel, mountDashboard } from './dashboard';
 import { formatBytes, formatDuration, formatRate, progressBar, truncateMiddle } from './format';
 import type { Output } from './output';
 
 export interface ProgressReporter {
     update(progress: UploadProgress): void;
-    /** Clear any transient line. Safe to call more than once. */
+    /** Clear any transient line or tear down the dashboard. Idempotent. */
     done(): void;
+}
+
+export interface ReporterOptions {
+    /** Take over the terminal with the full-screen dashboard. */
+    promote?: boolean;
+    encrypted?: boolean;
+    /** Lines to show in the dashboard's event panel. */
+    events?: Array<{ id: number; text: string }>;
 }
 
 /** Redraw no faster than this; a terminal cannot show more and it costs CPU. */
@@ -26,8 +35,12 @@ const PLAIN_INTERVAL_MS = 5_000;
 export function createProgressReporter(
     output: Output,
     label: string,
+    options: ReporterOptions = {},
     write: (text: string) => void = (text) => process.stderr.write(text),
 ): ProgressReporter {
+    if (options.promote && output.mode !== 'json') {
+        return createDashboardReporter(label, options);
+    }
     if (output.mode === 'json') {
         // stdout must stay a single JSON object, and stderr noise in a
         // machine-driven run is just noise.
@@ -99,5 +112,78 @@ export function createProgressReporter(
             dirty = true;
         },
         done: clear,
+    };
+}
+
+/**
+ * The full-screen renderer.
+ *
+ * Mounted lazily on the first update rather than up front, so a transfer that
+ * fails during allocation never takes the terminal over just to give it back.
+ * Throughput samples are collected once per second, which is the resolution a
+ * sparkline can actually show.
+ */
+function createDashboardReporter(label: string, options: ReporterOptions): ProgressReporter {
+    let handle: DashboardHandle | undefined;
+    let mountStarted = false;
+    let stopped = false;
+    const samples: number[] = [];
+    let lastSampleAt = 0;
+    let latest: DashboardModel | undefined;
+
+    const model = (progress: UploadProgress): DashboardModel => {
+        const now = Date.now();
+        if (now - lastSampleAt >= 1000) {
+            lastSampleAt = now;
+            samples.push(progress.rate);
+            if (samples.length > 120) {
+                samples.shift();
+            }
+        }
+        return {
+            ...progress,
+            label,
+            encrypted: options.encrypted ?? false,
+            samples,
+            events: options.events ?? [],
+        };
+    };
+
+    return {
+        update(progress) {
+            if (stopped) {
+                return;
+            }
+            latest = model(progress);
+            if (handle) {
+                handle.update(latest);
+                return;
+            }
+            if (mountStarted) {
+                return;
+            }
+            mountStarted = true;
+            void mountDashboard(latest)
+                .then((mounted) => {
+                    if (stopped) {
+                        mounted.stop();
+                        return;
+                    }
+                    handle = mounted;
+                    if (latest) {
+                        mounted.update(latest);
+                    }
+                })
+                .catch(() => {
+                    // A terminal that will not host an alt screen is not a
+                    // reason to fail a transfer; the run simply goes quiet.
+                    stopped = true;
+                });
+        },
+        done() {
+            stopped = true;
+            handle?.stop();
+            handle = undefined;
+        },
     };
 }
