@@ -6,11 +6,13 @@ export default defineConfig({
     version: pkg.version,
     description: pkg.description,
     commands: {
-        entry: './src/index.ts',
+        // The compiled executable takes its name from this file, and
+        // `bin` in package.json points at ./dist/sendfm.
+        entry: './src/sendfm.ts',
         directory: './src/commands',
     },
     build: {
-        entry: './src/index.ts',
+        entry: './src/sendfm.ts',
         outdir: './dist',
         /**
          * Targets are deliberately NOT listed here.

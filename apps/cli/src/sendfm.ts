@@ -15,9 +15,15 @@ import config from './commands/config';
 import doctor from './commands/doctor';
 import get from './commands/get';
 import info from './commands/info';
-import { lsCommand, passwordCommand, rmCommand, setCommand } from './commands/manage';
+import logs from './commands/logs';
+import ls from './commands/ls';
+import password from './commands/password';
+import report from './commands/report';
 import resume from './commands/resume';
+import rm from './commands/rm';
+import set from './commands/set';
 import up from './commands/up';
+import update from './commands/update';
 
 const cli = await createCLI({
     name: 'sendfm',
@@ -37,11 +43,14 @@ cli.command(up);
 cli.command(get);
 cli.command(info);
 cli.command(doctor);
-cli.command(lsCommand);
+cli.command(ls);
 cli.command(resume);
-cli.command(rmCommand);
-cli.command(setCommand);
-cli.command(passwordCommand);
+cli.command(rm);
+cli.command(set);
+cli.command(password);
 cli.command(config);
+cli.command(logs);
+cli.command(report);
+cli.command(update);
 
 await cli.run();

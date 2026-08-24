@@ -24,6 +24,7 @@
         "@bunli/core": "0.9.1",
         "@bunli/plugin-ai-detect": "0.6.4",
         "@bunli/plugin-completions": "0.3.5",
+        "@bunli/tui": "0.6.0",
         "@bunli/utils": "0.6.0",
         "react": "^19.2.0",
         "zod": "^4.3.6"
