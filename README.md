@@ -164,6 +164,12 @@ and everything human on stderr:
 sendfm up build.tar.zst --json | jq -r '.data.url'
 ```
 
+`data.url` is always the complete, ready-to-share link — for an encrypted send
+that includes the `#key` fragment, so the value can be passed on as-is. The key
+is also available on its own as `data.secret`. `sendfm ls` follows the same
+rule, and reports `url: null` for an encrypted send whose key was not kept,
+rather than a link that resolves to ciphertext nobody can open.
+
 ```jsonc
 { "sendfm": 1, "ok": true, "command": "up", "data": { … }, "warnings": [] }
 { "sendfm": 1, "ok": false, "command": "up",

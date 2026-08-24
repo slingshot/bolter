@@ -25,6 +25,12 @@ import { symbols } from '../ui/theme';
 
 export interface UpData {
     id: string;
+    /**
+     * The complete, ready-to-share link — including the `#key` fragment when
+     * the send is encrypted. A caller reading `--json` hands this straight to
+     * a person, so a link that needs assembling first is a link that gets
+     * shared broken.
+     */
     url: string;
     /** Present only for an encrypted send; this is the decryption key. */
     secret?: string;
@@ -117,7 +123,8 @@ async function buildSource(paths: string[]): Promise<Source> {
 
 function render(data: UpData, output: Output): void {
     const { theme } = output;
-    const share = buildShareUrl({ url: data.url, secret: data.secret, encrypted: data.encrypted });
+    // Already complete — `UpData.url` carries the fragment.
+    const share = data.url;
 
     output.blank();
     output.note(
@@ -307,7 +314,11 @@ export async function performUpload(
 
         return {
             id: outcome.id,
-            url: outcome.url,
+            url: buildShareUrl({
+                url: outcome.url,
+                secret: keychain?.secretKeyB64,
+                encrypted: encrypt,
+            }),
             ...(keychain ? { secret: keychain.secretKeyB64 } : {}),
             ownerToken: outcome.ownerToken,
             name: (flags.name as string | undefined) ?? source.displayName,

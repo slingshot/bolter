@@ -145,7 +145,12 @@ export async function performResume(session: Session, record: UploadRecord): Pro
         return {
             id: record.id,
             name: source.displayName,
-            url: outcome.url,
+            // Complete link, matching `up` — see UpData.url.
+            url: buildShareUrl({
+                url: outcome.url,
+                secret: record.secret ?? undefined,
+                encrypted: Boolean(record.secret),
+            }),
             ...(record.secret ? { secret: record.secret } : {}),
             partsAlreadyDone: done.size,
             partsTotal: outcome.parts,
@@ -185,9 +190,7 @@ function render(data: ResumeData, output: Output): void {
         );
     }
     output.blank();
-    output.result(
-        buildShareUrl({ url: data.url, secret: data.secret, encrypted: Boolean(data.secret) }),
-    );
+    output.result(data.url);
 }
 
 export default defineCommand({

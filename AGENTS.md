@@ -209,6 +209,12 @@ cannot, and why:
 - **Output contract**: stdout carries the result, stderr everything else.
   `--json` puts one versioned envelope on stdout. Exit codes and machine
   error codes both derive from one `SendfmError`, so they cannot drift.
+  `data.url` is always the *complete* share link, fragment included, in `up`,
+  `resume` and `ls` alike — an agent reads that field and hands it to a person,
+  so a value needing assembly is a value that gets shared broken. `ls` reports
+  `url: null` when an encrypted send's key was not kept; the state DB stores the
+  bare url and the key in separate columns, and the fragment is joined on the
+  way out.
 - **No telemetry.** Redacted NDJSON traces are written locally; `sendfm report`
   bundles one on request. Redaction happens at write time, and strips signed-URL
   query strings, keys, tokens and absolute paths (splitting on both separators,

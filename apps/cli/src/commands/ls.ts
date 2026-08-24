@@ -19,10 +19,16 @@ export interface ListEntry {
     name: string;
     size: number;
     instance: string;
-    url: string;
+    /**
+     * The complete, ready-to-share link, matching `up` and `resume` — the key
+     * fragment included when the send was encrypted.
+     *
+     * Null, rather than a bare link, when the send was encrypted and the key
+     * was not kept: there is no link left to reproduce, and printing one that
+     * resolves to unopenable ciphertext would be worse than saying so.
+     */
+    url: string | null;
     encrypted: boolean;
-    /** Null when the secret was not stored, so no working link can be shown. */
-    shareUrl: string | null;
     createdAt: number;
     expiresAt: number | null;
     expiresInSeconds: number | null;
@@ -36,8 +42,8 @@ export interface ListData {
     pruned: number;
 }
 
-function toEntry(record: UploadRecord, now: number): ListEntry {
-    const shareUrl =
+export function toEntry(record: UploadRecord, now: number): ListEntry {
+    const url =
         record.encrypted && !record.secret
             ? // The send was encrypted but the key was not kept, so there is no
               // link left to reproduce. Saying so beats printing a dead one.
@@ -52,9 +58,8 @@ function toEntry(record: UploadRecord, now: number): ListEntry {
         name: record.name,
         size: record.size,
         instance: record.instance,
-        url: record.url,
+        url,
         encrypted: Boolean(record.encrypted),
-        shareUrl,
         createdAt: record.createdAt,
         expiresAt: record.expiresAt,
         expiresInSeconds:
@@ -104,8 +109,8 @@ function renderList(data: ListData, output: Output): void {
 
     // The links are the machine-readable part, one per line.
     for (const entry of data.entries) {
-        if (entry.shareUrl) {
-            output.result(entry.shareUrl);
+        if (entry.url) {
+            output.result(entry.url);
         }
     }
 }

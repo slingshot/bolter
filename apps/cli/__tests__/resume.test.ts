@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DISCOVERY_VERSION, PROTOCOL_VERSION } from '@bolter/protocol';
+import { toEntry } from '../src/commands/ls';
 import { performResume } from '../src/commands/resume';
 import { performUpload } from '../src/commands/up';
 import { createSession } from '../src/core/session';
@@ -204,6 +205,68 @@ describe('history', () => {
         // The link still works — it was printed — but nothing about the key
         // was written to disk.
         expect(openState(env()).get(data.id)?.secret).toBeNull();
+    });
+});
+
+/**
+ * `data.url` is what an agent reading `--json` will hand to a person. For an
+ * encrypted send the key lives in the fragment, so a `url` without it is a link
+ * that resolves to ciphertext nobody can open — broken in a way that looks
+ * fine. The field therefore always carries the complete, ready-to-share link,
+ * and `secret` remains alongside it for callers that want the key by itself.
+ */
+describe('share link in the JSON envelope', () => {
+    it('carries the key in the url for an encrypted send', async () => {
+        const path = makeFile('a.bin', 1000);
+        const data = await performUpload(session(), [path], { encrypt: true });
+        expect(data.secret).toBeTruthy();
+        // The state DB keeps the bare url; the envelope adds the fragment. That
+        // split is deliberate — the key is stored in its own column.
+        const stored = openState(env()).get(data.id)?.url as string;
+        expect(stored).not.toContain('#');
+        expect(data.url).toBe(`${stored}#${data.secret}`);
+    });
+
+    it('leaves an unencrypted url without a fragment', async () => {
+        const path = makeFile('a.bin', 1000);
+        const data = await performUpload(session(), [path], {});
+        expect(data.url).not.toContain('#');
+        expect(data.secret).toBeUndefined();
+    });
+
+    it('is complete when `ls` reprints it from history', async () => {
+        const path = makeFile('a.bin', 1000);
+        const data = await performUpload(session(), [path], { encrypt: true });
+        const record = openState(env()).get(data.id) as NonNullable<
+            ReturnType<ReturnType<typeof openState>['get']>
+        >;
+        expect(toEntry(record, Date.now()).url).toBe(data.url);
+    });
+
+    it('reports no link at all when the key was never kept', async () => {
+        // A bare link to an encrypted file resolves to ciphertext nobody can
+        // open, so null is the honest answer.
+        writeFileSync(join(home, 'config.json'), JSON.stringify({ storeSecrets: false }));
+        const path = makeFile('a.bin', 1000);
+        const data = await performUpload(session(), [path], { encrypt: true });
+        const record = openState(env()).get(data.id) as NonNullable<
+            ReturnType<ReturnType<typeof openState>['get']>
+        >;
+        expect(toEntry(record, Date.now()).url).toBeNull();
+    });
+
+    it('is complete after a resume too', async () => {
+        // The resume path builds its own result, so it can drift from `up`.
+        // 6 MiB parts, because 5 MiB of ciphertext aligns down to a
+        // non-trailing part below what storage accepts.
+        partSize = 6 * 1024 * 1024;
+        const path = makeFile('big.bin', FILE_SIZE);
+        dieAfterPart = 1;
+        await performUpload(session(), [path], { encrypt: true }).catch(() => undefined);
+        dieAfterPart = 0;
+        const result = await performResume(session(), openState(env()).pending()[0]);
+        expect(result.secret).toBeTruthy();
+        expect(result.url.endsWith(`#${result.secret}`)).toBe(true);
     });
 });
 
