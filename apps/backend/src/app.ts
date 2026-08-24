@@ -7,7 +7,7 @@ import { UPLOAD_LIMITS } from '@bolter/shared';
 import { cors } from '@elysiajs/cors';
 import { openapi } from '@elysiajs/openapi';
 import { Elysia, t } from 'elysia';
-import { config } from './config';
+import { config, requestOrigin } from './config';
 // Health probes are unauthenticated, so they must be both memoised (no S3 API
 // amplification under a request flood) and bounded (a dead provider must not
 // stall readiness). See `lib/health.ts` for the full rationale — audit #29.
@@ -298,14 +298,17 @@ export const app = new Elysia({
         ({ request, set }) => {
             // This route's own origin is the API by definition. `baseUrl` is
             // where share links point, which may or may not be the same host.
-            const requestOrigin = new URL(request.url).origin;
+            // Derived through `requestOrigin` rather than `request.url`: behind
+            // a TLS-terminating edge this process only ever sees plaintext, and
+            // a cleartext `api` here becomes the client's base URL.
+            const origin = requestOrigin(request);
             set.headers['cache-control'] = 'public, max-age=300';
             const instance: InstanceDocument = {
                 bolter: DISCOVERY_VERSION,
                 name: config.customTitle,
                 description: config.customDescription,
                 web: config.baseUrl,
-                api: requestOrigin,
+                api: origin,
                 protocol: { version: PROTOCOL_VERSION, min: PROTOCOL_VERSION },
                 features: [
                     'multipart',

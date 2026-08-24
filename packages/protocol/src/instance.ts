@@ -166,6 +166,44 @@ export interface DiscoveredInstance {
 }
 
 /**
+ * Never let a discovery document move the client from TLS to cleartext.
+ *
+ * The same reasoning as `web` above, applied to the field that matters more:
+ * the scheme is not something the document knows better than the caller, which
+ * has just completed a request and therefore knows for certain. A document is
+ * routinely wrong about it — a backend behind a TLS-terminating proxy sees only
+ * the plaintext internal hop, so deriving `api` from its own request URL
+ * advertises `http://` to a client that arrived over `https://`.
+ *
+ * Downgrading is never merely slower. `api` becomes the base URL for every
+ * later call, so the edge answers each one with a 301, and the fetch spec
+ * rewrites a redirected `POST` into a bodyless `GET` — which is why this
+ * surfaces as an inexplicable 404 rather than anything mentioning TLS. On the
+ * routes that *are* GET-shaped it is worse than a 404: `Authorization: send-v1`
+ * headers and owner tokens would go out in the clear.
+ *
+ * Only upgrades, never downgrades: a client that spoke plain `http` is talking
+ * to local development or a plaintext self-host, and both are legitimate.
+ */
+function withoutSchemeDowngrade(api: string, base: string): string {
+    try {
+        const secure = new URL(base).protocol === 'https:';
+        const target = new URL(api);
+        if (!secure || target.protocol !== 'http:') {
+            return api;
+        }
+        target.protocol = 'https:';
+        // `URL` re-serialises with a trailing slash the origin never had.
+        return target.origin;
+    } catch {
+        // Not a URL at all. `looksLikeInstance` only checks that `api` is a
+        // string, and inventing a scheme for a malformed value would obscure
+        // the error the caller is about to get anyway.
+        return api;
+    }
+}
+
+/**
  * Resolve an origin — typically the one from a share link — to an instance.
  *
  * The `legacy-config` fallback matters: every instance deployed before this
@@ -225,7 +263,14 @@ export async function discoverInstance(
         if (looksLikeInstance(body)) {
             // A static document cannot know where it is served from; the
             // client, which just fetched it, can.
-            return { instance: { ...body, web: body.web || base }, source };
+            return {
+                instance: {
+                    ...body,
+                    web: body.web || base,
+                    api: withoutSchemeDowngrade(body.api, base),
+                },
+                source,
+            };
         }
     }
 

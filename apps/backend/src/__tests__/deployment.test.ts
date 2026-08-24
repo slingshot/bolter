@@ -59,6 +59,7 @@ const backendDockerfile = read('apps/backend/Dockerfile');
 const composeFile = read('docker-compose.yml');
 const nginxConf = read('apps/frontend/nginx.conf');
 const frontendDockerfile = read('apps/frontend/Dockerfile');
+const appSource = read('apps/backend/src/app.ts');
 
 /** Every `http://localhost:3001/...` URL referenced by a container healthcheck. */
 function healthcheckPaths(source: string): string[] {
@@ -189,6 +190,21 @@ describe('instance.json serving', () => {
         );
         expect(block).toContain('max-age=300');
         expect(block).not.toContain('immutable');
+    });
+
+    it('derives its api origin through requestOrigin, not request.url', () => {
+        // Every platform this deploys to terminates TLS at the edge, so the
+        // request reaching this process is plaintext and `request.url` reports
+        // `http://`. That value becomes the client's base URL, so advertising
+        // it sends every later call through the edge's 301 — and the fetch spec
+        // rewrites a redirected POST into a bodyless GET, which surfaces as a
+        // 404 on `/upload/url`, a route that works perfectly.
+        const route = appSource.slice(
+            appSource.indexOf("'/instance.json'"),
+            appSource.indexOf('cli: {'),
+        );
+        expect(route).toContain('requestOrigin(request)');
+        expect(route).not.toContain('new URL(request.url).origin');
     });
 
     it('has the API URL available at frontend build time', () => {

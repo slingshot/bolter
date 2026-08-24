@@ -10,8 +10,64 @@ import {
     deriveBaseUrl,
     parseIntArrayEnv,
     parseNumericEnv,
+    requestOrigin,
     resolveEnvName,
 } from '../config';
+
+/**
+ * Regression: behind a TLS-terminating proxy — Railway, Fly, Cloudflare, any
+ * ingress — the request that reaches this process arrives over plaintext, so
+ * `request.url` reports `http://` even though the client used `https://`.
+ * Anything that echoes that origin back to a client (notably `/instance.json`,
+ * whose `api` field becomes the client's base URL) will hand out a cleartext
+ * origin and send every subsequent request through a 301.
+ */
+describe('requestOrigin', () => {
+    it('trusts x-forwarded-proto over the plaintext internal hop', () => {
+        const request = new Request('http://api.example/instance.json', {
+            headers: { 'x-forwarded-proto': 'https' },
+        });
+        expect(requestOrigin(request)).toBe('https://api.example');
+    });
+
+    it('takes the leftmost entry when proxies are chained', () => {
+        // Each hop appends, so the leftmost value is the scheme the original
+        // client actually used.
+        const request = new Request('http://api.example/instance.json', {
+            headers: { 'x-forwarded-proto': 'https, http' },
+        });
+        expect(requestOrigin(request)).toBe('https://api.example');
+    });
+
+    it('falls back to the request scheme when no proxy header is present', () => {
+        // Direct connection, local development, `bun run dev`.
+        const request = new Request('http://localhost:3001/instance.json');
+        expect(requestOrigin(request)).toBe('http://localhost:3001');
+    });
+
+    it('keeps a non-default port', () => {
+        const request = new Request('http://api.example:8443/instance.json', {
+            headers: { 'x-forwarded-proto': 'https' },
+        });
+        expect(requestOrigin(request)).toBe('https://api.example:8443');
+    });
+
+    it('ignores a header value that is not a scheme it knows', () => {
+        // An unvalidated value lands in a URL the client will fetch, so only
+        // the two schemes this protocol runs on are accepted.
+        const request = new Request('http://api.example/instance.json', {
+            headers: { 'x-forwarded-proto': 'javascript' },
+        });
+        expect(requestOrigin(request)).toBe('http://api.example');
+    });
+
+    it('does not let the header downgrade a genuinely direct TLS request', () => {
+        const request = new Request('https://api.example/instance.json', {
+            headers: { 'x-forwarded-proto': 'http' },
+        });
+        expect(requestOrigin(request)).toBe('https://api.example');
+    });
+});
 
 describe('deriveBaseUrl', () => {
     const originalDetectBaseUrl = process.env.DETECT_BASE_URL;

@@ -133,3 +133,60 @@ describe('discoverInstance', () => {
         );
     });
 });
+
+/**
+ * Regression: a discovery document must never be able to move a client from
+ * TLS to cleartext.
+ *
+ * The bug that motivated this shipped as a 404, not as a security warning. A
+ * backend behind a TLS-terminating proxy derived `api` from its own
+ * `request.url` — plaintext on the internal hop — and advertised `http://`. The
+ * CLI took it at face value, its `POST /upload/url` was answered by the edge
+ * with a 301 to https, and the fetch spec turned that POST into a GET with no
+ * body. The route only exists for POST, so the user saw `HTTP 404` on an
+ * endpoint that was working perfectly.
+ *
+ * The scheme, unlike the host, is something the caller already knows for
+ * certain: it is the one it just completed a request over. So it wins.
+ */
+describe('discoverInstance scheme downgrade', () => {
+    it('refuses to be moved from https to http by the document', async () => {
+        const { impl } = routes({ '/instance.json': doc({ api: 'http://api.send.fm' }) });
+        const found = await discoverInstance('https://send.fm', { fetch: impl });
+        expect(found.instance.api).toBe('https://api.send.fm');
+    });
+
+    it('upgrades a same-host api, which is the proxy-terminated-TLS case', async () => {
+        const { impl } = routes({
+            '/instance.json': doc({ api: 'http://backend.up.railway.app' }),
+        });
+        const found = await discoverInstance('https://backend.up.railway.app', { fetch: impl });
+        expect(found.instance.api).toBe('https://backend.up.railway.app');
+    });
+
+    it('preserves the port and path while upgrading', async () => {
+        const { impl } = routes({ '/instance.json': doc({ api: 'http://api.test:8080' }) });
+        const found = await discoverInstance('https://web.test', { fetch: impl });
+        expect(found.instance.api).toBe('https://api.test:8080');
+    });
+
+    it('leaves http alone when the client itself spoke http', async () => {
+        // Local development and plaintext self-hosting are legitimate; the rule
+        // is "never downgrade", not "always https".
+        const { impl } = routes({ '/instance.json': doc({ api: 'http://localhost:3001' }) });
+        const found = await discoverInstance('http://localhost:3000', { fetch: impl });
+        expect(found.instance.api).toBe('http://localhost:3001');
+    });
+
+    it('leaves an already-https api untouched', async () => {
+        const { impl } = routes({ '/instance.json': doc({ api: 'https://api.send.fm' }) });
+        const found = await discoverInstance('https://send.fm', { fetch: impl });
+        expect(found.instance.api).toBe('https://api.send.fm');
+    });
+
+    it('does not choke on an api value that is not a URL', async () => {
+        const { impl } = routes({ '/instance.json': doc({ api: 'not a url' }) });
+        const found = await discoverInstance('https://send.fm', { fetch: impl });
+        expect(found.instance.api).toBe('not a url');
+    });
+});
