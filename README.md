@@ -27,6 +27,7 @@ Bolter is a self-hostable file sharing app with optional end-to-end encryption. 
 - **Streaming saves** — encrypted, zipped and legacy multi-file downloads write straight to disk (File System Access API, with a service-worker stream for Safari/Firefox) instead of being buffered in memory, and a download only counts against the share's limit once the save has actually landed
 - **No preflight tax** — part size is derived from the file size on the server (`clamp(fileSize / 1000, 64 MiB, 128 MiB)`), so an upload starts on its first real byte instead of spending up to 10s and 500 MB measuring the connection first. R2 requires every non-trailing part to be the same size, so the choice cannot adapt mid-upload anyway
 - **Multi-provider S3** — dynamic storage provider management via API; seamlessly migrate between S3-compatible services (Cloudflare R2, Railway, AWS S3, etc.) while existing files remain accessible on their original provider
+- **Command-line client** — `sendfm` sends and receives from any Bolter-compatible instance, with `--json` on every command for scripts and agents. Because it runs on a filesystem it needs no staged copy of anything: a part's bytes are a pure function of its part number, so retries and resumes re-read the source rather than a spool, directory uploads are resumable (the browser's are not), and downloads fetch many ranges in parallel instead of one sequential stream
 - **Self-hostable** — Docker Compose, or run directly with Bun
 - **Fully customizable** — white-label with your own branding, limits, and expiration options via environment variables
 
@@ -111,6 +112,108 @@ This starts:
 - **Redis** on port `6379` (persistent, AOF-enabled)
 
 > You still need to provide S3/R2 credentials in your `.env` file — Redis is included in the Compose stack but object storage is not.
+
+## Command line
+
+```bash
+# macOS and Linux
+curl -fsSL https://send.fm/install.sh | sh
+
+# Homebrew
+brew install slingshot/tap/sendfm
+
+# npm, pnpm, yarn, bun — installs a native binary, no Bun required
+npm install -g sendfm
+```
+
+```bash
+sendfm up report.pdf                     # send a file, print a link
+sendfm up photos/ --encrypt --expire 7d  # a directory, end-to-end encrypted
+sendfm get "https://send.fm/download/abc#key" -o ~/Downloads
+sendfm info "https://send.fm/download/abc#key"
+sendfm ls                                # what you have sent from here
+sendfm resume                            # finish an interrupted upload
+sendfm doctor --deep                     # check an instance end to end
+```
+
+Encryption is **off by default**, matching the web app — pass `--encrypt`/`-E`
+to turn it on. The key goes into the link's fragment and never reaches a
+server, exactly as in the browser.
+
+### Talking to other instances
+
+`sendfm` works against any Bolter deployment, not just send.fm:
+
+```bash
+sendfm -i https://files.example.org up notes.txt
+sendfm config set instances.work.url https://files.example.org
+sendfm -i work up notes.txt
+```
+
+A share link names the *web* origin, but the API is usually a separate
+deployment. The CLI resolves one to the other through `/instance.json` (see
+[Instance discovery](#instance-discovery)), falling back to `/config` for
+instances that predate it.
+
+### For scripts and agents
+
+Every command takes `--json`, which puts a single versioned object on stdout
+and everything human on stderr:
+
+```bash
+sendfm up build.tar.zst --json | jq -r '.data.url'
+```
+
+```jsonc
+{ "sendfm": 1, "ok": true, "command": "up", "data": { … }, "warnings": [] }
+{ "sendfm": 1, "ok": false, "command": "up",
+  "error": { "code": "FILE_TOO_LARGE", "message": "…", "retryable": false } }
+```
+
+Exit codes are stable: `0` ok · `2` usage · `3` network exhausted · `4` auth ·
+`5` gone (expired or out of downloads) · `6` instance incompatible · `7` local
+state · `1` other · `130` interrupted.
+
+Even without `--json`, stdout carries only the result — the share link, the
+saved path — so `sendfm up f | pbcopy` does the obvious thing.
+
+### Privacy
+
+The CLI sends no telemetry of any kind. Each run writes a redacted local trace
+instead; `sendfm logs` reads them and `sendfm report` bundles one to share, only
+when you ask. Signed URLs, keys, tokens and absolute paths are stripped as the
+trace is written.
+
+Local state (`sendfm ls`, resume, `sendfm rm`) lives in a `0600` SQLite database
+in your platform's data directory, and includes file decryption keys so links
+can be reprinted. Set `"storeSecrets": false` in the config to keep ids and
+owner tokens but not keys.
+
+## Instance discovery
+
+`GET /instance.json`, served both by the frontend (as a static file, reachable
+from a share link) and by the backend (authoritative for runtime limits), tells
+a non-browser client where the API lives and what it supports:
+
+```jsonc
+{
+  "bolter": 1,
+  "name": "Slingshot Send",
+  "api": "https://api.send.fm",
+  "protocol": { "version": 1, "min": 1 },
+  "features": ["multipart", "resume", "ece-v1", "owner-tokens", "password", "zip-at-upload"],
+  "limits": { "maxFileSize": 1000000000000, "minPartSize": 5242880, … },
+  "defaults": { "expireSeconds": 86400, "downloads": 1 },
+  "cli": { "package": "sendfm", "install": "https://send.fm/install.sh" }
+}
+```
+
+Self-hosters get this automatically. Two things matter if you serve the
+frontend yourself: pass `VITE_API_URL` at build time (the document is generated
+during `vite build`, and without it clients are told the API is on localhost),
+and do not let the document inherit a long cache — the bundled `nginx.conf`
+gives it `max-age=300` explicitly, because the hashed-asset rule would
+otherwise mark it `immutable` for a year.
 
 ## Architecture
 
@@ -352,6 +455,19 @@ bun run typecheck
 
 # Lint + format (Biome)
 bun run check
+
+# CLI: run from source, or compile a binary
+bun run --cwd apps/cli dev -- --help
+bun run --cwd apps/cli build:binary      # ./apps/cli/dist/sendfm
+bun run --cwd apps/cli build:all         # all five release targets
+
+# Cross-compiling needs every platform's native packages first: @bunli/core
+# pulls OpenTUI, whose native library ships per platform, and bun will not
+# extract packages whose os/cpu do not match the host.
+bun install --os '*' --cpu '*'
+
+# Integration testing against a real S3 (MinIO), rather than a mock
+docker compose --profile test up -d minio minio-init redis
 
 # Production build (Turborepo-cached)
 bun run build

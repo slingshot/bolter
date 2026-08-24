@@ -106,6 +106,28 @@ bolter/
 | `apps/backend/src/storage/redis.ts` | Redis metadata operations with TTL |
 | `packages/shared/config.ts` | Shared constants (sizes, limits, `PART_SIZING` bounds) |
 
+### Releasing the CLI
+
+`sendfm` owns the `v*.*.*` tag namespace. The web app is deploy-on-push and is
+never tagged, and the repository's 99 `v3.4.x` tags are dead history from the
+`timvisee/send` fork this was rewritten from. If the app ever needs release
+tags it takes an `app-v*` prefix.
+
+Pushing a `vX.Y.Z` tag builds all five targets, publishes archives and
+checksums to the GitHub Release, updates the Homebrew tap, and publishes to
+npm. Two repository settings are required first:
+
+- `vars.HOMEBREW_TAP` and `secrets.HOMEBREW_TAP_TOKEN` — omit both to skip the
+  tap update; the action rejects a partial configuration.
+- `secrets.NPM_TOKEN`.
+
+Cross-compiling locally needs `bun install --os '*' --cpu '*'` first:
+`@bunli/core` pulls OpenTUI, whose native library ships as a per-platform
+package, and bun refuses to extract packages whose `os`/`cpu` do not match the
+host. `bunli build` reads its targets from `bunli.config.ts`, which
+deliberately does not list any — otherwise every CI build would compile five
+~100 MB binaries.
+
 ## Development Workflow
 
 ### Running Individual Workspaces

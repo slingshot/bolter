@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`sendfm`, a command-line client** (`apps/cli`). Sends and receives against
+  any Bolter-compatible instance, with `--json` on every command. Because it
+  runs on a filesystem it needs no staged copy: a part's bytes are a pure
+  function of its part number, so retries and resumes re-read the source,
+  directory uploads are resumable (the browser's are not), and downloads fetch
+  many ranges in parallel rather than one sequential stream. Distributed as
+  standalone binaries via GitHub Releases and Homebrew, and on npm as a
+  launcher plus per-platform packages so no Bun is required
+- **`@bolter/protocol`** (`packages/protocol`), the wire protocol shared by the
+  web app and the CLI: ECE crypto, part planning, the typed API client, the
+  `send-v1` challenge-retry, metadata encoding, share URLs and instance
+  discovery. Golden vectors freeze the bytes so neither client can drift
+- **`GET /instance.json`**, served by both the backend and the frontend build,
+  so a client holding only a share link can find the API, learn the instance's
+  limits and negotiate protocol compatibility
+- `dl`, `dlimit` and `size` on `GET /metadata/:id`, so "how many downloads are
+  left" no longer requires minting and discarding a pre-signed URL
+- A MinIO service under a `test` compose profile, so multipart assembly, ETags,
+  Range requests and `EntityTooSmall`/`InvalidPart` can be exercised against
+  real S3 semantics rather than a mock
 - Adaptive uploader concurrency in the worker upload engine (AIMD): the pool grows while
   saturated and halves on HTTP 429/503, replacing the deleted speed test as the engine's
   adaptive element. Shrinking is cooperative at part boundaries, so no in-flight bytes are
@@ -18,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Commitizen interactive commit helper (`bun run commit`)
 - Open-source governance files (LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT)
 - GitHub issue and PR templates
+
+### Fixed
+
+- CI never ran: `test.yml` triggered on `main` while the default branch is
+  `master`. Turning it on required fixing two `upload-state` tests that hung on
+  an unstubbed network call
+- `@sentry/react` was bundled into the upload worker to reach `captureError`
+  calls that were inert there (the worker has no Sentry client)
+- The backend's isolated test suite ran its whole directory in one process, so
+  `mock.module` — which is process-global — leaked between files
+
 
 ### Changed
 

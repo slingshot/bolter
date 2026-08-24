@@ -4,6 +4,20 @@
 
 Slingshot Send is an open source, secure file sharing application that enables users to share files with true end-to-end encryption. Files are encrypted client-side before upload, and encryption keys are never sent to the server.
 
+## Command Line
+
+`sendfm` is the official CLI. Install with `curl -fsSL https://send.fm/install.sh | sh`,
+`brew install slingshot/tap/sendfm`, or `npm install -g sendfm`.
+
+- `sendfm up <paths...>` — send files or directories; `--encrypt` for end-to-end encryption
+- `sendfm get <link>` — download, decrypt and optionally unpack
+- `sendfm info <link>` — inspect a link without spending one of its downloads
+- `sendfm ls` / `resume` / `rm` / `set` — manage what you have sent
+- `--json` on every command for scripts and agents; stdout is a single object
+
+It works against any Bolter-compatible instance via `GET /instance.json`, which
+publishes the API origin, protocol version, supported features and limits.
+
 ## Key Features
 
 - **End-to-End Encryption**: Files are encrypted in your browser using AES-GCM before upload
