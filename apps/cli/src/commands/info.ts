@@ -63,10 +63,36 @@ export function parseTarget(
     return { origin: fallbackOrigin, id, secret };
 }
 
+/**
+ * Where to look for a target, and what it names.
+ *
+ * Parsing first is what lets a link name its own instance, and it touches no
+ * network, so nothing is spent finding out. Resolving the configured instance
+ * up front would instead commit to it before reading the link, and a link from
+ * anywhere else would be looked up on the wrong server — which answers an
+ * honest 404, reporting a healthy file as gone.
+ *
+ * Shared by `info` and `get` rather than repeated: two copies of a precedence
+ * rule are two chances for them to disagree about which server holds a file.
+ */
+export function resolveTarget(
+    session: Session,
+    target: string,
+): { origin: string; id: string; secret: string } {
+    const parsed = parseTarget(target, session.instanceOrigin);
+    // A flag typed on this invocation is the deliberate override and wins. A
+    // configured default is about where *this machine* sends things and says
+    // nothing about where someone else's link points, so the link outranks it.
+    return {
+        ...parsed,
+        origin: session.instanceExplicit ? session.instanceOrigin : parsed.origin,
+    };
+}
+
 export async function collectInfo(session: Session, target: string): Promise<InfoData> {
-    const instance = await session.instance();
-    const { id, secret } = parseTarget(target, instance.web ?? session.instanceOrigin);
-    const client = await session.client();
+    const { origin, id, secret } = resolveTarget(session, target);
+    const instance = await session.instanceFor(origin);
+    const client = await session.clientFor(origin);
     const keychain = secret ? new Keychain(secret) : null;
 
     const raw = await client.getRawMetadata(id, keychain).catch((error: unknown) => {
@@ -117,7 +143,7 @@ export async function collectInfo(session: Session, target: string): Promise<Inf
         files: metadata.files ?? [],
         downloads: { used: raw.dl ?? null, limit: raw.dlimit ?? null },
         expiresInSeconds: raw.ttl,
-        url: `${instance.web ?? session.instanceOrigin}/download/${id}`,
+        url: `${instance.web ?? origin}/download/${id}`,
     };
 }
 

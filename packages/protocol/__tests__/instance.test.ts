@@ -4,6 +4,7 @@ import {
     DISCOVERY_VERSION,
     discoverInstance,
     type InstanceDocument,
+    type InstanceNotFoundError,
     PROTOCOL_VERSION,
 } from '../src/instance';
 
@@ -188,5 +189,75 @@ describe('discoverInstance scheme downgrade', () => {
         const { impl } = routes({ '/instance.json': doc({ api: 'not a url' }) });
         const found = await discoverInstance('https://send.fm', { fetch: impl });
         expect(found.instance.api).toBe('not a url');
+    });
+});
+
+/**
+ * A probe that never reached the instance must not be reported as a verdict
+ * about the instance.
+ *
+ * Vercel and Netlify deployment protection, Cloudflare Access and corporate
+ * SSO all answer an unauthenticated request with a 302 to *their own* login
+ * page. `fetch` follows it, so the probe comes back 200 with HTML and looks
+ * exactly like a single-page app answering every path — which is what the
+ * "does not publish /instance.json yet" message is for. Said about a protected
+ * preview that publishes the document perfectly well, it sends the reader off
+ * to fix something that is not broken.
+ */
+describe('discoverInstance interception', () => {
+    /** A fetch that redirects everything to a third-party login page. */
+    function gated(loginOrigin: string) {
+        return (input: RequestInfo | URL) => {
+            const target = `${loginOrigin}/login?next=${encodeURIComponent(String(input))}`;
+            const response = new Response('<!doctype html><title>Log in</title>', {
+                status: 200,
+                headers: { 'content-type': 'text/html' },
+            });
+            // `redirected` and `url` are readonly on Response, and Bun follows
+            // the same rule, so a stub has to define them.
+            Object.defineProperty(response, 'redirected', { value: true });
+            Object.defineProperty(response, 'url', { value: target });
+            return Promise.resolve(response);
+        };
+    }
+
+    it('names the interception instead of blaming the instance', async () => {
+        const promise = discoverInstance('https://preview.example', {
+            fetch: gated('https://vercel.com'),
+        });
+        await expect(promise).rejects.toThrow(/vercel\.com/);
+        await expect(promise).rejects.toThrow(/redirected|sign-in|protect/i);
+    });
+
+    it('does not claim the instance fails to publish the document', async () => {
+        const promise = discoverInstance('https://preview.example', {
+            fetch: gated('https://vercel.com'),
+        });
+        await expect(promise).rejects.not.toThrow(/does not publish/);
+    });
+
+    it('still blames the instance when the redirect stays on it', async () => {
+        // A same-origin redirect is ordinary — http→https, a trailing slash.
+        // Nothing intercepted anything, so the SPA diagnosis is correct.
+        const spa = (input: RequestInfo | URL) => {
+            const response = new Response('<!doctype html>', { status: 200 });
+            Object.defineProperty(response, 'redirected', { value: true });
+            Object.defineProperty(response, 'url', { value: String(input) });
+            return Promise.resolve(response);
+        };
+        await expect(discoverInstance('https://send.fm', { fetch: spa })).rejects.toThrow(
+            /does not publish/,
+        );
+    });
+
+    it('exposes the interception origin for callers that want to act on it', async () => {
+        try {
+            await discoverInstance('https://preview.example', {
+                fetch: gated('https://vercel.com'),
+            });
+            throw new Error('should have thrown');
+        } catch (error) {
+            expect((error as InstanceNotFoundError).interceptedBy).toBe('https://vercel.com');
+        }
     });
 });

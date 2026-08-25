@@ -206,6 +206,28 @@ cannot, and why:
   again would mint a second file id and orphan every stored part. The part plan
   is built from the *total* part count, not the resume response's `parts` array,
   which lists only what is outstanding.
+- **Instance resolution has a precedence, and a link is part of it.** `-i`
+  takes the address a person actually knows — a frontend origin, a bare
+  hostname (upgraded to `https`, never `http`), an alias, or a whole pasted
+  share link, whose `/download/<id>` path is reduced to the origin.
+  `instanceRootOf` strips *only* that shape: discovery probes
+  `${base}/instance.json`, so an instance mounted at a subpath works, and
+  stripping every path to fix the share-link case would break it. For `get` and
+  `info`, the origin in the link outranks the configured default — the default
+  is where this machine *sends*, and says nothing about where someone else's
+  link points — while an explicit `-i` outranks both. `Session.clientFor(origin)`
+  memoises per origin because one invocation legitimately talks to two
+  instances; `session.instanceExplicit` is what distinguishes "the user typed
+  `-i` just now" from "an origin was resolved", which is always true.
+- **Discovery tells "no API here" from "we never got there".** Deployment
+  protection (Vercel, Netlify), Cloudflare Access and corporate SSO answer an
+  unauthenticated probe with a 302 to *their own* login page; `fetch` follows
+  it, so the probe returns 200 with HTML and is indistinguishable from an SPA
+  answering every path. `discoverInstance` therefore watches for a redirect that
+  lands on a *different* origin and reports `InstanceNotFoundError.interceptedBy`
+  — same-origin redirects (http→https, trailing slash, canonical host) are
+  ordinary and still followed. Without this a protected preview that publishes
+  `/instance.json` perfectly well was told it "does not publish /instance.json yet".
 - **Output contract**: stdout carries the result, stderr everything else.
   `--json` puts one versioned envelope on stdout. Exit codes and machine
   error codes both derive from one `SendfmError`, so they cannot drift.

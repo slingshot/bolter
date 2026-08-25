@@ -155,6 +155,28 @@ deployment. The CLI resolves one to the other through `/instance.json` (see
 [Instance discovery](#instance-discovery)), falling back to `/config` for
 instances that predate it.
 
+So `-i` wants the address you already know — the one in your browser, not the
+API behind it. A bare hostname is upgraded to `https`, and a whole share link
+pasted in is reduced to its origin:
+
+```bash
+sendfm -i files.example.org             up notes.txt
+sendfm -i https://files.example.org/download/abc123#key   up notes.txt
+```
+
+**A link decides its own instance.** `sendfm get` and `sendfm info` read the
+origin out of the link they are given and look there, so a link from anywhere
+works with no configuration at all:
+
+```bash
+sendfm get https://files.example.org/download/abc123#key
+```
+
+Your configured default is where *this machine* sends things; it says nothing
+about where someone else's link points, so the link outranks it. An explicit
+`-i` on the command line still wins over both — that is the escape hatch for an
+instance whose discovery cannot be reached.
+
 ### For scripts and agents
 
 Every command takes `--json`, which puts a single versioned object on stdout

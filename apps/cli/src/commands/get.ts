@@ -20,7 +20,7 @@ import { formatBytes } from '../ui/format';
 import type { Output } from '../ui/output';
 import { createProgressReporter } from '../ui/progress';
 import { symbols } from '../ui/theme';
-import { collectInfo } from './info';
+import { collectInfo, resolveTarget } from './info';
 
 export interface GetData {
     id: string;
@@ -134,8 +134,11 @@ export async function performDownload(
     // decrypts the metadata — and spends nothing, because reading metadata
     // never touches the counter.
     const info = await collectInfo(session, target);
-    const client = await session.client();
-    const secret = target.includes('#') ? target.slice(target.indexOf('#') + 1) : '';
+    // The same origin `info` just used, by the same rule — asking the session
+    // for its default here would download from a different server than the one
+    // whose metadata was read.
+    const { origin, secret } = resolveTarget(session, target);
+    const client = await session.clientFor(origin);
     const keychain = info.encrypted ? new Keychain(secret) : null;
 
     const destination = await resolveDestination(flags.out as string | undefined, info.name);

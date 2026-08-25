@@ -44,12 +44,23 @@ export interface Session {
     readonly config: SendfmConfig;
     readonly configSources: string[];
     readonly instanceOrigin: string;
+    /**
+     * True when `-i` was passed on this invocation.
+     *
+     * Distinct from "an origin was resolved", which is always true. A share
+     * link names the instance holding the file, and that outranks a configured
+     * default — but not a flag the person typed just now.
+     */
+    readonly instanceExplicit: boolean;
     readonly verbose: boolean;
     readonly warnings: EnvelopeWarning[];
     warn(code: string, message: string): void;
     /** Resolve the instance once per invocation, then reuse it. */
     instance(): Promise<InstanceDocument>;
     client(): Promise<BolterClient>;
+    /** The same, for an origin a link named rather than the configured one. */
+    instanceFor(origin: string): Promise<InstanceDocument>;
+    clientFor(origin: string): Promise<BolterClient>;
     signal: AbortSignal;
 }
 
@@ -97,8 +108,10 @@ export function createSession(options: RunOptions): Session {
     const instanceOrigin = resolveInstanceOrigin({ flag: flags.instance, config: values, env });
 
     const warnings: EnvelopeWarning[] = [];
-    let cached: InstanceDocument | undefined;
-    let client: BolterClient | undefined;
+    // Keyed by origin: one invocation can legitimately talk to two instances —
+    // `get` reading a link from elsewhere, `resume` finishing an older send.
+    const instances = new Map<string, InstanceDocument>();
+    const clients = new Map<string, BolterClient>();
 
     const session: Session = {
         output,
@@ -106,6 +119,7 @@ export function createSession(options: RunOptions): Session {
         config: values,
         configSources: sources,
         instanceOrigin,
+        instanceExplicit: Boolean(flags.instance),
         verbose: flags.verbose ?? false,
         warnings,
         signal: options.signal ?? new AbortController().signal,
@@ -115,26 +129,39 @@ export function createSession(options: RunOptions): Session {
             output.warn(message);
         },
 
-        async instance() {
-            if (cached) {
-                return cached;
+        instance() {
+            return session.instanceFor(instanceOrigin);
+        },
+
+        client() {
+            return session.clientFor(instanceOrigin);
+        },
+
+        async instanceFor(origin) {
+            const already = instances.get(origin);
+            if (already) {
+                return already;
             }
             let discovered: Awaited<ReturnType<typeof discoverInstance>>;
             try {
-                discovered = await discoverInstance(instanceOrigin);
+                discovered = await discoverInstance(origin);
             } catch (error) {
-                const servedNonJson = error instanceof InstanceNotFoundError && error.servedNonJson;
+                const found = error instanceof InstanceNotFoundError ? error : null;
+                const servedNonJson = found?.servedNonJson ?? false;
+                const intercepted = found?.interceptedBy ?? null;
                 throw new SendfmError(
                     'INSTANCE_UNREACHABLE',
-                    error instanceof InstanceNotFoundError
-                        ? error.message
-                        : `Could not reach a Bolter instance at ${instanceOrigin}`,
+                    found ? found.message : `Could not reach a Bolter instance at ${origin}`,
                     {
                         cause: error,
+                        // Interception is a door, not a dead end: the same
+                        // request may well succeed once it is opened.
                         retryable: !servedNonJson,
-                        hint: servedNonJson
-                            ? 'Try the API origin instead, e.g. `sendfm -i https://api.example doctor`.'
-                            : 'Check the URL and your network, then try `sendfm doctor`.',
+                        hint: intercepted
+                            ? 'Open the protection or sign in, then retry — or pass the API origin with `-i`.'
+                            : servedNonJson
+                              ? 'Try the API origin instead, e.g. `sendfm -i https://api.example doctor`.'
+                              : 'Check the URL and your network, then try `sendfm doctor`.',
                     },
                 );
             }
@@ -147,16 +174,19 @@ export function createSession(options: RunOptions): Session {
             for (const message of compatibility.warnings) {
                 session.warn('INSTANCE_COMPATIBILITY', message);
             }
-            cached = discovered.instance;
-            return cached;
+            instances.set(origin, discovered.instance);
+            return discovered.instance;
         },
 
-        async client() {
-            if (!client) {
-                const instance = await session.instance();
-                client = createBolterClient({ baseUrl: instance.api });
+        async clientFor(origin) {
+            const already = clients.get(origin);
+            if (already) {
+                return already;
             }
-            return client;
+            const instance = await session.instanceFor(origin);
+            const created = createBolterClient({ baseUrl: instance.api });
+            clients.set(origin, created);
+            return created;
         },
     };
 

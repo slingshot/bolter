@@ -131,19 +131,46 @@ function looksLikeInstance(value: unknown): value is InstanceDocument {
     );
 }
 
+function describeFailure(
+    origin: string,
+    servedNonJson: boolean,
+    interceptedBy: string | null,
+): string {
+    if (interceptedBy) {
+        return (
+            `${origin} redirected the request to ${interceptedBy}, which answered with a ` +
+            'sign-in page. Something in front of this instance — deployment protection, ' +
+            'SSO, a captive portal — is intercepting it, so its API was never reached. ' +
+            'Authenticate, disable the protection, or point at the API origin directly.'
+        );
+    }
+    if (servedNonJson) {
+        return (
+            `${origin} answered, but with a web page rather than a Bolter API. ` +
+            'Its API is probably on another origin, and this instance does not publish ' +
+            '/instance.json yet — point at the API directly.'
+        );
+    }
+    return `No Bolter instance at ${origin}: neither /instance.json nor /config answered.`;
+}
+
 export class InstanceNotFoundError extends Error {
     constructor(
         readonly origin: string,
         /** True when a probe answered 200 with something other than JSON. */
         readonly servedNonJson: boolean,
+        /**
+         * Origin a probe was redirected to, when it left the instance entirely.
+         *
+         * This separates "there is no API here" from "we never got to look".
+         * Deployment protection answers an unauthenticated probe with a 302 to
+         * its own login page; `fetch` follows it, so what comes back is a 200
+         * of HTML, indistinguishable from a single-page app answering every
+         * path unless the hop is noticed.
+         */
+        readonly interceptedBy: string | null = null,
     ) {
-        super(
-            servedNonJson
-                ? `${origin} answered, but with a web page rather than a Bolter API. ` +
-                      'Its API is probably on another origin, and this instance does not publish ' +
-                      '/instance.json yet — point at the API directly.'
-                : `No Bolter instance at ${origin}: neither /instance.json nor /config answered.`,
-        );
+        super(describeFailure(origin, servedNonJson, interceptedBy));
         this.name = 'InstanceNotFoundError';
     }
 }
@@ -230,12 +257,36 @@ export async function discoverInstance(
      * completely different fix.
      */
     let sawNonJson = false;
+    /** Origin a probe was redirected to, if it left `base` altogether. */
+    let interceptedBy: string | null = null;
+
+    const baseOrigin = (() => {
+        try {
+            return new URL(base).origin;
+        } catch {
+            return null;
+        }
+    })();
 
     const get = async (path: string): Promise<unknown | null> => {
         try {
             const response = await doFetch(`${base}${path}`, {
                 signal: AbortSignal.timeout(timeoutMs),
             });
+            // Redirects are followed, because same-origin ones are ordinary:
+            // http→https, a trailing slash, a canonical host. Only a hop that
+            // lands on a *different* origin means the request stopped being
+            // about this instance.
+            if (response.redirected && baseOrigin) {
+                try {
+                    const landed = new URL(response.url).origin;
+                    if (landed !== baseOrigin) {
+                        interceptedBy ??= landed;
+                    }
+                } catch {
+                    // Unparseable final URL tells us nothing; ignore it.
+                }
+            }
             if (!response.ok) {
                 return null;
             }
@@ -279,7 +330,7 @@ export async function discoverInstance(
         return { instance: fromLegacyConfig(base, config), source: 'legacy-config' };
     }
 
-    throw new InstanceNotFoundError(base, sawNonJson);
+    throw new InstanceNotFoundError(base, sawNonJson, interceptedBy);
 }
 
 interface LegacyConfig {

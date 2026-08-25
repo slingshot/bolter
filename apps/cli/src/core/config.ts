@@ -146,6 +146,36 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
  * like `-i sen.fm` fails as an unreachable host rather than being silently
  * treated as an alias that does not exist.
  */
+/**
+ * Reduce a URL a person actually typed to the root discovery probes hang off.
+ *
+ * People know the *frontend* URL because they are holding a share link, so
+ * pasting the whole link into `-i` is the obvious move. Probed as given it
+ * becomes `/download/<id>/instance.json`, which a single-page app answers with
+ * its own HTML and a 200 — a confusing failure for an entirely reasonable
+ * input.
+ *
+ * Only a share-link path is removed, not every path. Discovery probes
+ * `${base}/instance.json`, so an instance mounted at `https://example.com/bolter`
+ * works today; stripping unconditionally would break that deployment to fix
+ * this one.
+ */
+function instanceRootOf(url: string): string {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return url;
+    }
+    if (/^\/download\/[^/]+\/?$/.test(parsed.pathname)) {
+        return parsed.origin;
+    }
+    // A fragment or query is never part of an instance root, and a trailing
+    // slash would double up when a probe path is appended.
+    const path = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin}${path}`;
+}
+
 export function resolveInstanceOrigin(opts: {
     flag?: string;
     config: SendfmConfig;
@@ -161,7 +191,7 @@ export function resolveInstanceOrigin(opts: {
         return alias.url;
     }
     if (/^https?:\/\//i.test(requested)) {
-        return requested;
+        return instanceRootOf(requested);
     }
     // Bare hostnames are common enough to be worth accepting, but only over
     // https — silently downgrading someone's transfer to http is not a

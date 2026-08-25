@@ -114,6 +114,38 @@ describe('instance resolution', () => {
         );
     });
 
+    it('reduces a pasted share link to its origin', () => {
+        // People know the frontend URL because they are holding a link, so
+        // pasting the whole thing into -i is the obvious move. Left as-is it
+        // would probe /download/<id>/instance.json, which a single-page app
+        // answers with its own HTML and a 200.
+        expect(
+            resolveInstanceOrigin({ flag: 'https://send.fm/download/abc123', config: {}, env: {} }),
+        ).toBe('https://send.fm');
+        expect(
+            resolveInstanceOrigin({
+                flag: 'https://send.fm/download/abc123#kQ7secret',
+                config: {},
+                env: {},
+            }),
+        ).toBe('https://send.fm');
+    });
+
+    it('keeps a subpath, which is a real deployment shape', () => {
+        // Discovery probes `${base}/instance.json`, so an instance mounted at
+        // /bolter works today. Stripping every path to satisfy the share-link
+        // case would break it.
+        expect(
+            resolveInstanceOrigin({ flag: 'https://example.com/bolter', config: {}, env: {} }),
+        ).toBe('https://example.com/bolter');
+    });
+
+    it('drops a bare trailing slash', () => {
+        expect(resolveInstanceOrigin({ flag: 'https://send.fm/', config: {}, env: {} })).toBe(
+            'https://send.fm',
+        );
+    });
+
     it('rejects something that is neither an alias nor a host', () => {
         expect(() => resolveInstanceOrigin({ flag: 'not a host', config: {}, env: {} })).toThrow(
             /Unknown instance/,

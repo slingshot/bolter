@@ -18,6 +18,9 @@ const keychain = new Keychain(SECRET);
 
 let server: ReturnType<typeof Bun.serve>;
 let origin: string;
+/** A second, unrelated instance — the one a pasted link points at. */
+let other: ReturnType<typeof Bun.serve>;
+let otherOrigin: string;
 let configHome: string;
 let encryptedBlob: string;
 let plainBlob: string;
@@ -105,9 +108,57 @@ beforeAll(async () => {
         },
     });
     origin = `http://localhost:${server.port}`;
+
+    other = Bun.serve({
+        port: 0,
+        async fetch(request) {
+            const { pathname } = new URL(request.url);
+            if (pathname === '/instance.json') {
+                return Response.json({
+                    bolter: DISCOVERY_VERSION,
+                    name: 'Other Instance',
+                    web: otherOrigin,
+                    api: otherOrigin,
+                    protocol: { version: PROTOCOL_VERSION, min: PROTOCOL_VERSION },
+                    features: [],
+                    limits: {
+                        maxFileSize: 1,
+                        maxFilesPerArchive: 1,
+                        maxExpireSeconds: 1,
+                        maxDownloads: 1,
+                        multipartThreshold: 1,
+                        minPartSize: 1,
+                        maxParts: 1,
+                        maxMetadataBytes: 1,
+                    },
+                    defaults: { expireSeconds: 1, downloads: 1 },
+                });
+            }
+            if (pathname === '/metadata/elsewhere') {
+                const blob = await encodeMetadata(
+                    buildUploadMetadata({
+                        files: [{ name: 'from-other.txt', size: 5, type: 'text/plain' }],
+                        encrypted: false,
+                    }),
+                    null,
+                );
+                return Response.json({
+                    metadata: blob,
+                    ttl: 60,
+                    encrypted: false,
+                    dl: 0,
+                    dlimit: 1,
+                    size: 5,
+                });
+            }
+            return new Response('not found', { status: 404 });
+        },
+    });
+    otherOrigin = `http://localhost:${other.port}`;
 });
 
 afterAll(() => {
+    other.stop(true);
     server.stop(true);
     rmSync(configHome, { recursive: true, force: true });
 });
@@ -233,5 +284,46 @@ describe('collectInfo failures', () => {
             }),
         );
         expect(code).toBe(EXIT.GONE);
+    });
+});
+
+/**
+ * A share link names the instance holding the file. Nothing else does.
+ *
+ * The configured default is where *this machine* sends things; it says nothing
+ * about where someone else's link points. Resolving a link against the default
+ * queries the wrong server, which answers a perfectly honest 404 — and the file
+ * is reported gone when it is fine.
+ */
+describe('a link decides its own instance', () => {
+    /** No `-i`: the flag is absent, so only the link can say where to look. */
+    function unconfigured() {
+        return createSession({
+            name: 'info',
+            flags: {},
+            env: { SENDFM_CONFIG_DIR: configHome } as NodeJS.ProcessEnv,
+            write: () => undefined,
+        });
+    }
+
+    it('follows the origin in the link rather than the default', async () => {
+        // The default is send.fm, which this test must never touch — reaching
+        // the other stub is the proof it did not.
+        const info = await collectInfo(unconfigured(), `${otherOrigin}/download/elsewhere`);
+        expect(info.name).toBe('from-other.txt');
+        expect(info.instance).toBe('Other Instance');
+    });
+
+    it('lets an explicit -i override the link', async () => {
+        // The deliberate per-invocation escape hatch: point at an API directly
+        // when discovery cannot get there on its own.
+        const info = await collectInfo(session(), `${otherOrigin}/download/plain`);
+        expect(info.instance).toBe('Stub');
+    });
+
+    it('falls back to the configured instance for a bare id', async () => {
+        // A bare id carries no origin, so the configured one is all there is.
+        const info = await collectInfo(session(), 'plain');
+        expect(info.instance).toBe('Stub');
     });
 });
