@@ -17,7 +17,7 @@ vi.mock('@/lib/sentry', () => ({
 vi.mock('@/lib/plausible', () => ({
     trackDownload: vi.fn(),
 }));
-vi.mock('@/lib/crypto', () => ({
+vi.mock('@bolter/protocol/crypto', () => ({
     Keychain: class {
         secret: string;
         constructor(secret: string) {

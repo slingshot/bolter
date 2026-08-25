@@ -1,0 +1,57 @@
+{
+    "_comment": "Frozen on 2026-08-19 from the shipped implementation. These pin the bytes every Bolter client must produce; regenerating them to make a test pass would break every file already stored.",
+    "secretHex": "00112233445566778899aabbccddeeff",
+    "secretB64": "ABEiM0RVZneImaq7zN3u_w",
+    "authKeyB64": "T-NxRiVx6yLf13DukPL3kPUjG9QxYw48l5WbEYROiPH2l8xqiYlzol5qx-IMwh7nNIZv4eaM9QgKxKvLO0DXFA",
+    "authHeaderEmptyNonce": "send-v1 x7Mv4aNIB_ipcW5Fj4zqaU9PMVpTkcOcdn8t7bHpuaY",
+    "authHeaderNonceOfNines": "send-v1 -gyrd58csbG_W4jZbPmn3W19QgwM66Ub_ryTtLqOX8o",
+    "metadataInput": {
+        "files": [
+            {
+                "name": "report.pdf",
+                "size": 1234,
+                "type": "application/pdf"
+            }
+        ]
+    },
+    "metadataEncrypted": "v6_H8bvj41y4OSZsvLcjBrJO0eUdGsaRznCvXTLGeUgsFPH51VvHC4hUy466XoBFKF4R_O8ybWVTCexipW44YVO5UducWKEmAwFjAUx5yt3-kIF9rN5mjx8FSboxfY0SseIOOx8",
+    "metadataPlain": "eyJmaWxlcyI6W3sibmFtZSI6InJlcG9ydC5wZGYiLCJzaXplIjoxMjM0LCJ0eXBlIjoiYXBwbGljYXRpb24vcGRmIn1dfQ==",
+    "ciphertext": {
+        "empty": {
+            "plaintextBytes": 0,
+            "length": 17,
+            "calculatedSize": 17,
+            "sha256": "96ed3f15b21eb0d5bee263a3b1dc28e2e1d1e34dd4a8c809f0de2737c3107420"
+        },
+        "tiny": {
+            "plaintextBytes": 5,
+            "length": 22,
+            "calculatedSize": 22,
+            "sha256": "960b5bdc72297465587bdc9ed3605afd9796f8ac4cfae04215f69689da75463b"
+        },
+        "oneRecord": {
+            "plaintextBytes": 65536,
+            "length": 65570,
+            "calculatedSize": 65570,
+            "sha256": "058d9c9b00177aff7351f1d3bb8cb51a6348d1cda1d843848cb456af47df85a6"
+        },
+        "oneRecordPlusOne": {
+            "plaintextBytes": 65537,
+            "length": 65571,
+            "calculatedSize": 65571,
+            "sha256": "8b08b56770f34673a9d0620dd4785c2a93f1767204510cfbd362d12a31b70ce8"
+        },
+        "twoRecords": {
+            "plaintextBytes": 131072,
+            "length": 131123,
+            "calculatedSize": 131123,
+            "sha256": "04f722e28ebdaa7f8e7b6debe9a74def22f17a2f7a08e6521546add51f4f0f8d"
+        }
+    },
+    "effectivePartSize": {
+        "67108864": 67060719,
+        "104857600": 104819247,
+        "134217728": 134186991,
+        "136314880": 136284687
+    }
+}

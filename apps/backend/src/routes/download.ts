@@ -573,6 +573,15 @@ export const downloadRoutes = new Elysia()
                 metadata: metadata.metadata || '',
                 ttl,
                 encrypted: metadata.encrypted,
+                // Downloads used/allowed and the stored object size. These are
+                // already public on /download/url for unencrypted files and
+                // already auth-gated here for encrypted ones, so no new
+                // exposure — but without them a client that wants "how many
+                // downloads are left" has to call /download/url and discard a
+                // freshly minted pre-signed URL to find out.
+                dl: metadata.dl,
+                dlimit: metadata.dlimit,
+                size: metadata.fileSize,
             };
 
             logger.info(
@@ -599,6 +608,9 @@ export const downloadRoutes = new Elysia()
                     metadata: t.String(),
                     ttl: t.Number(),
                     encrypted: t.Boolean(),
+                    dl: t.Number(),
+                    dlimit: t.Number(),
+                    size: t.Number(),
                 }),
                 401: t.Object({ error: t.String() }),
                 404: t.Object({ error: t.String() }),

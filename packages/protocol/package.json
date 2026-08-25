@@ -1,0 +1,72 @@
+{
+    "name": "@bolter/protocol",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "main": "src/index.ts",
+    "exports": {
+        ".": {
+            "bun": "./src/index.ts",
+            "import": "./dist/index.js",
+            "default": "./src/index.ts"
+        },
+        "./concurrency": {
+            "bun": "./src/concurrency.ts",
+            "import": "./dist/concurrency.js",
+            "default": "./src/concurrency.ts"
+        },
+        "./retry": {
+            "bun": "./src/retry.ts",
+            "import": "./dist/retry.js",
+            "default": "./src/retry.ts"
+        },
+        "./crypto": {
+            "bun": "./src/crypto.ts",
+            "import": "./dist/crypto.js",
+            "default": "./src/crypto.ts"
+        },
+        "./telemetry": {
+            "bun": "./src/telemetry.ts",
+            "import": "./dist/telemetry.js",
+            "default": "./src/telemetry.ts"
+        },
+        "./parts": {
+            "bun": "./src/parts.ts",
+            "import": "./dist/parts.js",
+            "default": "./src/parts.ts"
+        },
+        "./client": {
+            "bun": "./src/client.ts",
+            "import": "./dist/client.js",
+            "default": "./src/client.ts"
+        },
+        "./metadata": {
+            "bun": "./src/metadata.ts",
+            "import": "./dist/metadata.js",
+            "default": "./src/metadata.ts"
+        },
+        "./share": {
+            "bun": "./src/share.ts",
+            "import": "./dist/share.js",
+            "default": "./src/share.ts"
+        },
+        "./instance": {
+            "bun": "./src/instance.ts",
+            "import": "./dist/instance.js",
+            "default": "./src/instance.ts"
+        }
+    },
+    "scripts": {
+        "postinstall": "bun run build",
+        "build": "bun build src/index.ts src/concurrency.ts src/retry.ts src/crypto.ts src/telemetry.ts src/parts.ts src/client.ts src/metadata.ts src/share.ts src/instance.ts --root src --outdir dist --format esm --splitting --external @bolter/shared",
+        "typecheck": "tsc --noEmit",
+        "test": "bun test"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.9.3"
+    },
+    "dependencies": {
+        "@bolter/shared": "workspace:*"
+    }
+}

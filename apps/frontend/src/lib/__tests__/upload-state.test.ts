@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { PersistedUpload } from '@/lib/upload-state';
 
 // Helper to create a valid PersistedUpload object with overrides.
@@ -34,7 +34,20 @@ async function getModule() {
 }
 
 describe('upload-state (IndexedDB)', () => {
+    let realFetch: typeof globalThis.fetch;
+
     beforeEach(async () => {
+        // cleanupExpiredUploads aborts the abandoned server-side multipart
+        // before forgetting the only record of its uploadId, so it reaches the
+        // network. Unstubbed, the result depends on whether anything happens to
+        // be listening on the dev port: refused instantly on CI, but hanging
+        // until the test times out on a machine with the backend running.
+        realFetch = globalThis.fetch;
+        globalThis.fetch = (() =>
+            Promise.resolve(
+                new Response(JSON.stringify({ success: true }), { status: 200 }),
+            )) as unknown as typeof globalThis.fetch;
+
         // Delete the database to ensure a clean state between tests
         await new Promise<void>((resolve, reject) => {
             const req = indexedDB.deleteDatabase('bolter-uploads');
@@ -42,6 +55,10 @@ describe('upload-state (IndexedDB)', () => {
             req.onerror = () => reject(req.error);
             req.onblocked = () => resolve(); // proceed even if blocked
         });
+    });
+
+    afterEach(() => {
+        globalThis.fetch = realFetch;
     });
 
     describe('saveUploadState + getResumableUpload', () => {

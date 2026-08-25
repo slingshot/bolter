@@ -1,0 +1,18 @@
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "types": ["bun"],
+        // Deliberately the lowest common denominator across consumers:
+        // apps/frontend targets ES2020, so an ES2022 API used here would
+        // only fail when that app compiles the package source.
+        "lib": ["ES2020", "DOM"],
+        "strict": true,
+        "skipLibCheck": true,
+        "noEmit": true,
+        "isolatedModules": true,
+        "verbatimModuleSyntax": true
+    },
+    "include": ["src", "__tests__"]
+}

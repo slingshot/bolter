@@ -24,7 +24,7 @@ vi.mock('@/lib/plausible', () => ({
 }));
 
 const { uploadFiles, resumeUpload, Canceller } = await import('@/lib/api');
-const { Keychain } = await import('@/lib/crypto');
+const { Keychain } = await import('@bolter/protocol/crypto');
 
 const MB = 1024 * 1024;
 

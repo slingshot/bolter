@@ -1,0 +1,113 @@
+name: Release CLI
+
+# The CLI owns the `v*.*.*` tag namespace. The web app is deploy-on-push and is
+# never tagged, and the repository's 99 `v3.4.x` tags are dead history from the
+# timvisee/send fork this was rewritten from. If the app ever wants release
+# tags it takes an `app-v*` prefix.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to (re)build
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  # A workflow_dispatch input reaches `ref:` on checkout, so it is validated
+  # before anything consumes it rather than interpolated directly. The pattern
+  # is the same one bunli-releaser enforces, so this also fails fast on a tag
+  # shape the release step would reject later.
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.check.outputs.ref }}
+    steps:
+      - id: check
+        env:
+          REQUESTED: ${{ github.event.inputs.tag }}
+          PUSHED: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${REQUESTED:-$PUSHED}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Refusing tag '$TAG': releases must be vX.Y.Z." >&2
+            exit 1
+          fi
+          printf 'ref=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Binaries, checksums and Homebrew
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      # Required, and bunli-releaser does not do it: it runs
+      # `bun install --frozen-lockfile`, which installs only the current
+      # platform's packages. @bunli/core pulls OpenTUI, whose native library
+      # ships as a per-platform package, and bun refuses to extract packages
+      # whose os/cpu do not match the host — so cross-compiling to darwin or
+      # windows fails to resolve them. Verified that a later
+      # `--frozen-lockfile` does not prune what this installs.
+      - name: Install every platform's runtime
+        run: bun install --os '*' --cpu '*'
+
+      - uses: AryaLabsHQ/bunli-releaser@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          workdir: apps/cli
+          targets: all
+          artifact-name: sendfm
+          # Reruns of a tag should not fail on assets that already exist.
+          existing-assets: skip
+          # Both or neither; the action rejects a partial Homebrew config.
+          brew-tap: ${{ vars.HOMEBREW_TAP || '' }}
+          brew-token: ${{ secrets.HOMEBREW_TAP_TOKEN || '' }}
+
+  npm:
+    name: npm
+    needs: [resolve, binaries]
+    # After the release exists, so a failed binary build does not leave npm
+    # advertising a version with nothing behind it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install every platform's runtime
+        run: bun install --os '*' --cpu '*'
+
+      - name: Build all targets
+        run: cd apps/cli && bun run build:all
+
+      # One package per platform plus a tiny launcher that depends on all of
+      # them optionally. npm installs only the matching one, so `npm i -g
+      # sendfm` gets a native binary without needing Bun — and without a
+      # postinstall script that downloads things, which breaks offline installs
+      # and is a supply-chain liability.
+      - name: Publish
+        run: cd apps/cli && bun run scripts/publish-npm.ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,5 +1,5 @@
+import { createConcurrencyController } from '@bolter/protocol/concurrency';
 import { describe, expect, it, vi } from 'vitest';
-import { createConcurrencyController } from '../concurrency';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type {
     CompletionEnvelope,

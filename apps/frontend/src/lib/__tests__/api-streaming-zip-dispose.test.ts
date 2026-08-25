@@ -1,6 +1,6 @@
+import { Keychain } from '@bolter/protocol/crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Canceller, uploadFiles } from '@/lib/api';
-import { Keychain } from '@/lib/crypto';
 
 /**
  * Audit finding 34 — cancelling a streaming-zip upload must cancel every

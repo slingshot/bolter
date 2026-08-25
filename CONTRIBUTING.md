@@ -106,6 +106,28 @@ bolter/
 | `apps/backend/src/storage/redis.ts` | Redis metadata operations with TTL |
 | `packages/shared/config.ts` | Shared constants (sizes, limits, `PART_SIZING` bounds) |
 
+### Releasing the CLI
+
+`sendfm` owns the `v*.*.*` tag namespace. The web app is deploy-on-push and is
+never tagged, and the repository's 99 `v3.4.x` tags are dead history from the
+`timvisee/send` fork this was rewritten from. If the app ever needs release
+tags it takes an `app-v*` prefix.
+
+Pushing a `vX.Y.Z` tag builds all five targets, publishes archives and
+checksums to the GitHub Release, updates the Homebrew tap, and publishes to
+npm. Two repository settings are required first:
+
+- `vars.HOMEBREW_TAP` and `secrets.HOMEBREW_TAP_TOKEN` — omit both to skip the
+  tap update; the action rejects a partial configuration.
+- `secrets.NPM_TOKEN`.
+
+Cross-compiling locally needs `bun install --os '*' --cpu '*'` first:
+`@bunli/core` pulls OpenTUI, whose native library ships as a per-platform
+package, and bun refuses to extract packages whose `os`/`cpu` do not match the
+host. `bunli build` reads its targets from `bunli.config.ts`, which
+deliberately does not list any — otherwise every CI build would compile five
+~100 MB binaries.
+
 ## Development Workflow
 
 ### Running Individual Workspaces
@@ -188,10 +210,16 @@ Use workspace names when the change is scoped to one workspace:
 ```
 feat(frontend): add drag-and-drop upload zone
 fix(backend): handle expired pre-signed URLs gracefully
+feat(cli): add resumable directory uploads
+refactor(protocol): move record-alignment math out of the frontend
 refactor(shared): normalize byte constants
 docs: update README with deployment instructions
 chore(deps): bump elysia to v1.2
 ```
+
+The allowed scopes are enforced by `commitlint.config.ts`: `frontend`,
+`backend`, `cli`, `protocol`, `shared`, `deps`, `ci`, `docker`, `release`.
+Adding a workspace means adding its scope there too.
 
 ### Interactive Helper
 

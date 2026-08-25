@@ -34,8 +34,8 @@ vi.mock('@/lib/api', () => {
     };
 });
 
-vi.mock('@/lib/crypto', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('@/lib/crypto')>()),
+vi.mock('@bolter/protocol/crypto', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@bolter/protocol/crypto')>()),
     Keychain: class {
         secretKeyB64 = 'secret-key-b64';
     },

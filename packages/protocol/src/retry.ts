@@ -1,8 +1,9 @@
 /**
- * Worker-safe upload helpers shared between the legacy main-thread pipeline
- * (`api.ts`) and the upload engine worker. Nothing in this module may touch
- * DOM globals or main-thread-only connectivity state — it must be importable
- * from a dedicated Web Worker.
+ * Retry classification and backoff, shared by every Bolter client.
+ *
+ * Nothing here may touch host-specific globals: the same code runs on the
+ * main thread, inside a dedicated Web Worker, and in a compiled Bun binary.
+ * `__tests__/no-host-globals.test.ts` enforces that across the package.
  */
 
 // Retry backoff configuration

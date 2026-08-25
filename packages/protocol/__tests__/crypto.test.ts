@@ -1,9 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-vi.mock('@/lib/sentry', () => ({
-    captureError: vi.fn(),
-    addBreadcrumb: vi.fn(),
-}));
+import { beforeEach, describe, expect, it, mock } from 'bun:test';
 
 import {
     arrayToB64,
@@ -18,8 +13,19 @@ import {
     generateSecretKey,
     Keychain,
     readEceVersion,
-} from '@/lib/crypto';
-import { captureError } from '@/lib/sentry';
+} from '../src/crypto';
+import { setTelemetrySink } from '../src/telemetry';
+
+/**
+ * The telemetry seam replaces what used to be a module mock of the app's
+ * Sentry wrapper. Installing a recorder is both narrower (it cannot leak
+ * into other suites the way a global module mock does) and closer to what
+ * a real host does.
+ */
+const captureError = mock((_error: unknown, _context?: unknown) => {
+    // Intentional: the test asserts on the recorded calls, not on behaviour.
+});
+setTelemetrySink(captureError);
 
 // Helper: pipe a Uint8Array through a TransformStream and collect output
 async function pipeThrough(
@@ -444,7 +450,7 @@ describe('Encryption/Decryption streams', () => {
 
 describe('Decryption stream integrity', () => {
     beforeEach(() => {
-        vi.mocked(captureError).mockClear();
+        captureError.mockClear();
     });
 
     const roundtripSizes = [
@@ -470,7 +476,7 @@ describe('Decryption stream integrity', () => {
                 createDecryptionStream(kc, { eceVersion: ECE_VERSION }),
             );
             expect(decrypted).toEqual(plaintext);
-            expect(vi.mocked(captureError)).not.toHaveBeenCalled();
+            expect(captureError).not.toHaveBeenCalled();
         });
     }
 
@@ -491,7 +497,7 @@ describe('Decryption stream integrity', () => {
         await expect(
             pipeThrough(truncated, createDecryptionStream(kc, { eceVersion: ECE_VERSION })),
         ).rejects.toThrow();
-        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+        expect(captureError).toHaveBeenCalledWith(
             expect.anything(),
             expect.objectContaining({ operation: 'crypto.decryptRecord' }),
         );
@@ -525,7 +531,7 @@ describe('Decryption stream integrity', () => {
         expect(decrypted).toEqual(plaintext);
 
         // Missing final record is reported as warning telemetry, not a failure
-        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+        expect(captureError).toHaveBeenCalledWith(
             expect.anything(),
             expect.objectContaining({
                 operation: 'crypto.missingFinalRecord',
@@ -550,11 +556,11 @@ describe('Decryption stream integrity', () => {
         ).rejects.toThrow(/final record is missing/i);
 
         // Reported as an error, not a warning
-        expect(vi.mocked(captureError)).toHaveBeenCalledWith(
+        expect(captureError).toHaveBeenCalledWith(
             expect.anything(),
             expect.objectContaining({ operation: 'crypto.missingFinalRecord' }),
         );
-        expect(vi.mocked(captureError)).not.toHaveBeenCalledWith(
+        expect(captureError).not.toHaveBeenCalledWith(
             expect.anything(),
             expect.objectContaining({ level: 'warning' }),
         );
@@ -625,7 +631,7 @@ describe('Decryption stream integrity', () => {
                 createDecryptionStream(kc, { eceVersion: 0 }),
             );
             expect(decrypted).toEqual(plaintext);
-            expect(vi.mocked(captureError)).not.toHaveBeenCalled();
+            expect(captureError).not.toHaveBeenCalled();
         });
     }
 

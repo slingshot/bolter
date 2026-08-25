@@ -6,6 +6,9 @@ services:
       args:
         - VITE_APP_TITLE=${VITE_APP_TITLE:-Slingshot Send}
         - VITE_APP_DESCRIPTION=${VITE_APP_DESCRIPTION:-Encrypt and send files with a link that automatically expires.}
+        # Baked into the bundle and into instance.json. The compose frontend
+        # proxies /api/ to the backend, so same-origin is the right default.
+        - VITE_API_URL=${VITE_API_URL:-/api}
     ports:
       - "3000:80"
     depends_on:
@@ -68,6 +71,49 @@ services:
     networks:
       - bolter-network
     restart: unless-stopped
+
+  # Integration-test S3. Not started by default — `docker compose up` runs the
+  # app against whatever real bucket .env points at. Bring it up with:
+  #   docker compose --profile test up -d minio minio-init redis
+  #
+  # It exists because nothing in this repo exercised a real S3 before: the
+  # Playwright suite mocks the API at the page level, so multipart assembly,
+  # ETag round-trips, Range requests and R2's EntityTooSmall/InvalidPart
+  # rejections were only ever tested in production.
+  minio:
+    image: minio/minio:latest
+    profiles: ["test"]
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${TEST_S3_ACCESS_KEY:-bolter-test}
+      - MINIO_ROOT_PASSWORD=${TEST_S3_SECRET_KEY:-bolter-test-secret}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - bolter-network
+
+  # Creates the bucket, then exits. Separate from `minio` so the server's
+  # healthcheck is what gates readiness, not a bucket that may already exist.
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["test"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${TEST_S3_ACCESS_KEY:-bolter-test} ${TEST_S3_SECRET_KEY:-bolter-test-secret} &&
+      mc mb --ignore-existing local/${TEST_S3_BUCKET:-bolter-test} &&
+      echo 'bucket ready'
+      "
+    networks:
+      - bolter-network
 
 networks:
   bolter-network:

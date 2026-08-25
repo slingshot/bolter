@@ -28,12 +28,12 @@
  * dedicated workers (and the timer is injectable for deterministic tests).
  */
 
-import { isRetryableError } from '@/lib/upload-shared';
 import {
     type ConcurrencyController,
     createConcurrencyController,
     isPushbackError,
-} from './concurrency';
+} from '@bolter/protocol/concurrency';
+import { isRetryableError } from '@bolter/protocol/retry';
 import type { PartStore } from './part-store';
 import type { EngineStateStore } from './state';
 
@@ -77,7 +77,7 @@ export interface UploaderOpts {
     /** A failure faster than this with zero bytes transferred counts as
      * "immediate" for offline inference; default 5_000 wall-clock ms. */
     immediateFailureMs?: number;
-    retryDelayMs(attempt: number): number; // from upload-shared (Task 1)
+    retryDelayMs(attempt: number): number; // from @bolter/protocol/retry
     /** `atMs` is this uploader's own clock reading for `totalBytesSent` —
      * carried to the consumer so a rate is never timed by message delivery. */
     onProgress(totalBytesSent: number, atMs: number): void;

@@ -1,3 +1,4 @@
+import { Keychain } from '@bolter/protocol/crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { ChevronDown, ChevronUp, Plus, Upload } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -17,7 +18,6 @@ import {
     resumeUpload,
     uploadFiles,
 } from '@/lib/api';
-import { Keychain } from '@/lib/crypto';
 import { trackUpload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
 import {

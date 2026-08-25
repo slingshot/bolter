@@ -1,3 +1,4 @@
+import { Keychain } from '@bolter/protocol/crypto';
 import {
     AlertCircle,
     Archive,
@@ -23,7 +24,6 @@ import {
     getDownloadStatus,
     getMetadata,
 } from '@/lib/api';
-import { Keychain } from '@/lib/crypto';
 import { trackDownload } from '@/lib/plausible';
 import { addBreadcrumb, captureError } from '@/lib/sentry';
 import { captureUrlFragmentSecret } from '@/lib/url-secret';

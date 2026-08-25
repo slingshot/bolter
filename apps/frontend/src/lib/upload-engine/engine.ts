@@ -19,10 +19,10 @@
  * Worker-safe: no DOM globals.
  */
 
-import { createEncryptionStream, ECE_RECORD_SIZE, Keychain } from '@/lib/crypto';
-import { isRetryableError, retryDelayMs as sharedRetryDelayMs } from '@/lib/upload-shared';
+import { createConcurrencyController } from '@bolter/protocol/concurrency';
+import { createEncryptionStream, ECE_RECORD_SIZE, Keychain } from '@bolter/protocol/crypto';
+import { isRetryableError, retryDelayMs as sharedRetryDelayMs } from '@bolter/protocol/retry';
 import { finalizeUpload } from './completion';
-import { createConcurrencyController } from './concurrency';
 import { type PartStore, PartStoreQuotaError } from './part-store';
 import { createSliceProducer, createZipProducer, type ProducerChunk } from './producer';
 import type { EngineFailureStage, EngineJob, WorkerToClient } from './protocol';

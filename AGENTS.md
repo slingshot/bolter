@@ -52,7 +52,9 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 **Monorepo Structure** (Turborepo + Bun workspaces):
 - `apps/frontend/` - Vite + React 18 + TypeScript + Tailwind
 - `apps/backend/` - Elysia (Bun web framework) + TypeScript
+- `apps/cli/` - `sendfm`, the command-line client (Bunli, compiled with `bun build --compile`)
 - `packages/shared/` - Constants exported to both (BYTES, LIMITS, DEFAULTS)
+- `packages/protocol/` - `@bolter/protocol`: the wire protocol, shared by the frontend and the CLI
 
 **Data Flow**:
 1. Frontend optionally encrypts files with Web Crypto API (AES-GCM + HKDF key derivation)
@@ -129,6 +131,125 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 
 **Path Alias**: `@/` maps to `apps/frontend/src/`
 
+
+## `packages/protocol` — the shared wire layer
+
+`@bolter/protocol` owns everything that *is* the Bolter protocol rather than a
+way of driving it, so the web app and the CLI cannot disagree about bytes:
+`crypto.ts` (ECE, HKDF, `Keychain`), `parts.ts` (`getEffectivePartSize`,
+`planParts`, `plaintextRangeForPart`, `validatePartSequence`), `client.ts` (the
+typed API client and the single `send-v1` challenge-retry), `metadata.ts`,
+`share.ts`, `instance.ts` (discovery), `concurrency.ts` (AIMD), `retry.ts` and
+`telemetry.ts`.
+
+Three constraints hold it together:
+
+- **No host-specific globals.** `__tests__/no-host-globals.test.ts` scans the
+  whole source tree for `window`, `document`, `navigator`, `localStorage`,
+  `indexedDB`, `XMLHttpRequest` and `import.meta.env`, stripping comments *and*
+  string literals first so prose and error messages stay free. WebCrypto,
+  `TextEncoder`, `fetch` and the stream types are fine — Bun implements them.
+- **tsconfig is pinned to ES2020**, matching `apps/frontend` (the most
+  conservative consumer), so an API too new for a consumer fails here rather
+  than in whichever app compiles the source. `Array.prototype.at` already
+  tripped this.
+- **Golden vectors** (`__tests__/vectors/golden.json`) freeze the derived auth
+  key, both auth headers, the deterministic metadata ciphertext, ECE output for
+  five plaintext shapes, and effective part sizes. Files already stored were
+  written by this implementation and their keys exist only in URLs people hold,
+  so regenerating the fixture to make a test pass is the one repair that is
+  never correct.
+
+Telemetry is a registrar (`setTelemetrySink`) defaulting to silence. The browser
+installs Sentry in `main.tsx`; the CLI installs its trace writer; the upload
+worker installs nothing — which is why `@sentry/react` is no longer bundled into
+the worker chunk to reach calls that were always inert there.
+
+## `apps/cli` — the `sendfm` command-line client
+
+Built on Bunli, compiled to standalone binaries. What it does that the browser
+cannot, and why:
+
+- **No staged copy, anywhere.** A part's bytes are a pure function of its part
+  number, so the uploader asks the source for a byte range and streams it
+  straight into the request. A retry asks for the same range. Encryption does
+  not change this: `plaintextRangeForPart` maps an encrypted part back to the
+  plaintext that produces it, exactly, because `getEffectivePartSize` floors to
+  a whole number of ECE records.
+- **Transport is `fetch` with a `ReadableStream` body *and* an explicit
+  `Content-Length`.** Without that header Bun frames the body as
+  `transfer-encoding: chunked`, which S3/R2 reject on a pre-signed PUT (signed
+  `UNSIGNED-PAYLOAD`). With it, backpressure comes free from the pull contract:
+  measured at ~5.5 MiB outstanding for a 128 MiB part.
+- **Keep-alive is off for part PUTs.** When a server answers a streamed request
+  before draining its body — exactly what S3 does for an expired pre-signed URL
+  — Bun leaves the unsent body queued, and the *next* request on that
+  connection returns 400. Setting `Connection: close` only on the retry does not
+  help: the poison is consumed by whichever request comes next.
+- **Directory uploads are resumable.** `transfer/archive.ts` computes the whole
+  ZIP layout from names and sizes alone, so any byte range is derivable without
+  reading content. That requires STORE (a deflated entry's size is unknown until
+  it is compressed) and data descriptors (CRC-32 is a function of content, while
+  the local header precedes it). Zip64 throughout. A retried range rewinds
+  checksum state from a per-boundary checkpoint — without that, a re-read folds
+  the same bytes into the CRC twice and the archive is corrupt while the upload
+  reports success.
+- **Downloads are parallel ranged GETs** into a sparse file, each decrypted from
+  its own record counter (`createDecryptionStream`'s `initialCounter`). Only the
+  last range expects the final-flagged record. A `200` answer to a ranged
+  request is refused rather than written at that range's offset.
+- **`/download/complete` is posted only after `fsync` + atomic rename**, so a
+  failed save never burns one of a link's limited downloads.
+- **Resume stores almost nothing**: the part plan is derived, so only the parts
+  the server already has, their ETags, and the source identity are durable. A
+  resume calls `/upload/multipart/:id/resume`, never `/upload/url` — allocating
+  again would mint a second file id and orphan every stored part. The part plan
+  is built from the *total* part count, not the resume response's `parts` array,
+  which lists only what is outstanding.
+- **Instance resolution has a precedence, and a link is part of it.** `-i`
+  takes the address a person actually knows — a frontend origin, a bare
+  hostname (upgraded to `https`, never `http`), an alias, or a whole pasted
+  share link, whose `/download/<id>` path is reduced to the origin.
+  `instanceRootOf` strips *only* that shape: discovery probes
+  `${base}/instance.json`, so an instance mounted at a subpath works, and
+  stripping every path to fix the share-link case would break it. For `get` and
+  `info`, the origin in the link outranks the configured default — the default
+  is where this machine *sends*, and says nothing about where someone else's
+  link points — while an explicit `-i` outranks both. `Session.clientFor(origin)`
+  memoises per origin because one invocation legitimately talks to two
+  instances; `session.instanceExplicit` is what distinguishes "the user typed
+  `-i` just now" from "an origin was resolved", which is always true.
+- **Discovery tells "no API here" from "we never got there".** Deployment
+  protection (Vercel, Netlify), Cloudflare Access and corporate SSO answer an
+  unauthenticated probe with a 302 to *their own* login page; `fetch` follows
+  it, so the probe returns 200 with HTML and is indistinguishable from an SPA
+  answering every path. `discoverInstance` therefore watches for a redirect that
+  lands on a *different* origin and reports `InstanceNotFoundError.interceptedBy`
+  — same-origin redirects (http→https, trailing slash, canonical host) are
+  ordinary and still followed. Without this a protected preview that publishes
+  `/instance.json` perfectly well was told it "does not publish /instance.json yet".
+- **Output contract**: stdout carries the result, stderr everything else.
+  `--json` puts one versioned envelope on stdout. Exit codes and machine
+  error codes both derive from one `SendfmError`, so they cannot drift.
+  `data.url` is always the *complete* share link, fragment included, in `up`,
+  `resume` and `ls` alike — an agent reads that field and hands it to a person,
+  so a value needing assembly is a value that gets shared broken. `ls` reports
+  `url: null` when an encrypted send's key was not kept; the state DB stores the
+  bare url and the key in separate columns, and the fragment is joined on the
+  way out.
+- **No telemetry.** Redacted NDJSON traces are written locally; `sendfm report`
+  bundles one on request. Redaction happens at write time, and strips signed-URL
+  query strings, keys, tokens and absolute paths (splitting on both separators,
+  because `node:path`'s `basename` follows the host platform and would leak a
+  Windows path read on Linux).
+
+Bunli notes that bit: it requires Bun >= 1.3.11; `@bunli/core` pulls OpenTUI,
+which needs React 19 (the frontend is on 18, so the workspace carries both);
+`bunli build` reads `targets` from `bunli.config.ts`, so they are deliberately
+absent there and passed explicitly; cross-compiling requires
+`bun install --os '*' --cpu '*'` first; and the commands directory needs exactly
+one default-exported command per file.
+
 ## Environment Variables
 
 Required for local development:
@@ -177,6 +298,7 @@ Neither of these is an environment variable and neither is detectable by `/healt
 - `GET /openapi.json` - Raw OpenAPI 3.x specification
 - `GET /health` - Full health check (Redis + S3)
 - `GET /config` - Client configuration (limits, defaults)
+- `GET /instance.json` - Instance discovery document (API origin, protocol version, features, limits)
 - `POST /upload/url` - Request pre-signed upload URL
 - `POST /upload/complete` - Complete file upload (finalize multipart, store metadata)
 - `POST /upload/abort/:id` - Abort multipart upload
@@ -186,7 +308,7 @@ Neither of these is an environment variable and neither is detectable by `/healt
 - `GET /download/:id` - Stream download (fallback)
 - `GET /download/blob/:id` - Blob download (alternative)
 - `POST /download/complete/:id` - Report download complete
-- `GET /metadata/:id` - Get file metadata
+- `GET /metadata/:id` - Get file metadata, plus `dl`/`dlimit`/`size`
 - `GET /exists/:id` - Check file existence
 - `GET /download/legacy/:id` - Check legacy system
 - `POST /delete/:id` - Delete file (owner only)

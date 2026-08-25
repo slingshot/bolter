@@ -1,6 +1,6 @@
+import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@bolter/protocol/crypto';
 import { UPLOAD_LIMITS } from '@bolter/shared';
 import { describe, expect, it } from 'vitest';
-import { ECE_ENCRYPTED_RECORD_SIZE, ECE_RECORD_SIZE } from '@/lib/crypto';
 import type { EngineDeps } from '../engine';
 import { MemoryPartStore, type PartStore } from '../part-store';
 import type { WorkerToClient } from '../protocol';

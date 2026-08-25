@@ -54,7 +54,8 @@
             "bracketSameLine": false,
             "bracketSpacing": true,
             "jsxQuoteStyle": "double"
-        }
+        },
+        "globals": ["Bun"]
     },
     "json": {
         "formatter": {
@@ -76,7 +77,8 @@
             "!**/.turbo",
             "!**/coverage",
             "!**/playwright-report",
-            "!**/test-results"
+            "!**/test-results",
+            "!**/.bunli"
         ]
     }
 }

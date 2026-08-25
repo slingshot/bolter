@@ -389,10 +389,34 @@ function loadConfig(): Config {
 
 export const config: Config = loadConfig();
 
+/**
+ * The origin a client actually used to reach this process.
+ *
+ * `request.url` is not it. Every managed platform this deploys to — Railway,
+ * Fly, Cloudflare, any nginx ingress — terminates TLS at the edge and forwards
+ * over plaintext, so a request the client made over `https://` arrives here as
+ * `http://` and `new URL(request.url).origin` reports cleartext. Echoing that
+ * back to a client is not cosmetic: `/instance.json`'s `api` field *becomes*
+ * the client's base URL, so a downgraded origin sends every later request
+ * through the edge's 301 — and a redirected `POST` is rewritten to `GET` by the
+ * fetch spec, which surfaces as a 404 on a route that works.
+ *
+ * The header can only ever *upgrade* the answer. It is attacker-controllable by
+ * anyone who can reach this process without passing the edge, and letting such
+ * a request talk a genuine TLS connection down to `http` would be a real, if
+ * narrow, foothold. Upgrading fails safe.
+ */
+export function requestOrigin(request: Request): string {
+    const url = new URL(request.url);
+    // Each proxy appends, so the leftmost entry is the original client's scheme.
+    const forwarded = request.headers.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+    const secure = forwarded === 'https' || url.protocol === 'https:';
+    return `${secure ? 'https' : 'http'}://${url.host}`;
+}
+
 export function deriveBaseUrl(request: Request): string {
     if (process.env.DETECT_BASE_URL === 'true') {
-        const url = new URL(request.url);
-        return `${url.protocol}//${url.host}`;
+        return requestOrigin(request);
     }
     return config.baseUrl;
 }

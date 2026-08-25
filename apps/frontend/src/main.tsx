@@ -10,9 +10,15 @@ import { BrowserRouter, useNavigate } from 'react-router-dom';
 import './lib/plausible'; // Initialize Plausible (auto pageviews enabled by default)
 import App from './App';
 import './index.css';
+import { setTelemetrySink } from '@bolter/protocol/telemetry';
 import { AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { scrubReplayRecordingEvent, scrubSentryBreadcrumb, scrubSentryEvent } from './lib/sentry';
+import {
+    captureError,
+    scrubReplayRecordingEvent,
+    scrubSentryBreadcrumb,
+    scrubSentryEvent,
+} from './lib/sentry';
 
 Sentry.init({
     dsn: 'https://04c2025d3ea04059cd3f474b55d0a941@glitch.slingshot.fm/5',
@@ -39,6 +45,12 @@ Sentry.init({
     beforeSendTransaction: (event) => scrubSentryEvent(event),
     beforeBreadcrumb: (breadcrumb) => scrubSentryBreadcrumb(breadcrumb),
 });
+
+// `@bolter/protocol` reports through a registrar that defaults to silence, so
+// the browser has to opt in explicitly. Doing it here — after `Sentry.init` and
+// on the main thread only — is deliberate: the upload worker has no Sentry
+// client, and leaving its sink silent keeps the SDK out of the worker bundle.
+setTelemetrySink(captureError);
 
 function ErrorFallback() {
     const navigate = useNavigate();

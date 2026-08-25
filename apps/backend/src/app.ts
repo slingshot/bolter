@@ -1,7 +1,13 @@
+import {
+    DISCOVERY_VERSION,
+    type InstanceDocument,
+    PROTOCOL_VERSION,
+} from '@bolter/protocol/instance';
+import { UPLOAD_LIMITS } from '@bolter/shared';
 import { cors } from '@elysiajs/cors';
 import { openapi } from '@elysiajs/openapi';
 import { Elysia, t } from 'elysia';
-import { config } from './config';
+import { config, requestOrigin } from './config';
 // Health probes are unauthenticated, so they must be both memoised (no S3 API
 // amplification under a request flood) and bounded (a dead provider must not
 // stall readiness). See `lib/health.ts` for the full rationale — audit #29.
@@ -273,6 +279,73 @@ export const app = new Elysia({
         },
         {
             detail: { hide: true },
+        },
+    )
+
+    /**
+     * Instance discovery.
+     *
+     * A share link names the *web* origin, which on send.fm is a different
+     * deployment from the API. A browser never notices — its API URL is baked
+     * in at build time — but every other client is handed only the link, and
+     * nothing else in the protocol bridges the two. The same document is
+     * emitted as a static file by the frontend build; this one is
+     * authoritative for limits, because it reads runtime config rather than
+     * build-time constants.
+     */
+    .get(
+        '/instance.json',
+        ({ request, set }) => {
+            // This route's own origin is the API by definition. `baseUrl` is
+            // where share links point, which may or may not be the same host.
+            // Derived through `requestOrigin` rather than `request.url`: behind
+            // a TLS-terminating edge this process only ever sees plaintext, and
+            // a cleartext `api` here becomes the client's base URL.
+            const origin = requestOrigin(request);
+            set.headers['cache-control'] = 'public, max-age=300';
+            const instance: InstanceDocument = {
+                bolter: DISCOVERY_VERSION,
+                name: config.customTitle,
+                description: config.customDescription,
+                web: config.baseUrl,
+                api: origin,
+                protocol: { version: PROTOCOL_VERSION, min: PROTOCOL_VERSION },
+                features: [
+                    'multipart',
+                    'resume',
+                    'ece-v1',
+                    'owner-tokens',
+                    'password',
+                    'zip-at-upload',
+                ],
+                limits: {
+                    maxFileSize: config.maxFileSize,
+                    maxFilesPerArchive: config.maxFilesPerArchive,
+                    maxExpireSeconds: config.maxExpireSeconds,
+                    maxDownloads: config.maxDownloads,
+                    multipartThreshold: UPLOAD_LIMITS.MULTIPART_THRESHOLD,
+                    minPartSize: UPLOAD_LIMITS.MIN_PART_SIZE,
+                    maxParts: UPLOAD_LIMITS.MAX_PARTS,
+                    maxMetadataBytes: UPLOAD_LIMITS.MAX_METADATA_BYTES,
+                },
+                defaults: {
+                    expireSeconds: config.defaultExpireSeconds,
+                    downloads: config.defaultDownloads,
+                },
+                cli: { package: 'sendfm' },
+            };
+            return instance;
+        },
+        {
+            detail: {
+                tags: ['Configuration'],
+                summary: 'Instance discovery document',
+                description:
+                    'Describes this instance to non-browser clients: where its API lives, which ' +
+                    'protocol versions it speaks, what it supports and what its limits are. ' +
+                    'Served from the web origin as a static file too, so a client holding only a ' +
+                    'share link can find the API.',
+            },
         },
     )
 

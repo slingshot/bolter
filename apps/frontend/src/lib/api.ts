@@ -3,8 +3,7 @@
  * Implements resilient direct-to-cloudflare multipart uploads
  */
 
-import { UPLOAD_LIMITS } from '@bolter/shared';
-import { predictLength } from 'client-zip';
+import { createBolterClient } from '@bolter/protocol/client';
 import {
     arrayToB64,
     b64ToArray,
@@ -16,7 +15,14 @@ import {
     ECE_VERSION,
     Keychain,
     readEceVersion,
-} from './crypto';
+} from '@bolter/protocol/crypto';
+import { getEffectivePartSize } from '@bolter/protocol/parts';
+import { getConcurrentUploads, isRetryableError, retryDelayMs } from '@bolter/protocol/retry';
+
+export { getEffectivePartSize };
+
+import { UPLOAD_LIMITS } from '@bolter/shared';
+import { predictLength } from 'client-zip';
 import { FileReadError, LimitReachedError } from './errors';
 import { addBreadcrumb, captureError } from './sentry';
 import {
@@ -37,7 +43,6 @@ import { createEngineProgressReporter } from './upload-engine/progress-reporter'
 import type { EngineJob, EngineSource } from './upload-engine/protocol';
 import { type CompletionEnvelope, openEngineState } from './upload-engine/state';
 import { withUploadLifecycle } from './upload-lifecycle';
-import { getConcurrentUploads, isRetryableError, retryDelayMs } from './upload-shared';
 import {
     computeContentFingerprint,
     deleteUploadState,
@@ -67,8 +72,15 @@ const STREAMING_ZIP_THRESHOLD = 500 * 1024 * 1024;
 
 // API base URL - defaults to localhost for development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+/**
+ * The browser talks to exactly one instance, fixed at build time, so it
+ * keeps a single client. `@bolter/protocol` exposes a factory because the
+ * CLI does not have that luxury — it follows whichever instance a share
+ * link came from.
+ */
+const client = createBolterClient({ baseUrl: API_BASE_URL });
 
-// Retry configuration (backoff base/cap live in upload-shared.ts → retryDelayMs)
+// Retry configuration (backoff base/cap live in @bolter/protocol/retry → retryDelayMs)
 const MAX_RETRIES = 10;
 const STALL_TIMEOUT = 60_000; // Abort upload part if no progress for 60 seconds
 
@@ -407,21 +419,6 @@ async function uploadMultipartSliced(
     };
 }
 
-/**
- * Part size actually used when cutting the stream into parts.
- * Encrypted parts are cut on ECE record boundaries so every non-trailing part
- * holds a whole number of records — required for resume to re-encrypt the
- * remainder with a consistent record counter. The backend allocates parts
- * based on the raw partSize; since the effective size is <= partSize the last
- * allocated part absorbs the residual bytes.
- */
-export function getEffectivePartSize(partSize: number, encrypted: boolean): number {
-    if (!encrypted) {
-        return partSize;
-    }
-    return Math.floor(partSize / ECE_ENCRYPTED_RECORD_SIZE) * ECE_ENCRYPTED_RECORD_SIZE;
-}
-
 export interface UploadProgress {
     loaded: number;
     total: number;
@@ -586,24 +583,15 @@ export class Canceller {
 /**
  * Get API configuration
  */
-export async function getConfig() {
-    const response = await fetchWithRetry(`${API_BASE_URL}/config`, {}, 3);
-    if (!response.ok) {
-        throw new Error('Failed to fetch config');
-    }
-    return response.json();
+export function getConfig() {
+    return client.getConfig();
 }
 
 /**
  * Check if file exists
  */
-export async function fileExists(id: string): Promise<boolean> {
-    const response = await fetchWithRetry(`${API_BASE_URL}/exists/${id}`, {}, 3);
-    if (!response.ok) {
-        return false;
-    }
-    const data = await response.json();
-    return data.exists;
+export function fileExists(id: string): Promise<boolean> {
+    return client.exists(id);
 }
 
 /**
@@ -731,13 +719,8 @@ export async function getMetadata(id: string, keychain?: Keychain) {
 /**
  * Delete a file
  */
-export async function deleteFile(id: string, ownerToken: string): Promise<boolean> {
-    const response = await fetch(`${API_BASE_URL}/delete/${id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owner_token: ownerToken }),
-    });
-    return response.ok;
+export function deleteFile(id: string, ownerToken: string): Promise<boolean> {
+    return client.deleteFile(id, ownerToken);
 }
 
 /**
@@ -748,25 +731,8 @@ export type FileInfoResult =
     | { status: 'not_found' }
     | { status: 'error' };
 
-export async function getFileInfo(id: string, ownerToken: string): Promise<FileInfoResult> {
-    try {
-        const response = await fetch(`${API_BASE_URL}/info/${id}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ owner_token: ownerToken }),
-        });
-        if (response.status === 404) {
-            return { status: 'not_found' };
-        }
-        if (!response.ok) {
-            return { status: 'error' };
-        }
-        const data = await response.json();
-        return { status: 'ok', ...data };
-    } catch {
-        // Network error — don't assume file is deleted
-        return { status: 'error' };
-    }
+export function getFileInfo(id: string, ownerToken: string): Promise<FileInfoResult> {
+    return client.getFileInfo(id, ownerToken);
 }
 
 /**
@@ -785,53 +751,10 @@ export async function getDownloadStatus(
     id: string,
     keychain?: Keychain | null,
 ): Promise<DownloadStatusResult> {
-    try {
-        const headers: Record<string, string> = {};
-        if (keychain) {
-            headers.Authorization = await keychain.authHeader();
-        }
-
-        let response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
-
-        // Handle 401 challenge-response for encrypted files
-        if (response.status === 401 && keychain) {
-            const wwwAuth = response.headers.get('WWW-Authenticate');
-            if (wwwAuth) {
-                const nonce = wwwAuth.split(' ')[1];
-                if (nonce) {
-                    keychain.nonce = nonce;
-                    headers.Authorization = await keychain.authHeader();
-                    response = await fetch(`${API_BASE_URL}/download/url/${id}`, { headers });
-                }
-            }
-        }
-
-        // Harvest the rotated nonce from the final response (successful or not)
-        if (keychain) {
-            const wwwAuth = response.headers.get('WWW-Authenticate');
-            const nonce = wwwAuth?.split(' ')[1];
-            if (nonce) {
-                keychain.nonce = nonce;
-            }
-        }
-
-        if (response.status === 404 || response.status === 410) {
-            return { status: 'gone' };
-        }
-        if (!response.ok) {
-            return { status: 'error' };
-        }
-        const data = await response.json();
-        return { status: 'ok', dl: data.dl, dlimit: data.dlimit };
-    } catch {
-        return { status: 'error' };
-    }
+    const result = await client.getDownloadStatus(id, keychain ?? null);
+    return result.status === 'ok' ? { status: 'ok', dl: result.dl, dlimit: result.dlimit } : result;
 }
 
-/**
- * Upload files with resilient multipart support
- * Multi-file uploads are zipped at upload time for efficient downloads
- */
 export function uploadFiles(
     options: UploadOptions,
     keychain: Keychain,
@@ -3315,62 +3238,8 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
  * Mirrors getMetadata's 401 challenge-response pattern, retries once on pure
  * network errors, and never throws — returns false on failure.
  */
-export async function reportDownloadComplete(
-    id: string,
-    keychain: Keychain | null,
-): Promise<boolean> {
-    const post = async (): Promise<Response> => {
-        const headers: Record<string, string> = {};
-        if (keychain) {
-            headers.Authorization = await keychain.authHeader();
-        }
-        return fetch(`${API_BASE_URL}/download/complete/${id}`, { method: 'POST', headers });
-    };
-
-    let response: Response;
-    try {
-        // No blind retry on network error: the server may have processed the
-        // increment before the response was lost, and /download/complete is
-        // not idempotent — a retry could double-count the download.
-        response = await post();
-
-        // Handle 401 challenge-response: harvest nonce, re-sign, retry once
-        // (safe: a 401 response proves the counter was not incremented)
-        if (response.status === 401 && keychain) {
-            const wwwAuth = response.headers.get('WWW-Authenticate');
-            const nonce = wwwAuth?.split(' ')[1];
-            if (nonce) {
-                keychain.nonce = nonce;
-                response = await post();
-            }
-        }
-    } catch (e) {
-        captureError(e, {
-            operation: 'download.complete',
-            extra: { fileId: id },
-            level: 'warning',
-        });
-        return false;
-    }
-
-    // Harvest the rotated nonce from the final response
-    if (keychain) {
-        const wwwAuth = response.headers.get('WWW-Authenticate');
-        const nonce = wwwAuth?.split(' ')[1];
-        if (nonce) {
-            keychain.nonce = nonce;
-        }
-    }
-
-    if (!response.ok) {
-        captureError(new Error(`Failed to report download complete: HTTP ${response.status}`), {
-            operation: 'download.complete',
-            extra: { fileId: id, httpStatus: response.status },
-            level: 'warning',
-        });
-        return false;
-    }
-    return true;
+export function reportDownloadComplete(id: string, keychain: Keychain | null): Promise<boolean> {
+    return client.reportDownloadComplete(id, keychain);
 }
 
 /**

@@ -292,3 +292,12 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
+
+### Bunli
+# Generated command types, rebuilt by `bunli build` / `bunli generate`.
+.bunli/
+
+### sendfm release staging
+# Per-platform npm packages assembled by apps/cli/scripts/publish-npm.ts.
+# Each carries a ~100 MB binary, which is over GitHub's per-file limit.
+.npm-publish/

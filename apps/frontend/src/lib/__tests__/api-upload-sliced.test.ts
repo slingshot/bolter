@@ -11,7 +11,7 @@ const navigatorStub = {
 vi.stubGlobal('navigator', navigatorStub);
 
 const { uploadFiles, Canceller } = await import('@/lib/api');
-const { Keychain } = await import('@/lib/crypto');
+const { Keychain } = await import('@bolter/protocol/crypto');
 
 const PART_SIZE = 1024 * 1024;
 // R2/S3 reject non-trailing parts below 5 MiB, and the uploader hard-fails on

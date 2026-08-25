@@ -3,7 +3,7 @@
  * Uses Web Crypto API for AES-GCM encryption and HKDF key derivation
  */
 
-import { captureError } from './sentry';
+import { reportError } from './telemetry';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -283,13 +283,43 @@ export class Keychain {
     }
 }
 
+export interface EncryptionStreamOptions {
+    /**
+     * Record counter this stream starts at. Non-zero when encrypting a slice
+     * that begins partway through a file — the counter is what ties a record's
+     * ciphertext to its position, so a slice must resume the sequence exactly.
+     */
+    initialCounter?: number;
+    /**
+     * Whether to close the stream with the final-flagged record.
+     *
+     * True (the default) for a whole file or the trailing part. **False when
+     * encrypting a middle part**, because the final flag is what tells a
+     * decryptor the file ends here — emitting it mid-file would make every
+     * part look like a complete, truncated file, and the concatenation would
+     * not match a whole-stream encryption of the same bytes.
+     *
+     * With `finalize: false` the input must be a whole number of records; a
+     * partial record has no legal non-final representation and throws rather
+     * than silently producing a part that cannot be reassembled.
+     */
+    finalize?: boolean;
+}
+
 /**
- * Create encryption transform stream for file content
+ * Create encryption transform stream for file content.
+ *
+ * Accepts a bare counter for the common case; the options form exists so a
+ * client with random access to its source can regenerate any single part on
+ * demand — which is what makes a byte-identical retry free, with no staged
+ * copy of the ciphertext.
  */
 export function createEncryptionStream(
     keychain: Keychain,
-    initialCounter = 0,
+    options: number | EncryptionStreamOptions = 0,
 ): TransformStream<Uint8Array, Uint8Array> {
+    const { initialCounter = 0, finalize = true } =
+        typeof options === 'number' ? { initialCounter: options } : options;
     let recordCount = initialCounter;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
@@ -318,6 +348,20 @@ export function createEncryptionStream(
         },
 
         async flush(controller) {
+            if (!finalize) {
+                // A middle slice ends exactly on a record boundary by
+                // construction; anything left over means the caller cut the
+                // part somewhere no decryptor can rejoin.
+                if (buffer.length > 0) {
+                    controller.error(
+                        new Error(
+                            `non-final encryption stream ended mid-record with ${buffer.length} ` +
+                                `bytes buffered (records are ${ECE_RECORD_SIZE} bytes)`,
+                        ),
+                    );
+                }
+                return;
+            }
             // Always emit a final-flagged record (empty when the plaintext is an
             // exact record-size multiple) so truncation at a record boundary is
             // detectable by the decryptor.
@@ -360,6 +404,25 @@ async function encryptRecord(
 
 export interface DecryptionStreamOptions {
     /**
+     * Record counter this stream starts at.
+     *
+     * Non-zero when decrypting a *range* of a file rather than the whole of
+     * it, which is what lets a client fetch ranges in parallel and decrypt
+     * each one as it lands. Exactly mirrors the encryptor: a record's nonce is
+     * derived from its index, so a range that starts on a record boundary is
+     * self-sufficient given the right starting count.
+     */
+    initialCounter?: number;
+    /**
+     * Whether the absence of a final-flagged record is an error.
+     *
+     * False for a range that is not the end of the file, where there is no
+     * final record to find. The whole-file guarantee is then reasserted by the
+     * caller, which knows how many plaintext bytes it should have ended up
+     * with.
+     */
+    expectFinalRecord?: boolean;
+    /**
      * ECE format version taken from the file's authenticated metadata via
      * `readEceVersion(metadata)`. `>= ECE_MIN_VERSION_WITH_FINAL_RECORD` means
      * the ciphertext was written by a client that always emits a final-flagged
@@ -383,8 +446,9 @@ export function createDecryptionStream(
     options: DecryptionStreamOptions,
 ): TransformStream<Uint8Array, Uint8Array> {
     const eceVersion = options.eceVersion;
-    const requireFinalRecord = eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
-    let recordCount = 0;
+    const requireFinalRecord =
+        (options.expectFinalRecord ?? true) && eceVersion >= ECE_MIN_VERSION_WITH_FINAL_RECORD;
+    let recordCount = options.initialCounter ?? 0;
     let buffer = new Uint8Array(0);
     let encryptionKey: CryptoKey;
     let sawFinal = false;
@@ -438,7 +502,7 @@ export function createDecryptionStream(
                     }
                 } catch (e) {
                     console.error('Failed to decrypt final record:', e);
-                    captureError(e, {
+                    reportError(e, {
                         operation: 'crypto.decryptRecord',
                         extra: { recordCount, bufferLength: buffer.length },
                     });
@@ -465,7 +529,7 @@ export function createDecryptionStream(
                     recordCount,
                     eceVersion,
                 });
-                captureError(err, {
+                reportError(err, {
                     operation: 'crypto.missingFinalRecord',
                     extra: { recordCount, eceVersion },
                 });
@@ -476,7 +540,7 @@ export function createDecryptionStream(
             // Pre-versioning uploads with exact-record-multiple plaintexts have
             // no final-flagged record, so this is not an error for them — but
             // track occurrences for telemetry.
-            captureError(new Error('Encrypted stream ended without final record'), {
+            reportError(new Error('Encrypted stream ended without final record'), {
                 operation: 'crypto.missingFinalRecord',
                 level: 'warning',
                 extra: { recordCount, eceVersion },
