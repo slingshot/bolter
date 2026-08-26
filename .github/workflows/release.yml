@@ -45,7 +45,7 @@ jobs:
           printf 'ref=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
 
   binaries:
-    name: Binaries, checksums and Homebrew
+    name: Binaries and checksums
     needs: resolve
     runs-on: ubuntu-latest
     steps:
@@ -57,31 +57,131 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-      # Required, and bunli-releaser does not do it: it runs
-      # `bun install --frozen-lockfile`, which installs only the current
-      # platform's packages. @bunli/core pulls OpenTUI, whose native library
-      # ships as a per-platform package, and bun refuses to extract packages
-      # whose os/cpu do not match the host — so cross-compiling to darwin or
-      # windows fails to resolve them. Verified that a later
-      # `--frozen-lockfile` does not prune what this installs.
+      # Required, and easy to lose: `bun install --frozen-lockfile` installs
+      # only the current platform's packages. @bunli/core pulls OpenTUI, whose
+      # native library ships as a per-platform package, and bun refuses to
+      # extract packages whose os/cpu do not match the host — so cross-compiling
+      # to darwin or windows cannot resolve them. Verified that this does not
+      # touch bun.lock, so it does not defeat lockfile pinning.
       - name: Install every platform's runtime
         run: bun install --os '*' --cpu '*'
 
-      # Pinned to a commit, not `@v1` (which does not exist: the action publishes
-      # no tags or releases) and not `@main` (mutable by a third party, while
-      # this step holds `contents: write` and later a tap push token).
-      # main @ 2026-02-11.
-      - uses: AryaLabsHQ/bunli-releaser@46167b587d929c1d25caf1de7f422360543c0e40
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          workdir: apps/cli
-          targets: all
-          artifact-name: sendfm
-          # Reruns of a tag should not fail on assets that already exist.
-          existing-assets: skip
-          # Both or neither; the action rejects a partial Homebrew config.
-          brew-tap: ${{ vars.HOMEBREW_TAP || '' }}
-          brew-token: ${{ secrets.HOMEBREW_TAP_TOKEN || '' }}
+      # `--targets all` resolves, in bunli's own source, to exactly the five
+      # directories the packaging step walks below. A single-target build would
+      # write a flat dist/sendfm instead of dist/<target>/sendfm.
+      - name: Build all targets
+        run: cd apps/cli && bun run build:all
+
+      # Packaging is done here rather than by a third-party action.
+      # AryaLabsHQ/bunli-releaser was the obvious fit and is what this workflow
+      # originally called, but its action.yml fails to parse as YAML at every
+      # commit it has ever had (an unquoted `Bunli CLIs: build` in the
+      # top-level `description`), so GitHub cannot load it at any ref, and it
+      # publishes no tags to pin besides. The work it would have done is a
+      # tar, a sha256sum and an upload.
+      #
+      # THE ASSET NAMING BELOW IS A CONTRACT WITH THREE INDEPENDENT CONSUMERS:
+      #   - apps/frontend/public/install.sh  (served at https://send.fm/install.sh)
+      #   - apps/cli/src/commands/update.ts  (`assetNameFor`, the self-updater)
+      #   - the Homebrew formula, once that ships
+      # All three build `sendfm-<version>-<os>-<arch>.<ext>` and expect the
+      # executable at the ARCHIVE ROOT, not under a directory. Renaming an
+      # asset silently breaks `curl | sh` and `sendfm update` for everyone who
+      # already installed — the old clients are already in the wild.
+      - name: Package archives and checksums
+        env:
+          TAG: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
+
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 windows-x64; do
+            case "$target" in
+              windows-*) exe=sendfm.exe ;;
+              *)         exe=sendfm ;;
+            esac
+
+            src="apps/cli/dist/$target/$exe"
+            if [ ! -f "$src" ]; then
+              echo "::error::missing build output for $target: $src"
+              exit 1
+            fi
+            chmod +x "$src"
+
+            # -C so the executable lands at the archive root; both the installer
+            # and the self-updater look for ./sendfm immediately after unpacking.
+            case "$target" in
+              windows-*)
+                ( cd "apps/cli/dist/$target" \
+                  && zip -qX "$GITHUB_WORKSPACE/release-assets/sendfm-$VERSION-$target.zip" "$exe" )
+                ;;
+              *)
+                tar -czf "$GITHUB_WORKSPACE/release-assets/sendfm-$VERSION-$target.tar.gz" \
+                    -C "apps/cli/dist/$target" "$exe"
+                ;;
+            esac
+          done
+
+          # sha256sum's default `<hash>  <name>` output is what both consumers
+          # parse: install.sh greps for a trailing " <asset>" and update.ts
+          # splits each line on whitespace. Bare names, no ./ prefix, and the
+          # glob deliberately excludes checksums.txt itself.
+          cd "$GITHUB_WORKSPACE/release-assets"
+          sha256sum sendfm-* > checksums.txt
+          cat checksums.txt
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          `sendfm` is the command-line client for send.fm — send and receive
+          end-to-end encrypted files from a terminal, against any Bolter instance.
+
+          ## Install
+
+          ```sh
+          curl -fsSL https://send.fm/install.sh | sh
+          ```
+
+          The installer picks the binary for your platform, verifies it against
+          `checksums.txt` below, and installs it somewhere writable on your
+          `PATH`. `SENDFM_INSTALL_DIR` chooses the location and `SENDFM_VERSION`
+          pins a version. On Windows, take the `windows-x64.zip` asset directly.
+
+          Homebrew and npm packages follow shortly. Already installed? `sendfm update`.
+
+          ## Verifying by hand
+
+          ```sh
+          sha256sum -c checksums.txt --ignore-missing
+          ```
+          NOTES
+
+          # Re-running a tag must not fail on a release that already exists —
+          # the whole point of the workflow_dispatch input is rebuilding one.
+          # `--clobber` replaces assets rather than skipping them, so a rerun
+          # after a build fix actually ships the fixed binary.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; replacing its assets."
+          else
+            gh release create "$TAG" \
+              --title "sendfm $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              --verify-tag
+          fi
+
+          gh release upload "$TAG" "$GITHUB_WORKSPACE"/release-assets/* --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
+
+      # Homebrew is deliberately not here yet. When the tap ships it becomes a
+      # step that rewrites Formula/sendfm.rb with the four darwin/linux asset
+      # URLs and their sha256s, read straight out of checksums.txt above.
 
   npm:
     name: npm
