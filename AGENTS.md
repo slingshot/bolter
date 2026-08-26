@@ -250,6 +250,53 @@ absent there and passed explicitly; cross-compiling requires
 `bun install --os '*' --cpu '*'` first; and the commands directory needs exactly
 one default-exported command per file.
 
+### Releasing `sendfm`
+
+Releases are cut by pushing a `v*.*.*` tag; `.github/workflows/release.yml`
+does the rest. The CLI owns that tag namespace outright — the web app is
+deploy-on-push and never tagged, and if it ever wants release tags it takes an
+`app-v*` prefix. (The timvisee/send fork left 99 tags spanning `v0.1.0`-`v3.4.9`
+in older clones. None were ever pushed here and they were deleted locally before
+`v0.1.0`, so the namespace starts empty; a stale clone may still need
+`git tag -d` before it can tag.)
+
+The workflow builds the five targets, packages them, and publishes the release
+itself rather than delegating to an action. `AryaLabsHQ/bunli-releaser` was the
+natural fit and is what the workflow first called, but its `action.yml` has
+never been valid YAML at any commit (an unquoted `Bunli CLIs: build` in the
+top-level `description`), so GitHub cannot load it at any ref — and it publishes
+no tags to pin. Do not reintroduce it without checking that upstream is fixed.
+
+**The asset names are a contract with three independent consumers**, all of
+which construct `sendfm-<version>-<os>-<arch>.<ext>` and expect the executable
+at the *archive root*:
+
+- `apps/frontend/public/install.sh` — served at `https://send.fm/install.sh`
+- `apps/cli/src/commands/update.ts` — `assetNameFor`, backing `sendfm update`
+- the Homebrew formula, once the tap ships
+
+Renaming an asset, nesting the binary in a directory, or dropping
+`checksums.txt` breaks `curl | sh` and self-update for everyone already
+installed — those clients are in the wild and cannot be corrected after the
+fact. `checksums.txt` is plain `sha256sum` output: `install.sh` greps for a
+trailing `" <asset>"` and `update.ts` splits each line on whitespace, so the
+default two-space format satisfies both. Verification is mandatory in both
+consumers — a self-updater that skips it is a remote code execution primitive.
+
+Homebrew and npm are deliberately dormant. Homebrew needs no gate: the action
+that would have handled it is gone, and the tap step is simply not written yet.
+npm is a full job gated on `if: vars.PUBLISH_NPM == 'true'`, because the
+`secrets` context is **not available in a job-level `if:`** — `secrets.NPM_TOKEN
+!= ''` would silently read as empty and never run. Enabling npm is: add the
+`NPM_TOKEN` secret, set the `PUBLISH_NPM` variable, retag. It runs after the
+release exists so a failed binary build never leaves npm advertising a version
+with nothing behind it.
+
+Reruns are safe. `workflow_dispatch` takes an existing `vX.Y.Z` tag (validated
+in its own `resolve` job before it reaches `checkout`'s `ref:`), and assets
+upload with `--clobber`, so re-dispatching after a build fix ships the fixed
+binary rather than skipping it.
+
 ## Environment Variables
 
 Required for local development:

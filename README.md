@@ -118,12 +118,20 @@ This starts:
 ```bash
 # macOS and Linux
 curl -fsSL https://send.fm/install.sh | sh
+```
 
-# Homebrew
-brew install slingshot/tap/sendfm
+The installer picks the binary for your platform, verifies it against the
+release's `checksums.txt`, and installs it somewhere writable on your `PATH`.
+`SENDFM_INSTALL_DIR` chooses where, `SENDFM_VERSION` pins a version. On Windows,
+take the `windows-x64.zip` from the
+[releases page](https://github.com/slingshot/bolter/releases). Once installed,
+`sendfm update` upgrades in place — verifying the checksum the same way.
 
-# npm, pnpm, yarn, bun — installs a native binary, no Bun required
-npm install -g sendfm
+Homebrew and npm are **not published yet**; both are next up:
+
+```bash
+brew install slingshot/tap/sendfm   # not yet — coming shortly
+npm install -g sendfm               # not yet — coming shortly
 ```
 
 ```bash
