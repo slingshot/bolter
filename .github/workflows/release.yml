@@ -1,9 +1,12 @@
 name: Release CLI
 
 # The CLI owns the `v*.*.*` tag namespace. The web app is deploy-on-push and is
-# never tagged, and the repository's 99 `v3.4.x` tags are dead history from the
-# timvisee/send fork this was rewritten from. If the app ever wants release
-# tags it takes an `app-v*` prefix.
+# never tagged. The timvisee/send fork this was rewritten from left 99 tags in
+# local clones, spanning v0.1.0-v3.4.9 rather than only the v3.4.x range an
+# earlier version of this comment claimed — enough to collide with every
+# version a new CLI would plausibly pick. None were ever pushed to this repo,
+# and they were deleted locally before v0.1.0, so the namespace starts empty.
+# If the app ever wants release tags it takes an `app-v*` prefix.
 on:
   push:
     tags:
@@ -64,7 +67,11 @@ jobs:
       - name: Install every platform's runtime
         run: bun install --os '*' --cpu '*'
 
-      - uses: AryaLabsHQ/bunli-releaser@v1
+      # Pinned to a commit, not `@v1` (which does not exist: the action publishes
+      # no tags or releases) and not `@main` (mutable by a third party, while
+      # this step holds `contents: write` and later a tap push token).
+      # main @ 2026-02-11.
+      - uses: AryaLabsHQ/bunli-releaser@46167b587d929c1d25caf1de7f422360543c0e40
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           workdir: apps/cli
@@ -81,6 +88,13 @@ jobs:
     needs: [resolve, binaries]
     # After the release exists, so a failed binary build does not leave npm
     # advertising a version with nothing behind it.
+    #
+    # Dormant until `PUBLISH_NPM` is set to "true" in the repository variables.
+    # The first release ships via GitHub + install.sh only, and an ungated job
+    # with no NPM_TOKEN would publish nothing and put a red X on the release it
+    # was meant to accompany. A variable rather than a code change so enabling
+    # npm later is: add the NPM_TOKEN secret, set the variable, retag.
+    if: vars.PUBLISH_NPM == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
