@@ -179,9 +179,73 @@ jobs:
           gh release upload "$TAG" "$GITHUB_WORKSPACE"/release-assets/* --clobber
           gh release view "$TAG" --json assets --jq '.assets[].name'
 
-      # Homebrew is deliberately not here yet. When the tap ships it becomes a
-      # step that rewrites Formula/sendfm.rb with the four darwin/linux asset
-      # URLs and their sha256s, read straight out of checksums.txt above.
+  homebrew:
+    name: Homebrew tap
+    needs: [resolve, binaries]
+    # Dormant until `HOMEBREW_TAP` (e.g. "slingshot/homebrew-tap") is set in the
+    # repository variables, alongside a `HOMEBREW_TAP_TOKEN` secret. Gated on the
+    # variable and not the secret because the `secrets` context is not available
+    # in a job-level `if:` — `secrets.X != ''` reads as empty and never runs.
+    if: vars.HOMEBREW_TAP != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      # No `bun install`: render-formula.ts imports nothing, so the job needs
+      # only a Bun runtime. Keeps this well under a minute.
+      - name: Render the formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Read checksums from the release the previous job just published,
+          # rather than rebuilding the binaries and hashing those. A rebuild is
+          # not bit-identical (Bun's compiled output is not reproducible), so
+          # hashing a second build would publish digests that do not match the
+          # assets people actually download.
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern checksums.txt \
+            --dir "$RUNNER_TEMP"
+          bun run apps/cli/scripts/render-formula.ts "$TAG" "$RUNNER_TEMP/checksums.txt" \
+            > "$RUNNER_TEMP/sendfm.rb"
+          cat "$RUNNER_TEMP/sendfm.rb"
+
+      # A separate checkout of the tap: GITHUB_TOKEN is scoped to this
+      # repository and cannot push to another one, whatever `permissions:` say.
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Commit the formula
+        env:
+          TAG: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/sendfm.rb" tap/Formula/sendfm.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Re-running a tag must not fail on an unchanged formula, and
+          # `git commit` exits non-zero with nothing staged.
+          if git diff --quiet -- Formula/sendfm.rb; then
+            echo "Formula already at $TAG; nothing to commit."
+            exit 0
+          fi
+          git add Formula/sendfm.rb
+          git commit -m "chore: sendfm ${TAG#v}" \
+            -m "Generated from ${GITHUB_REPOSITORY}@${TAG} by apps/cli/scripts/render-formula.ts."
+          git push
 
   npm:
     name: npm

@@ -116,22 +116,32 @@ This starts:
 ## Command line
 
 ```bash
-# macOS and Linux
+# Homebrew (macOS and Linux)
+brew install slingshot/tap/sendfm
+
+# or, with no Homebrew
 curl -fsSL https://send.fm/install.sh | sh
 ```
 
-The installer picks the binary for your platform, verifies it against the
-release's `checksums.txt`, and installs it somewhere writable on your `PATH`.
-`SENDFM_INSTALL_DIR` chooses where, `SENDFM_VERSION` pins a version. On Windows,
-take the `windows-x64.zip` from the
-[releases page](https://github.com/slingshot/bolter/releases). Once installed,
-`sendfm update` upgrades in place — verifying the checksum the same way.
+Install by that **fully qualified** name. Since Homebrew 6.0, non-official taps
+must be trusted explicitly, and a fully qualified install trusts exactly that
+one formula — whereas `brew tap slingshot/tap && brew install sendfm` fails
+until you also run `brew trust --formula slingshot/tap/sendfm`.
 
-Homebrew and npm are **not published yet**; both are next up:
+The `install.sh` route picks the binary for your platform, verifies it against
+the release's `checksums.txt`, and installs it somewhere writable on your
+`PATH`; `SENDFM_INSTALL_DIR` chooses where and `SENDFM_VERSION` pins a version.
+On Windows, take the `windows-x64.zip` from the
+[releases page](https://github.com/slingshot/bolter/releases).
+
+`sendfm update` upgrades a standalone install in place, verifying the checksum
+the same way. It detects a Homebrew install from its own path and prints
+`brew upgrade sendfm` instead of replacing a binary Homebrew owns.
+
+npm is **not published yet**:
 
 ```bash
-brew install slingshot/tap/sendfm   # not yet — coming shortly
-npm install -g sendfm               # not yet — coming shortly
+npm install -g sendfm   # not yet — coming shortly
 ```
 
 ```bash

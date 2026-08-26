@@ -283,14 +283,42 @@ trailing `" <asset>"` and `update.ts` splits each line on whitespace, so the
 default two-space format satisfies both. Verification is mandatory in both
 consumers — a self-updater that skips it is a remote code execution primitive.
 
-Homebrew and npm are deliberately dormant. Homebrew needs no gate: the action
-that would have handled it is gone, and the tap step is simply not written yet.
-npm is a full job gated on `if: vars.PUBLISH_NPM == 'true'`, because the
-`secrets` context is **not available in a job-level `if:`** — `secrets.NPM_TOKEN
-!= ''` would silently read as empty and never run. Enabling npm is: add the
-`NPM_TOKEN` secret, set the `PUBLISH_NPM` variable, retag. It runs after the
-release exists so a failed binary build never leaves npm advertising a version
-with nothing behind it.
+**Homebrew** ships from the `homebrew` job into `slingshot/homebrew-tap`
+(`brew install slingshot/tap/sendfm`). `Formula/sendfm.rb` there is *generated*
+by `apps/cli/scripts/render-formula.ts` and overwritten every release — edit the
+renderer, never the tap. The renderer reads the release's own `checksums.txt`
+rather than rehashing a rebuild, because Bun's compiled output is not
+reproducible: a second build produces different bytes and therefore digests that
+do not match the assets people download.
+
+Four shapes in that formula are mandated by `brew style` / `brew audit --strict`
+and each rejects the obvious spelling: `desc` must say "command-line", the
+components run desc/homepage/license, `livecheck` takes `url :stable` plus an
+explicit strategy, and there must be **no `version` stanza** — Homebrew scans the
+version out of the download URL and calls an explicit one redundant. Neither
+check runs in this repo's CI, so they only fail once the tap is pushed; run
+`brew style slingshot/tap` and `brew audit --strict --online slingshot/tap/sendfm`
+against a local edit before trusting a renderer change.
+
+Note for docs: since Homebrew 6.0 a non-official tap needs explicit trust, and
+only a **fully qualified** `brew install slingshot/tap/sendfm` grants it
+implicitly — `brew tap` + bare `brew install sendfm` fails until
+`brew trust --formula`. Always document the qualified form.
+
+**npm** is a full job gated on `if: vars.PUBLISH_NPM == 'true'`. Both it and
+`homebrew` gate on a *variable*, never the secret, because the `secrets` context
+is **not available in a job-level `if:`** — `secrets.NPM_TOKEN != ''` would
+silently read as empty and never run. Enabling npm is: add the `NPM_TOKEN`
+secret, set the `PUBLISH_NPM` variable, retag. Both run after the release exists
+so a failed binary build never leaves a registry advertising a version with
+nothing behind it.
+
+Both cross-repo/registry jobs need a credential this repo cannot mint:
+`GITHUB_TOKEN` is scoped to `slingshot/bolter` and cannot push to the tap
+whatever `permissions:` say, which is why `homebrew` takes a separate
+`actions/checkout` with `HOMEBREW_TAP_TOKEN`. That token is also the quiet
+failure mode of the whole pipeline — when it expires the formula simply stops
+updating and nothing in this repo's CI goes red.
 
 Reruns are safe. `workflow_dispatch` takes an existing `vX.Y.Z` tag (validated
 in its own `resolve` job before it reaches `checkout`'s `ref:`), and assets
