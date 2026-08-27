@@ -1,4 +1,5 @@
 import type { Keychain } from '@bolter/protocol/crypto';
+import { DOWNLOAD_LIMITS, TIME_LIMITS } from '@bolter/shared';
 import { create } from 'zustand';
 import { type Canceller, deleteFile, getDownloadStatus, type UploadProgress } from '@/lib/api';
 import { captureError } from '@/lib/sentry';
@@ -209,9 +210,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Settings
     encrypted: false,
     setEncrypted: (encrypted) => set({ encrypted }),
-    timeLimit: 86400, // 1 day (replaced by the server default once /config loads)
+    // Placeholders for the window before /config resolves; the server's
+    // configured defaults replace both in `setConfig`. They are derived from
+    // the shared constants rather than written out so the pre-config frame
+    // matches the value that lands a moment later.
+    timeLimit: TIME_LIMITS.DEFAULT_EXPIRE_SECONDS,
     setTimeLimit: (timeLimit) => set({ timeLimit, userTouchedSettings: true }),
-    downloadLimit: 1,
+    downloadLimit: DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS,
     setDownloadLimit: (downloadLimit) => set({ downloadLimit, userTouchedSettings: true }),
     userTouchedSettings: false,
 
@@ -357,10 +362,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     config: null,
     setConfig: (config) =>
         set((state) => {
-            // Seed the active upload settings from the server defaults. Without
-            // this the hardcoded 86400 / 1 win, silently ignoring the admin's
-            // configured defaults and rendering the Select blank whenever the
-            // configured option list omits those values.
+            // Seed the active upload settings from the server defaults.
+            // Without this the build-time constants win, silently ignoring the
+            // admin's configured defaults and rendering the Select blank
+            // whenever the configured option list omits those values.
             if (!config || state.userTouchedSettings) {
                 return { config };
             }

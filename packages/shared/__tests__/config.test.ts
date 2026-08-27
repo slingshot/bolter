@@ -133,8 +133,8 @@ describe('DOWNLOAD_LIMITS', () => {
         expect(DOWNLOAD_LIMITS.MAX_DOWNLOADS).toBe(100);
     });
 
-    it('should set DEFAULT_DOWNLOADS to 1', () => {
-        expect(DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS).toBe(1);
+    it('should set DEFAULT_DOWNLOADS to 5', () => {
+        expect(DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS).toBe(5);
     });
 
     it('should have DOWNLOAD_COUNTS sorted ascending', () => {

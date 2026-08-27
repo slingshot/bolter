@@ -185,7 +185,10 @@ describe('clampDownloadLimit', () => {
     it('should raise a non-positive limit to 1 instead of bricking the file', () => {
         // A negative dlimit survived `||` and made dl >= dlimit true immediately
         expect(clampDownloadLimit(-1)).toBe(1);
-        expect(clampDownloadLimit(0)).toBe(DEFAULT);
+        // 0 is finite, so it is a *requested* value clamped up to the floor —
+        // not an omission falling back to the default. Asserting DEFAULT here
+        // passed only while DEFAULT happened to be 1.
+        expect(clampDownloadLimit(0)).toBe(1);
     });
 
     it('should truncate fractions so the stored value round-trips through parseInt', () => {

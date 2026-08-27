@@ -241,7 +241,7 @@ belongs to:
 
 ```
   Slingshot-Streaming-Ads-AdSpot.mp4
-  116 MB  ·  1 download  ·  in 23h 58m
+  116 MB  ·  5 downloads  ·  in 23h 58m
   https://send.fm/download/615948f90b254d39
 
   q3-board-deck.pdf
@@ -370,7 +370,7 @@ All configuration is done via environment variables. See [`.env.example`](.env.e
 | `MAX_EXPIRE_SECONDS` | `15552000` (6 months) | Maximum link expiration time |
 | `DEFAULT_EXPIRE_SECONDS` | `86400` (1 day) | Default expiration |
 | `MAX_DOWNLOADS` | `100` | Maximum download limit |
-| `DEFAULT_DOWNLOADS` | `1` | Default download limit |
+| `DEFAULT_DOWNLOADS` | `5` | Default download limit |
 | `PLAUSIBLE_DOMAINS` | `send.fm` | Site domains the analytics proxy will forward events for, comma separated |
 | `TRUSTED_EDGE_CIDRS` | _(none)_ | CIDR ranges allowed to set `cf-connecting-ip`; when set, the header is only trusted from those peers |
 | `HEALTH_CACHE_TTL_SECONDS` | `30` | How long a `/health*` probe result is reused. Set it to at least your orchestrator's probe interval |

@@ -68,7 +68,7 @@ export const TIME_LIMITS = {
 // Download limits
 export const DOWNLOAD_LIMITS = {
     MAX_DOWNLOADS: 100,
-    DEFAULT_DOWNLOADS: 1,
+    DEFAULT_DOWNLOADS: 5,
     DOWNLOAD_COUNTS: [1, 2, 3, 4, 5, 20, 50, 100],
 } as const;
 

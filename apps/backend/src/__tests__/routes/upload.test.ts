@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { PART_SIZING } from '@bolter/shared';
+import { DOWNLOAD_LIMITS, PART_SIZING } from '@bolter/shared';
 import type { FileMetadata } from '../../storage';
 
 // ---------------------------------------------------------------------------
@@ -504,7 +504,7 @@ describe('POST /upload/url', () => {
         const app = createApp();
         await app.handle(jsonPost('/upload/url', { fileSize: 50_000_000 }));
 
-        expect(setFieldValues('dlimit')).toEqual(['1']);
+        expect(setFieldValues('dlimit')).toEqual([String(DOWNLOAD_LIMITS.DEFAULT_DOWNLOADS)]);
     });
 
     it('should store an in-range dlimit verbatim as an integer string', async () => {
