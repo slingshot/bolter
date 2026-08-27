@@ -35,7 +35,16 @@ const cli = await createCLI({
         // output format — a format that changes based on the environment is
         // worse than a flag someone forgot.
         aiAgentPlugin({}),
-        completionsPlugin({}),
+        // `commandName` is mandatory, not decorative: without it the plugin
+        // derives the name from `process.cwd()` at runtime rather than from
+        // `name` above, so a shipped binary emitted completions for whatever
+        // directory the user was standing in — `bolter-monorepo` inside this
+        // repo, and plain `cli` anywhere without a package.json. The generated
+        // script both registers against that name and shells out to it for
+        // candidates, so completion silently did nothing. Shipped broken in
+        // v0.1.0; see __tests__/completions.test.ts, which runs the CLI from a
+        // temp directory because running it from this package hides the bug.
+        completionsPlugin({ commandName: 'sendfm' }),
     ] as const,
 });
 

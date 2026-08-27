@@ -105,6 +105,11 @@ ${blocks.get('linux')?.join('\n')}
 
   def install
     bin.install "sendfm"
+    # Runs \`sendfm completions <shell>\` during install and captures stdout.
+    # Only correct from v0.1.1: before that the plugin named the script after
+    # \`process.cwd()\`, so this would have installed a completion bound to
+    # whichever directory the build ran in.
+    generate_completions_from_executable(bin/"sendfm", "completions", shells: [:bash, :zsh, :fish])
   end
 
   test do
