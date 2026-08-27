@@ -250,6 +250,16 @@ absent there and passed explicitly; cross-compiling requires
 `bun install --os '*' --cpu '*'` first; and the commands directory needs exactly
 one default-exported command per file.
 
+`completionsPlugin` needs an explicit `commandName`. Left to itself it resolves
+the name from `process.cwd()` *at runtime*, not from the `name` given to
+`createCLI` — so the completion script a shipped binary prints is named after
+whatever directory the user is standing in (`bolter-monorepo` inside this repo,
+plain `cli` anywhere without a package.json), and since the script also shells
+out to that name for candidates, completion silently does nothing. v0.1.0
+shipped this. `__tests__/completions.test.ts` runs the CLI from a temp
+directory for exactly this reason: run from `apps/cli` the bug is invisible,
+because the package.json next door happens to say `sendfm`.
+
 ### Releasing `sendfm`
 
 Releases are cut by pushing a `v*.*.*` tag; `.github/workflows/release.yml`
