@@ -11,36 +11,24 @@
         "dist/"
     ],
     "scripts": {
-        "dev": "bun run src/index.ts",
-        "build": "bunli build",
-        "build:all": "bunli build --targets all",
+        "dev": "bun run src/sendfm.ts",
+        "build": "bun run scripts/build.ts",
+        "build:all": "bun run scripts/build.ts --all",
+        "build:binary": "bun run scripts/build.ts",
         "typecheck": "tsc --noEmit",
-        "test": "bun test",
-        "build:binary": "bunli build --targets native"
+        "test": "bun test"
     },
     "dependencies": {
         "@bolter/protocol": "workspace:*",
         "@bolter/shared": "workspace:*",
-        "@bunli/core": "0.9.1",
-        "@bunli/plugin-ai-detect": "0.6.4",
-        "@bunli/plugin-completions": "0.3.5",
-        "@bunli/tui": "0.6.0",
-        "@bunli/utils": "0.6.0",
-        "@opentui/core": "0.1.97",
-        "@opentui/react": "0.1.97",
+        "ink": "^7.1.1",
         "react": "^19.2.0",
         "zod": "^4.3.6"
     },
     "devDependencies": {
         "@types/bun": "latest",
-        "bunli": "0.9.1",
+        "@types/react": "^19.2.18",
+        "react-devtools-core": "file:./vendor/react-devtools-core",
         "typescript": "^5.9.3"
-    },
-    "optionalDependencies": {
-        "@opentui/core-darwin-arm64": "0.1.97",
-        "@opentui/core-darwin-x64": "0.1.97",
-        "@opentui/core-linux-arm64": "0.1.97",
-        "@opentui/core-linux-x64": "0.1.97",
-        "@opentui/core-win32-x64": "0.1.97"
     }
 }

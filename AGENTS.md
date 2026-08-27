@@ -52,7 +52,7 @@ Environment variables that affect build output (`VITE_*`, `SENTRY_*`, `NODE_ENV`
 **Monorepo Structure** (Turborepo + Bun workspaces):
 - `apps/frontend/` - Vite + React 18 + TypeScript + Tailwind
 - `apps/backend/` - Elysia (Bun web framework) + TypeScript
-- `apps/cli/` - `sendfm`, the command-line client (Bunli, compiled with `bun build --compile`)
+- `apps/cli/` - `sendfm`, the command-line client (no CLI framework; compiled with `bun build --compile` via `scripts/build.ts`)
 - `packages/shared/` - Constants exported to both (BYTES, LIMITS, DEFAULTS)
 - `packages/protocol/` - `@bolter/protocol`: the wire protocol, shared by the frontend and the CLI
 
@@ -167,8 +167,8 @@ the worker chunk to reach calls that were always inert there.
 
 ## `apps/cli` — the `sendfm` command-line client
 
-Built on Bunli, compiled to standalone binaries. What it does that the browser
-cannot, and why:
+No CLI framework (see "No CLI framework" below), compiled to standalone
+binaries. What it does that the browser cannot, and why:
 
 - **No staged copy, anywhere.** A part's bytes are a pure function of its part
   number, so the uploader asks the source for a byte range and streams it
@@ -243,22 +243,131 @@ cannot, and why:
   because `node:path`'s `basename` follows the host platform and would leak a
   Windows path read on Linux).
 
-Bunli notes that bit: it requires Bun >= 1.3.11; `@bunli/core` pulls OpenTUI,
-which needs React 19 (the frontend is on 18, so the workspace carries both);
-`bunli build` reads `targets` from `bunli.config.ts`, so they are deliberately
-absent there and passed explicitly; cross-compiling requires
-`bun install --os '*' --cpu '*'` first; and the commands directory needs exactly
-one default-exported command per file.
+### No CLI framework
 
-`completionsPlugin` needs an explicit `commandName`. Left to itself it resolves
-the name from `process.cwd()` *at runtime*, not from the `name` given to
-`createCLI` — so the completion script a shipped binary prints is named after
-whatever directory the user is standing in (`bolter-monorepo` inside this repo,
-plain `cli` anywhere without a package.json), and since the script also shells
-out to that name for candidates, completion silently does nothing. v0.1.0
-shipped this. `__tests__/completions.test.ts` runs the CLI from a temp
-directory for exactly this reason: run from `apps/cli` the bug is invisible,
-because the package.json next door happens to say `sendfm`.
+`sendfm` has no CLI framework. `src/cli/` is ~350 lines that pick a command out
+of argv, parse its flags and call its handler: `define.ts` (`defineCommand` /
+`option`), `parse.ts` (`node:util`'s `parseArgs`, then each option's Zod schema),
+`help.ts`, `completions.ts` and `index.ts` (`createCLI`). Runtime dependencies
+are five: `@bolter/protocol`, `@bolter/shared`, `ink`, `react`, `zod`.
+
+It used to be `@bunli/core`, and the reasons it is not are worth keeping:
+
+- **The framework dragged a renderer behind it.** `@bunli/core` depends on
+  `@bunli/runtime`, which hard-depends on `@opentui/core` and `@opentui/react`
+  and imports them from its prompt runtime. `bunli build` then refused to
+  cross-compile unless `@opentui/core-<platform>` resolved inside
+  `apps/cli/node_modules` — a check about a renderer this CLI does not use,
+  which is the entire reason the release once needed
+  `bun install --os '*' --cpu '*'`. **That step is gone.** Do not reintroduce
+  it; `scripts/build.ts` is `bun build --compile` per target and needs nothing
+  installed for a foreign platform.
+- **It broke the documented output contract.** `sendfm --help` emitted
+  `{"ok":true,"data":{"type":"help",…}}` whenever stdout was not a terminal, so
+  `sendfm --help | less` printed JSON — and a *different* envelope from the
+  `{sendfm, ok, command, data, warnings}` one the README specifies. Help is now
+  plain text on stdout when asked for, and on stderr with exit 2 when it is
+  shown because the invocation was wrong.
+- **Nothing was gained by it.** The generated `.bunli/commands.gen.ts` was
+  referenced by no source file, and `@bunli/plugin-ai-detect`'s effects were
+  never read by ours.
+
+Migrating cost 17 import lines. `defineCommand` and `option` kept their exact
+shapes and a handler still receives `{ flags, positional }`, so not one of the
+13 command files changed otherwise — which is only true because the framework
+was already at the edge: every handler's real work starts at `runCommand`.
+
+Two things the parser does that are easy to undo by accident:
+
+- **`--no-<flag>` is declared per flag, not treated as a prefix.** `parseArgs`
+  has no negation and is strict, so each flag also registers a companion
+  `no-<flag>` boolean. Accepting any `--no-` prefix instead would silently
+  swallow `--no-instance` and every typo like it.
+- **Zod does the validating.** `--limit abc` and `--limit 99999` are both
+  rejected by the same schema that documents the option, so bounds cannot
+  drift from their description.
+
+Completions (`sendfm completions <bash|zsh|fish>`) are generated from the
+command table, statically. A callback protocol — what the old plugin used —
+makes every Tab press cost a process start and stops working entirely if the
+binary moves, which is the opposite of what you want from the thing you press
+when unsure. The generator escapes shell quotes, and colons in zsh descriptions
+because `_describe` splits on the first one.
+
+`scripts/build.ts` replaces `bunli build`: `--all` writes
+`dist/<target>/sendfm` for the five release targets, no arguments writes a flat
+`dist/sendfm` for the host. **That layout is a contract with the release
+workflow's packaging loop** — flattening the multi-target case would package
+one binary five times under five different names.
+
+### The `sendfm` terminal UI
+
+Two renderers, chosen once per transfer before the first byte, because a
+renderer that redraws a line cannot be swapped in after something is printed:
+an inline `\r`-redraw reporter (`ui/progress.ts`) and the Ink dashboard
+(`ui/dashboard.tsx`). `shouldPromote` picks between them.
+
+- **Ink, not OpenTUI, and not the alternate screen.** The dashboard renders
+  *inline into the normal buffer*, so the last frame stays in scrollback and
+  the share link printed underneath is simply the next line. The previous
+  alt-screen version had to reprint its own result after teardown, because
+  leaving the alternate screen discards everything drawn in it.
+- **It draws on stderr.** stdout is the result — `sendfm up notes.pdf | pbcopy`
+  must copy a link and nothing else. OpenTUI's `createCliRenderer` defaulted to
+  `process.stdout` and was saved only by `shouldPromote` refusing to run unless
+  stdout was a TTY, which is a guard rather than a design.
+- **`MIN_ROWS` is derived from `DASHBOARD_ROWS`, and the test pins that.** The
+  old layout stacked four separately bordered `@bunli/tui` panels — each with
+  padding and a hardcoded `gap: 1` — spending ~28 rows on eight lines, while
+  promotion admitted 15-row terminals. Overflow was not clipped or scrolled:
+  children painted over the borders and over each other. That, not any resize
+  handling, was "the TUI goes weird when you resize" — it reproduces on a plain
+  100x20 terminal, first frame, with no resize at all. Any layout change must
+  move `DASHBOARD_ROWS` with it.
+- **Resize is a subscription, never a sample.** `useWindowSize()` re-renders on
+  resize. Reading `stdout.columns` during render (what the old code did) only
+  takes effect on the next progress tick, and never at all once the transfer
+  has finished.
+- **Colour stays monochrome.** `ui/theme.ts` is dim/bold with colour reserved
+  for state that changed; `@bunli/tui`'s components painted an rgb(106,196,255)
+  accent straight through it.
+- **`vendor/react-devtools-core` is a deliberate 3-line stub.** Ink's reconciler
+  imports the real 16 MB package behind `process.env.DEV === 'true'` — never
+  true in a release — but the import is in the module graph, so
+  `bun build --compile` must resolve it. `--external` is worse than useless
+  here: the compiled binary then tries to resolve it at runtime from inside
+  `/$bunfs` and dies on the first render. It is wired as a `file:`
+  devDependency because `overrides` cannot create a node that nothing depends
+  on, and `react-devtools-core` is an optional peer nobody installs. **Both
+  Dockerfiles copy `apps/cli/vendor/`** — bun resolves every workspace's
+  dependencies even when only the frontend is being built, so a pruned
+  checkout that omits the stub fails the whole install, not just the CLI's.
+
+`sendfm ls` prints one block per send — name, facts, link — rather than a table
+followed by a block of bare URLs. The link goes to stdout when stdout is piped
+and to stderr when it is a terminal, and that split is the point: interleaving
+two streams per entry would leave the ordering to flush timing, which Node
+guarantees to be synchronous for a terminal only on POSIX. `__tests__/ls.test.ts`
+pins both halves, because on a terminal both streams land on the same screen and
+nothing else would notice the contract breaking.
+
+**`__tests__/completions.test.ts` runs the CLI from a temp directory, and must
+keep doing so.** v0.1.0 shipped completions named after `process.cwd()`: the old
+`completionsPlugin` resolved the command name from the filesystem at runtime
+rather than from the `name` given to `createCLI`, so a shipped binary emitted a
+script for `bolter-monorepo` inside this repo and plain `cli` anywhere without a
+package.json — bound to a command nobody has, and shelling out to that same
+missing command for candidates, so completion silently did nothing. Run from
+`apps/cli` the bug is invisible, because the package.json next door happens to
+say `sendfm`.
+
+The generator that did this is gone; `src/cli/completions.ts` takes the name
+from the CLI definition and reads no filesystem, so the class of bug is closed
+rather than fixed. The test stays because that property is worth pinning, and
+its bash assertion deliberately matches *a* registered function that the script
+also defines, rather than one by name — the previous assertion pinned the old
+generator's internal naming, which tested authorship rather than whether a shell
+could act on the output.
 
 ### Releasing `sendfm`
 

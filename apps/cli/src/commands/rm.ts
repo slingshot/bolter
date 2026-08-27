@@ -5,8 +5,8 @@
  * rejection means the file is already gone rather than that we lack permission.
  */
 
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand } from '../core/session';

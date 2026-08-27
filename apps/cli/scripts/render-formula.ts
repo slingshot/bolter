@@ -106,9 +106,10 @@ ${blocks.get('linux')?.join('\n')}
   def install
     bin.install "sendfm"
     # Runs \`sendfm completions <shell>\` during install and captures stdout.
-    # Only correct from v0.1.1: before that the plugin named the script after
-    # \`process.cwd()\`, so this would have installed a completion bound to
-    # whichever directory the build ran in.
+    # Only correct from v0.1.1: v0.1.0 named the script after \`process.cwd()\`,
+    # so this would have installed a completion bound to whichever directory
+    # the build ran in. The generator that did that is gone — the name now
+    # comes from the CLI's own definition and nothing reads the filesystem.
     generate_completions_from_executable(bin/"sendfm", "completions", shells: [:bash, :zsh, :fish])
   end
 
@@ -119,3 +120,8 @@ end
 `;
 
 process.stdout.write(formula);
+
+// This file is a script, not a library, but top-level `await` is only allowed
+// in a module — and with no imports or exports TypeScript classifies it as a
+// global script. An empty export is what makes it a module.
+export {};

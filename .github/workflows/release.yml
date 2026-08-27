@@ -27,7 +27,7 @@ jobs:
   # shape the release step would reject later.
   resolve:
     name: Resolve tag
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     outputs:
       ref: ${{ steps.check.outputs.ref }}
     steps:
@@ -47,7 +47,7 @@ jobs:
   binaries:
     name: Binaries and checksums
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,18 +57,18 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-      # Required, and easy to lose: `bun install --frozen-lockfile` installs
-      # only the current platform's packages. @bunli/core pulls OpenTUI, whose
-      # native library ships as a per-platform package, and bun refuses to
-      # extract packages whose os/cpu do not match the host — so cross-compiling
-      # to darwin or windows cannot resolve them. Verified that this does not
-      # touch bun.lock, so it does not defeat lockfile pinning.
-      - name: Install every platform's runtime
-        run: bun install --os '*' --cpu '*'
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-      # `--targets all` resolves, in bunli's own source, to exactly the five
-      # directories the packaging step walks below. A single-target build would
-      # write a flat dist/sendfm instead of dist/<target>/sendfm.
+      # `--all` builds exactly the five directories the packaging step walks
+      # below. A single-target build writes a flat dist/sendfm instead of
+      # dist/<target>/sendfm, which would package one binary five times.
+      #
+      # No `bun install --os '*' --cpu '*'` here any more. That step existed
+      # because `bunli build` refused to cross-compile unless OpenTUI's
+      # per-platform native packages resolved — a check about a renderer this
+      # CLI never used. scripts/build.ts is `bun build --compile` per target
+      # and has no such requirement.
       - name: Build all targets
         run: cd apps/cli && bun run build:all
 
@@ -187,7 +187,7 @@ jobs:
     # variable and not the secret because the `secrets` context is not available
     # in a job-level `if:` — `secrets.X != ''` reads as empty and never runs.
     if: vars.HOMEBREW_TAP != ''
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -259,7 +259,7 @@ jobs:
     # was meant to accompany. A variable rather than a code change so enabling
     # npm later is: add the NPM_TOKEN secret, set the variable, retag.
     if: vars.PUBLISH_NPM == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -274,8 +274,8 @@ jobs:
           node-version: "24"
           registry-url: https://registry.npmjs.org
 
-      - name: Install every platform's runtime
-        run: bun install --os '*' --cpu '*'
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
       - name: Build all targets
         run: cd apps/cli && bun run build:all

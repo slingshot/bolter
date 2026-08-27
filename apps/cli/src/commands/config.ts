@@ -8,7 +8,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { defineCommand } from '@bunli/core';
+import { defineCommand } from '../cli';
 import { configSchema, type SendfmConfig } from '../core/config';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';

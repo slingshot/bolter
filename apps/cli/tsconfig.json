@@ -13,11 +13,11 @@
         "noEmit": true,
         "isolatedModules": true,
         "resolveJsonModule": true,
+        // Ink's components are ordinary React components, so JSX resolves
+        // against React's own runtime. (OpenTUI used to supply the intrinsic
+        // elements — box, text, span — via jsxImportSource; nothing does now.)
         "jsx": "react-jsx",
-        // OpenTUI provides the intrinsic elements (box, text, span…), so
-        // JSX resolves against its runtime rather than react-dom's.
-        "jsxImportSource": "@opentui/react",
         "verbatimModuleSyntax": true
     },
-    "include": ["src", "__tests__", "bunli.config.ts"]
+    "include": ["src", "__tests__", "scripts"]
 }

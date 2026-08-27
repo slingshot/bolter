@@ -26,6 +26,17 @@ export interface Output {
     readonly mode: OutputMode;
     readonly theme: Theme;
     readonly isInteractive: boolean;
+    /**
+     * Whether the result stream is a terminal rather than a pipe or a file.
+     *
+     * A command that wants to interleave commentary with results — `ls` puts
+     * each link directly under the entry it belongs to — cannot do it across
+     * two streams: Node only guarantees a terminal write is synchronous on
+     * POSIX, and on Windows it is asynchronous, so the two would scramble.
+     * Knowing nobody is parsing stdout lets such a command put the whole
+     * ordered block on one stream instead.
+     */
+    readonly stdoutIsTTY: boolean;
     /** The answer. stdout. */
     result(text: string): void;
     /** Human commentary. stderr, suppressed by --quiet. */
@@ -65,6 +76,7 @@ export function createOutput(options: OutputOptions): Output {
         mode,
         theme,
         isInteractive: options.stderrIsTTY && !options.json,
+        stdoutIsTTY: options.stdoutIsTTY,
 
         result(text) {
             write('out', `${text}\n`);

@@ -10,8 +10,8 @@
 import { access, mkdir, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { Keychain } from '@bolter/protocol';
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand, type Session } from '../core/session';

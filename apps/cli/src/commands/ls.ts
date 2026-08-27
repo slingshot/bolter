@@ -6,8 +6,8 @@
  */
 
 import { buildShareUrl } from '@bolter/protocol';
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand } from '../core/session';
 import { openState, type UploadRecord } from '../state/db';
@@ -69,49 +69,76 @@ export function toEntry(record: UploadRecord, now: number): ListEntry {
     };
 }
 
-function renderList(data: ListData, output: Output): void {
+/** The facts about one entry, in the order they answer "can I still use this?". */
+export function describeEntry(entry: ListEntry): string {
+    const expiry =
+        entry.expiresInSeconds === null
+            ? '—'
+            : entry.expiresInSeconds <= 0
+              ? 'expired'
+              : formatExpiry(entry.expiresInSeconds);
+    const downloads = entry.downloadLimit === 1 ? '1 download' : `${entry.downloadLimit} downloads`;
+    return [formatBytes(entry.size), downloads, expiry]
+        .concat(entry.encrypted ? ['encrypted'] : [])
+        .concat(entry.status === 'pending' ? ['unfinished'] : [])
+        .join('  ·  ');
+}
+
+/**
+ * One block per send: what it is, then the link that opens it.
+ *
+ * The link sits directly under the entry it belongs to rather than in a
+ * trailing block, because a list of bare URLs after a table is a puzzle — the
+ * only thing tying a row to its link was that both happened to contain the
+ * same id, which is also why the id was worth a column at all. It no longer
+ * is: the link contains it, and for an encrypted send the link is the *only*
+ * usable form, since the key lives in a fragment that cannot be reconstructed
+ * from an id.
+ */
+export function renderList(data: ListData, output: Output): void {
     const { theme } = output;
     if (data.entries.length === 0) {
         output.note(theme.muted('Nothing sent from this machine yet.'));
         return;
     }
 
-    const widths = {
-        id: Math.max(2, ...data.entries.map((e) => e.id.length)),
-        name: Math.min(28, Math.max(4, ...data.entries.map((e) => e.name.length))),
-        size: Math.max(4, ...data.entries.map((e) => formatBytes(e.size).length)),
-    };
+    /**
+     * Where a link goes.
+     *
+     * Piped, it is the result and belongs on stdout — `sendfm ls > links.txt`
+     * has to keep working. On a terminal nobody is parsing stdout, and
+     * splitting the block across two streams would put its ordering at the
+     * mercy of flush timing, so the whole thing goes to stderr in one piece.
+     */
+    const emitLink = output.stdoutIsTTY
+        ? // Indented to sit with the block it belongs to.
+          (url: string) => output.note(`  ${theme.link(url)}`)
+        : // A result is a bare line: something downstream is reading it.
+          (url: string) => output.result(url);
 
-    for (const entry of data.entries) {
-        const expiry =
-            entry.expiresInSeconds === null
-                ? theme.muted('—')
-                : entry.expiresInSeconds <= 0
-                  ? theme.muted('expired')
-                  : formatExpiry(entry.expiresInSeconds);
-        const flags = [
-            entry.encrypted ? theme.muted('enc') : '   ',
-            entry.status === 'pending' ? theme.warning('unfinished') : '',
-        ]
-            .filter(Boolean)
-            .join(' ');
-        output.note(
-            `  ${theme.muted(entry.id.padEnd(widths.id))}  ` +
-                `${truncateMiddle(entry.name, widths.name).padEnd(widths.name)}  ` +
-                `${theme.secondary(formatBytes(entry.size).padStart(widths.size))}  ` +
-                `${expiry}  ${flags}`,
-        );
+    const width = Math.max(40, (process.stderr.columns ?? 80) - 4);
+
+    for (const [index, entry] of data.entries.entries()) {
+        if (index > 0) {
+            output.blank();
+        }
+        output.note(`  ${theme.bold(truncateMiddle(entry.name, width))}`);
+        output.note(`  ${theme.muted(describeEntry(entry))}`);
+        if (entry.url) {
+            emitLink(entry.url);
+        } else {
+            // Encrypted, key not kept. Saying so beats printing a dead link.
+            output.note(`  ${theme.muted('link unavailable — key was not stored')}`);
+        }
     }
 
     if (data.pruned > 0) {
-        output.note(theme.muted(`\n  ${data.pruned} expired entries forgotten.`));
-    }
-
-    // The links are the machine-readable part, one per line.
-    for (const entry of data.entries) {
-        if (entry.url) {
-            output.result(entry.url);
-        }
+        output.blank();
+        output.note(
+            theme.muted(
+                `  ${data.pruned} expired ${data.pruned === 1 ? 'entry' : 'entries'} forgotten.`,
+            ),
+        );
     }
 }
 

@@ -116,20 +116,17 @@ export function createProgressReporter(
 }
 
 /**
- * The full-screen renderer.
+ * The dashboard renderer.
  *
  * Mounted lazily on the first update rather than up front, so a transfer that
- * fails during allocation never takes the terminal over just to give it back.
- * Throughput samples are collected once per second, which is the resolution a
- * sparkline can actually show.
+ * fails during allocation never draws a frame at all. Throughput samples are
+ * collected once per second, which is the resolution a sparkline can show.
  */
 function createDashboardReporter(label: string, options: ReporterOptions): ProgressReporter {
     let handle: DashboardHandle | undefined;
-    let mountStarted = false;
     let stopped = false;
     const samples: number[] = [];
     let lastSampleAt = 0;
-    let latest: DashboardModel | undefined;
 
     const model = (progress: UploadProgress): DashboardModel => {
         const now = Date.now();
@@ -154,31 +151,18 @@ function createDashboardReporter(label: string, options: ReporterOptions): Progr
             if (stopped) {
                 return;
             }
-            latest = model(progress);
+            const next = model(progress);
             if (handle) {
-                handle.update(latest);
+                handle.update(next);
                 return;
             }
-            if (mountStarted) {
-                return;
+            try {
+                handle = mountDashboard(next);
+            } catch {
+                // A terminal that will not host the renderer is not a reason
+                // to fail a transfer; the run simply goes quiet.
+                stopped = true;
             }
-            mountStarted = true;
-            void mountDashboard(latest)
-                .then((mounted) => {
-                    if (stopped) {
-                        mounted.stop();
-                        return;
-                    }
-                    handle = mounted;
-                    if (latest) {
-                        mounted.update(latest);
-                    }
-                })
-                .catch(() => {
-                    // A terminal that will not host an alt screen is not a
-                    // reason to fail a transfer; the run simply goes quiet.
-                    stopped = true;
-                });
         },
         done() {
             stopped = true;
