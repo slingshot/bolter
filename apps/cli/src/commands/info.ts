@@ -13,7 +13,7 @@ import {
     parseShareUrl,
     type UploadMetadata,
 } from '@bolter/protocol';
-import { defineCommand } from '@bunli/core';
+import { defineCommand } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand, type Session } from '../core/session';

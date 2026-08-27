@@ -8,9 +8,9 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
 import pkg from '../../package.json' with { type: 'json' };
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand } from '../core/session';

@@ -5,8 +5,8 @@
  * and nothing else, so an expiry is fixed when the link is created.
  */
 
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand } from '../core/session';

@@ -10,8 +10,8 @@
  * user has waited through a large upload.
  */
 
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { EXIT } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand, type Session } from '../core/session';

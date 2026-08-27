@@ -7,8 +7,8 @@
  * commands is worse than one that exists on none.
  */
 
-import { option } from '@bunli/core';
 import { z } from 'zod';
+import { option } from '../cli';
 
 export const globalOptions = {
     json: option(z.coerce.boolean().default(false), {

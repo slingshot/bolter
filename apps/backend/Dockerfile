@@ -16,6 +16,10 @@ COPY packages/protocol/package.json ./packages/protocol/
 COPY packages/protocol/src ./packages/protocol/src
 COPY packages/protocol/tsconfig.json ./packages/protocol/
 COPY apps/cli/package.json ./apps/cli/
+# apps/cli devDepends on a local stub via `file:`, and bun resolves every
+# workspace's dependencies even when only the frontend is being built — so a
+# pruned checkout that omits it fails the whole install, not just the CLI's.
+COPY apps/cli/vendor ./apps/cli/vendor
 
 # Install dependencies
 RUN bun install --frozen-lockfile --production

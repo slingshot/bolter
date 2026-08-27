@@ -158,6 +158,19 @@ Encryption is **off by default**, matching the web app — pass `--encrypt`/`-E`
 to turn it on. The key goes into the link's fragment and never reaches a
 server, exactly as in the browser.
 
+### Shell completion
+
+```bash
+sendfm completions zsh  > "${fpath[1]}/_sendfm"        # zsh
+sendfm completions bash > /etc/bash_completion.d/sendfm # bash
+sendfm completions fish > ~/.config/fish/completions/sendfm.fish
+```
+
+The script is generated once and written to disk rather than calling back into
+the binary on every Tab, so completion costs nothing at press time and keeps
+working if `sendfm` is busy or moved. Regenerate it after an upgrade that adds
+commands.
+
 ### Talking to other instances
 
 `sendfm` works against any Bolter deployment, not just send.fm:
@@ -222,6 +235,22 @@ state · `1` other · `130` interrupted.
 
 Even without `--json`, stdout carries only the result — the share link, the
 saved path — so `sendfm up f | pbcopy` does the obvious thing.
+
+`sendfm ls` prints one block per send, with each link under the entry it
+belongs to:
+
+```
+  Slingshot-Streaming-Ads-AdSpot.mp4
+  116 MB  ·  1 download  ·  in 23h 58m
+  https://send.fm/download/615948f90b254d39
+
+  q3-board-deck.pdf
+  4.2 MB  ·  1 download  ·  in 59m  ·  encrypted
+  https://send.fm/download/8c1d0e77aa934b02#Zk9xQ2pLd0h…
+```
+
+Piped, stdout is just the links, one per line — `sendfm ls > links.txt` — and
+the descriptions stay on stderr.
 
 ### Privacy
 
@@ -507,10 +536,10 @@ bun run --cwd apps/cli dev -- --help
 bun run --cwd apps/cli build:binary      # ./apps/cli/dist/sendfm
 bun run --cwd apps/cli build:all         # all five release targets
 
-# Cross-compiling needs every platform's native packages first: @bunli/core
-# pulls OpenTUI, whose native library ships per platform, and bun will not
-# extract packages whose os/cpu do not match the host.
-bun install --os '*' --cpu '*'
+# Cross-compiling needs nothing extra: scripts/build.ts is `bun build --compile`
+# per target. (It used to need `bun install --os '*' --cpu '*'`, because the
+# old CLI framework refused to cross-compile until a native renderer it pulled
+# in resolved for every target. Both are gone.)
 
 # Integration testing against a real S3 (MinIO), rather than a mock
 docker compose --profile test up -d minio minio-init redis

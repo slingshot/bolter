@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { type PromotionInput, partsBar, shouldPromote, sparkline } from '../src/ui/dashboard';
+import {
+    DASHBOARD_ROWS,
+    MIN_ROWS,
+    type PromotionInput,
+    partsBar,
+    shouldPromote,
+    sparkline,
+} from '../src/ui/dashboard';
 
 const base: PromotionInput = {
     stdoutIsTTY: true,
@@ -45,6 +52,26 @@ describe('promotion', () => {
     it('does not promote into a terminal too small for the layout', () => {
         expect(shouldPromote({ ...base, columns: 40 })).toBe(false);
         expect(shouldPromote({ ...base, rows: 8 })).toBe(false);
+    });
+
+    /**
+     * The bug this pins: the old layout drew ~28 rows while promotion admitted
+     * 15-row terminals, so the panels painted over each other and over their
+     * own borders. Nothing about that needed a resize — it reproduced on a
+     * plain 100x20 terminal, first frame. Any terminal that cannot seat the
+     * whole frame must therefore be refused, and the threshold has to be
+     * derived from the layout rather than guessed alongside it.
+     */
+    it('refuses any terminal that cannot seat the frame it would draw', () => {
+        // The gate is derived from the frame, not guessed next to it.
+        expect(MIN_ROWS).toBeGreaterThan(DASHBOARD_ROWS);
+        expect(shouldPromote({ ...base, rows: MIN_ROWS - 1 })).toBe(false);
+        expect(shouldPromote({ ...base, rows: MIN_ROWS })).toBe(true);
+    });
+
+    it('refuses a short terminal even when --tui asks for it', () => {
+        // Forcing cannot make the rows exist.
+        expect(shouldPromote({ ...base, force: true, rows: MIN_ROWS - 1 })).toBe(false);
     });
 
     it('lets --tui and --no-tui override the size heuristic', () => {

@@ -47,10 +47,24 @@ describe('shell completions', () => {
         });
     }
 
-    test('bash registers the completion function against sendfm', () => {
+    test('bash registers a defined function against the sendfm command', () => {
         // The registration line is what the shell acts on: a script full of
         // correct candidates still does nothing if it is bound to a command
         // that does not exist.
-        expect(completionsFromElsewhere('bash')).toContain('complete -F __sendfm_complete sendfm');
+        //
+        // Asserted as "some function, and it is defined here" rather than by
+        // name. The name belonged to the generator, and the generator has
+        // since been replaced; pinning it tested authorship rather than the
+        // property that matters, which is that the shell can find both the
+        // command and the function it is told to call.
+        const script = completionsFromElsewhere('bash');
+        const registration = script.match(/^complete -F (\S+) sendfm$/m);
+        expect(registration).not.toBeNull();
+        expect(script).toContain(`${registration?.[1]}()`);
+    });
+
+    test('zsh and fish name the sendfm command too', () => {
+        expect(completionsFromElsewhere('zsh')).toContain('#compdef sendfm');
+        expect(completionsFromElsewhere('fish')).toMatch(/^complete -c sendfm/m);
     });
 });

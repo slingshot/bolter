@@ -6,8 +6,8 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { traceDir } from '../core/paths';

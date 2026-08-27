@@ -10,9 +10,9 @@
 
 import { chmod, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { defineCommand, option } from '@bunli/core';
 import { z } from 'zod';
 import pkg from '../../package.json' with { type: 'json' };
+import { defineCommand, option } from '../cli';
 import { SendfmError } from '../core/errors';
 import { globalFlagsFrom, globalOptions } from '../core/global-options';
 import { type CommandResult, runCommand } from '../core/session';
