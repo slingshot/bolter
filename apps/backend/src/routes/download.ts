@@ -1,5 +1,6 @@
 import { Elysia, t } from 'elysia';
 import { config } from '../config';
+import { directDownloadUrlLifetime } from '../lib/download-url-lifetime';
 import { captureError } from '../lib/sentry';
 import { downloadLogger as logger } from '../logger';
 import { verifyAuth, verifyOwner } from '../middleware/auth';
@@ -220,8 +221,15 @@ export const downloadRoutes = new Elysia()
                 return { error: 'Download limit reached' };
             }
 
-            // Sign before incrementing so a signing failure doesn't burn a credit
-            const signedUrl = await storage.getSignedDownloadUrl(id, filename);
+            // Sign before incrementing so a signing failure doesn't burn a credit.
+            // The lifetime scales with the file: the credit is spent at the
+            // redirect below, and the browser's resume-after-drop re-requests
+            // this exact URL, so it must outlive the whole transfer.
+            const signedUrl = await storage.getSignedDownloadUrl(
+                id,
+                filename,
+                directDownloadUrlLifetime(metadata.fileSize),
+            );
             if (!signedUrl) {
                 captureError(new Error('Failed to generate signed download URL'), {
                     operation: 'download.sign-url',
