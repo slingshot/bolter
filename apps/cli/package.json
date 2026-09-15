@@ -26,7 +26,7 @@
         "zod": "^4.3.6"
     },
     "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "^1.4.2",
         "@types/react": "^19.2.18",
         "react-devtools-core": "file:./vendor/react-devtools-core",
         "typescript": "^5.9.3"
