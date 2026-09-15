@@ -145,12 +145,20 @@ export const storage = {
 
     // --- Download operations (resolve from file metadata) ---
 
-    async getSignedDownloadUrl(id: string, filename?: string): Promise<string | null> {
+    /**
+     * `expiresIn` (seconds) defaults to the provider's flat hour; the direct
+     * download route passes a size-derived lifetime (`directDownloadUrlLifetime`).
+     */
+    async getSignedDownloadUrl(
+        id: string,
+        filename?: string,
+        expiresIn?: number,
+    ): Promise<string | null> {
         try {
             const provider = await resolveProviderForFile(id);
-            return await provider.getSignedDownloadUrl(id, filename);
+            return await provider.getSignedDownloadUrl(id, filename, expiresIn);
         } catch (e) {
-            captureError(e, { operation: 's3.sign-download', extra: { id, filename } });
+            captureError(e, { operation: 's3.sign-download', extra: { id, filename, expiresIn } });
             console.error('Failed to get signed download URL:', e);
             return null;
         }

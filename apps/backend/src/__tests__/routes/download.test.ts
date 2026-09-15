@@ -114,6 +114,7 @@ mock.module('../../middleware/auth', () => ({
 // ---------------------------------------------------------------------------
 import { Elysia } from 'elysia';
 import { config } from '../../config';
+import { directDownloadUrlLifetime } from '../../lib/download-url-lifetime';
 import {
     clampDownloadLimit,
     downloadRoutes,
@@ -207,6 +208,25 @@ describe('GET /download/direct/:id', () => {
 
         expect(res.status).toBe(302);
         expect(res.headers.get('location')).toBe('https://s3.example.com/download?signed=true');
+    });
+
+    it('signs the redirect for a lifetime scaled to the file size, not a flat hour', async () => {
+        // The browser's own resume re-requests this exact URL after a drop; a
+        // URL that expired mid-transfer turns that resume into a 403 with the
+        // download credit already spent.
+        const fileSize = 37 * 1024 ** 3;
+        mockStorage.getMetadata.mockResolvedValue(makeMetadata({ encrypted: false, fileSize }));
+
+        const app = createApp();
+        const res = await app.handle(new Request('http://localhost/download/direct/abc123'));
+
+        expect(res.status).toBe(302);
+        expect(mockStorage.getSignedDownloadUrl).toHaveBeenCalledWith(
+            'abc123',
+            'test-file.txt',
+            directDownloadUrlLifetime(fileSize),
+        );
+        expect(directDownloadUrlLifetime(fileSize)).toBeGreaterThan(3600);
     });
 
     it('should return 400 for encrypted file', async () => {
