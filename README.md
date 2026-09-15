@@ -593,7 +593,7 @@ These are configured on the **bucket**, not through environment variables. The b
 The browser uploads and downloads directly against the bucket and reads response headers that S3/R2 only expose when the CORS policy says so:
 
 - **`ETag`** is read after every multipart part completes. If it is not exposed, every upload large enough to go multipart fails — *after* all bytes have transferred — with a "bucket CORS misconfiguration" error.
-- **`Content-Range`** is read when a mid-stream download failure is resumed with a `Range` request. If it is not exposed, resumable downloads fail with "Range resume mismatch".
+- **`Content-Range`** is read when a mid-stream download failure is resumed with a `Range` request, to verify the server resumed at the requested offset. If it is not exposed, the client trusts the `206` status instead (the byte-count and decryption guards still fail closed on a wrong offset) and reports a `download.range-resume` warning to Sentry on every resume — treat that warning as "apply this policy".
 
 ```json
 [

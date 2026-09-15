@@ -7,6 +7,12 @@ import {
     StreamConsumerGoneError,
     shouldRetryDownloadAttempt,
 } from '@/lib/api';
+import { captureError } from '@/lib/sentry';
+
+vi.mock('@/lib/sentry', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/lib/sentry')>();
+    return { ...actual, captureError: vi.fn() };
+});
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -93,6 +99,7 @@ const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 afterEach(() => {
     vi.unstubAllGlobals();
+    vi.mocked(captureError).mockClear();
 });
 
 // ---------------------------------------------------------------------------
@@ -404,6 +411,75 @@ describe('createResilientDownloadStream', () => {
         const out = await readAll(stream);
         expect(out.length).toBe(32);
         expect(resumeAttempts).toBe(1);
+    });
+
+    it('resumes on a 206 whose Content-Range the bucket CORS policy hides (BOLTER-FRONTEND-64)', async () => {
+        // Content-Range is not CORS-safelisted: a bucket whose policy does not
+        // list it in ExposeHeaders answers the Range request with a genuine
+        // 206 whose header the browser cannot read. The 206 itself proves the
+        // range was honoured, and both downstream integrity guards (advertised
+        // length, ECE authentication) fail closed on a wrong offset — so the
+        // hidden header is a warning, not a reason to discard 37 GB.
+        let resumeAttempts = 0;
+        installFetch((_url, init) => {
+            resumeAttempts++;
+            const headers = (init.headers ?? {}) as Record<string, string>;
+            expect(headers.Range).toBe('bytes=16-');
+            return fakeResponse({
+                status: 206,
+                body: makeBody([new Uint8Array(16).fill(9)], 'close'),
+            });
+        });
+
+        const stream = createResilientDownloadStream({
+            firstResponse: fakeResponse({
+                headers: { 'Content-Length': '32' },
+                body: makeBody([new Uint8Array(16).fill(4)], 'error'),
+            }),
+            expectedTotal: 32,
+            getRequest: async () => ({ url: 'https://obj.example/file' }),
+            retryDelays: [1],
+            maxRetries: 3,
+        });
+
+        const out = await readAll(stream);
+        expect(out.length).toBe(32);
+        expect(out.subarray(0, 16).every((b) => b === 4)).toBe(true);
+        expect(out.subarray(16).every((b) => b === 9)).toBe(true);
+        expect(resumeAttempts).toBe(1);
+        expect(captureError).toHaveBeenCalledTimes(1);
+        expect(captureError).toHaveBeenCalledWith(
+            expect.objectContaining({ message: expect.stringMatching(/Content-Range/) }),
+            expect.objectContaining({
+                operation: 'download.range-resume',
+                level: 'warning',
+                extra: expect.objectContaining({ requestedOffset: 16 }),
+            }),
+        );
+    });
+
+    it('still rejects a 206 whose Content-Range disagrees with the requested offset', async () => {
+        installFetch(() =>
+            fakeResponse({
+                status: 206,
+                headers: { 'Content-Range': 'bytes 0-31/32' },
+                body: makeBody([new Uint8Array(32).fill(9)], 'close'),
+            }),
+        );
+
+        const stream = createResilientDownloadStream({
+            firstResponse: fakeResponse({
+                headers: { 'Content-Length': '32' },
+                body: makeBody([new Uint8Array(16).fill(4)], 'error'),
+            }),
+            expectedTotal: 32,
+            getRequest: async () => ({ url: 'https://obj.example/file' }),
+            retryDelays: [1],
+            maxRetries: 1,
+        });
+
+        await expect(readAll(stream)).rejects.toThrow(/Range resume mismatch/);
+        expect(captureError).not.toHaveBeenCalled();
     });
 
     it('gives up permanently on a 410 without burning the retry budget', async () => {

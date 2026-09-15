@@ -3529,13 +3529,36 @@ export function createResilientDownloadStream(
 
         if (received > 0) {
             if (response.status === 206) {
-                const contentRange = response.headers.get('Content-Range') || '';
-                const startMatch = /^bytes (\d+)-/.exec(contentRange);
-                const start = startMatch ? parseInt(startMatch[1], 10) : -1;
-                if (start !== received) {
-                    throw new Error(
-                        `Range resume mismatch: requested offset ${received}, got Content-Range "${contentRange}"`,
+                const contentRange = response.headers.get('Content-Range');
+                if (contentRange === null) {
+                    // A 206 must carry Content-Range (RFC 9110 §15.3.7), so a
+                    // null read means the bucket's CORS policy does not list
+                    // it in ExposeHeaders and the browser stripped it. The 206
+                    // itself proves the Range was honoured — a server that
+                    // ignores Range answers 200 and one that cannot satisfy
+                    // it answers 416 — and both downstream guards (advertised
+                    // length, ECE authentication) fail closed on a wrong
+                    // offset. Trust the status, but surface the misconfig:
+                    // every resume against this bucket used to die here after
+                    // the whole transfer had been paid for (BOLTER-FRONTEND-64).
+                    captureError(
+                        new Error(
+                            'Range resume: Content-Range not readable on a 206 — the bucket CORS policy must expose it',
+                        ),
+                        {
+                            operation: 'download.range-resume',
+                            level: 'warning',
+                            extra: { requestedOffset: received },
+                        },
                     );
+                } else {
+                    const startMatch = /^bytes (\d+)-/.exec(contentRange);
+                    const start = startMatch ? parseInt(startMatch[1], 10) : -1;
+                    if (start !== received) {
+                        throw new Error(
+                            `Range resume mismatch: requested offset ${received}, got Content-Range "${contentRange}"`,
+                        );
+                    }
                 }
             } else if (response.status === 200) {
                 // Server ignored the Range header — discard the prefix we already have
